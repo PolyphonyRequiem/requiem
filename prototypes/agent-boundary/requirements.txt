@@ -1,0 +1,5 @@
+# Phase A — Agent Boundary prototypes
+# Python 3.11+
+pydantic>=2.6
+pydantic-ai>=1.0    # variant B
+litellm>=1.40       # variant A (live) + variant C
