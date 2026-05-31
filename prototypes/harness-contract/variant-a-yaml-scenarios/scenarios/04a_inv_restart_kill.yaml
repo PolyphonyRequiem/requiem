@@ -1,0 +1,15 @@
+# 4a) INV-RESTART, phase 1 — run until the chaos hook kills the engine
+#     after `load` completes. We expect crashed=true and NO terminal.
+#     Phase 2 is in `04b_inv_restart_resume.yaml` and reuses the same
+#     log file via `resume: true`.
+workflow: tiny_three_node
+run_id: restart-demo
+agent_scripts:
+  architect:
+    - plan: "after-resume"
+chaos:
+  kill_after_event:
+    type: NodeCompleted
+    node: load
+expect:
+  crashed: true

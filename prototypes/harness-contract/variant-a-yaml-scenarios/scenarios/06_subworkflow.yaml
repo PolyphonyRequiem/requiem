@@ -1,0 +1,23 @@
+# 6) sub-workflow scripting story — parent has an `architect` agent,
+#    child has a `reviewer` agent. The YAML names the child workflow
+#    explicitly under `subworkflow_agent_scripts:`.
+#
+#    The cost of this clarity: the YAML duplicates the child-name
+#    string that already exists in the workflow definition.
+workflow: parent_with_subworkflow
+run_id: parent-with-child
+agent_scripts:
+  architect:
+    - plan: "parent-plan"
+subworkflow_agent_scripts:
+  child:
+    reviewer:
+      - verdict: "approve"
+expect:
+  terminal: completed
+  agents_invoked:
+    architect: 1
+    reviewer: 1
+  events:
+    - {type: SubworkflowStarted, payload_contains: {child: child}}
+    - {type: SubworkflowCompleted, payload_contains: {child: child, terminal: completed}}

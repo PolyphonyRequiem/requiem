@@ -1,0 +1,63 @@
+workflow: tiny_three_node
+run_id: event-assert-7
+inputs:
+  work_item_id: 7
+agent_calls:
+- agent: architect
+  reply:
+    plan: ok
+gate_decisions: []
+events:
+- event_id: 1
+  run_id: event-assert-7
+  type: RunStarted
+  node: null
+  payload:
+    inputs:
+      work_item_id: 7
+- event_id: 2
+  run_id: event-assert-7
+  type: NodeEntered
+  node: load
+  payload: {}
+- event_id: 3
+  run_id: event-assert-7
+  type: NodeCompleted
+  node: load
+  payload:
+    outcome: success
+    payload:
+      loaded: true
+- event_id: 4
+  run_id: event-assert-7
+  type: NodeEntered
+  node: architect
+  payload: {}
+- event_id: 5
+  run_id: event-assert-7
+  type: NodeCompleted
+  node: architect
+  payload:
+    outcome: success
+    payload:
+      plan: ok
+- event_id: 6
+  run_id: event-assert-7
+  type: NodeEntered
+  node: end
+  payload: {}
+- event_id: 7
+  run_id: event-assert-7
+  type: NodeCompleted
+  node: end
+  payload:
+    outcome: success
+    payload: {}
+- event_id: 8
+  run_id: event-assert-7
+  type: RunTerminated
+  node: null
+  payload:
+    terminal: completed
+expect:
+  terminal: completed

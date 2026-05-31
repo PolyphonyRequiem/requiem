@@ -1,0 +1,15 @@
+# 1) tiny happy path — 3 nodes, scripted agent, terminal assertion.
+workflow: tiny_three_node
+run_id: tiny-happy
+agent_scripts:
+  architect:
+    - plan: "approved"
+      children: []
+expect:
+  terminal: completed
+  events:
+    - {type: RunStarted}
+    - {type: NodeCompleted, node: load}
+    - {type: NodeCompleted, node: architect}
+    - {type: RunTerminated, payload_contains: {terminal: completed}}
+  agents_invoked: {architect: 1}

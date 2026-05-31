@@ -1,0 +1,18 @@
+# 5) human gate behaviour — scripted gate answer drives the branch.
+#    We answer `abort`, so terminal must be `aborted`.
+workflow: gated_workflow
+run_id: gate-abort
+agent_scripts:
+  architect:
+    - plan: "needs-review"
+gates:
+  gate:
+    value: abort
+    additional_input:
+      reason: "operator declined"
+expect:
+  terminal: aborted
+  events:
+    - {type: HumanGatePresented, node: gate}
+    - {type: HumanGateResolved, node: gate, payload_contains: {chosen: abort}}
+    - {type: NodeCompleted, node: abort_run}

@@ -1,0 +1,95 @@
+workflow: gated_workflow
+run_id: gate-abort
+inputs: {}
+agent_calls:
+- agent: architect
+  reply:
+    plan: needs-review
+gate_decisions:
+- gate: gate
+  value: abort
+  additional_input:
+    reason: operator-decision
+events:
+- event_id: 1
+  run_id: gate-abort
+  type: RunStarted
+  node: null
+  payload:
+    inputs: {}
+- event_id: 2
+  run_id: gate-abort
+  type: NodeEntered
+  node: architect
+  payload: {}
+- event_id: 3
+  run_id: gate-abort
+  type: NodeCompleted
+  node: architect
+  payload:
+    outcome: success
+    payload:
+      plan: needs-review
+- event_id: 4
+  run_id: gate-abort
+  type: NodeEntered
+  node: gate
+  payload: {}
+- event_id: 5
+  run_id: gate-abort
+  type: HumanGatePresented
+  node: gate
+  payload:
+    options:
+    - approve
+    - abort
+- event_id: 6
+  run_id: gate-abort
+  type: HumanGateResolved
+  node: gate
+  payload:
+    chosen: abort
+    additional_input:
+      reason: operator-decision
+- event_id: 7
+  run_id: gate-abort
+  type: NodeCompleted
+  node: gate
+  payload:
+    outcome: success
+    payload:
+      chosen: abort
+      reason: operator-decision
+- event_id: 8
+  run_id: gate-abort
+  type: NodeEntered
+  node: abort_run
+  payload: {}
+- event_id: 9
+  run_id: gate-abort
+  type: NodeCompleted
+  node: abort_run
+  payload:
+    outcome: success
+    payload:
+      aborted: true
+- event_id: 10
+  run_id: gate-abort
+  type: NodeEntered
+  node: end_abort
+  payload: {}
+- event_id: 11
+  run_id: gate-abort
+  type: NodeCompleted
+  node: end_abort
+  payload:
+    outcome: success
+    payload: {}
+- event_id: 12
+  run_id: gate-abort
+  type: RunTerminated
+  node: null
+  payload:
+    terminal: aborted
+expect:
+  terminal: aborted

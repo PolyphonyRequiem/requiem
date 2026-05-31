@@ -1,0 +1,12 @@
+# 2) transient failure — verb returns RetryableFailure twice then Success.
+#    Asserts RetryAttempted event count = 2 and terminal = completed.
+workflow: transient_failure_workflow
+run_id: flaky-retry
+expect:
+  terminal: completed
+  retries:
+    flaky: 2
+  events:
+    - {type: RetryAttempted, node: flaky, payload_contains: {attempt: 1}}
+    - {type: RetryAttempted, node: flaky, payload_contains: {attempt: 2}}
+    - {type: NodeCompleted, node: flaky}

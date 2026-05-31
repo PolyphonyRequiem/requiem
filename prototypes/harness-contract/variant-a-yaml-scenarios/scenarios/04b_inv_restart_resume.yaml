@@ -1,0 +1,14 @@
+# 4b) INV-RESTART, phase 2 — resume from the log left by 04a.
+#     Assert RunResumed event present + workflow terminates.
+workflow: tiny_three_node
+run_id: restart-demo
+resume: true
+agent_scripts:
+  architect:
+    - plan: "after-resume"
+expect:
+  terminal: completed
+  events:
+    - {type: RunResumed, payload_contains: {after_node: load}}
+    - {type: NodeCompleted, node: architect}
+    - {type: RunTerminated, payload_contains: {terminal: completed}}

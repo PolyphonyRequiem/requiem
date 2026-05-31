@@ -1,0 +1,15 @@
+# 3) Assert a SPECIFIC event was emitted — RunStarted with run_id payload.
+#    Demonstrates payload_contains matching on the event stream.
+workflow: tiny_three_node
+run_id: event-assert-7
+agent_scripts:
+  architect:
+    - plan: "ok"
+expect:
+  terminal: completed
+  events:
+    - type: RunStarted
+      payload_contains:
+        inputs: {}
+    - type: NodeEntered
+      node: architect
