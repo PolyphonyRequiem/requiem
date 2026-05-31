@@ -1,0 +1,79 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-wheel-metadata/
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Tooling
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# --- Node (UI) ---
+node_modules/
+.npm
+.eslintcache
+*.tsbuildinfo
+.next/
+.nuxt/
+.cache/
+.parcel-cache/
+.vite/
+dist-ssr/
+.svelte-kit/
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Local runtime state ---
+.requiem/
+*.events.jsonl
+*.notifications.jsonl
+*.log
+
+# --- Secrets & local config ---
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
