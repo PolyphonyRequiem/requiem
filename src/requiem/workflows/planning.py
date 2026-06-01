@@ -1042,6 +1042,9 @@ def build_workflow() -> Workflow:
         .entry("start")
         .script("start", verb="start_run")
             .edge("start", on="success", to="guard_depth")
+            # Catch-all so a crash in start_run narrates instead of
+            # stranding the run with `route.missing` (issue #31).
+            .edge("start", on="permanent_failure", to="fail_end_crash")
         .script("guard_depth", verb="guard_depth")
             .edge("guard_depth", on="success", to="fetch_item")
             .edge(
@@ -1049,6 +1052,7 @@ def build_workflow() -> Workflow:
                 on="permanent_failure:depth_exceeded",
                 to="depth_gate",
             )
+            .edge("guard_depth", on="permanent_failure", to="fail_end_crash")
         .human_gate(
             "depth_gate",
             prompt="Max planning depth exceeded. Proceed manually?",
@@ -1068,6 +1072,9 @@ def build_workflow() -> Workflow:
                 on="permanent_failure:twig_unknown",
                 to="twig_gate",
             )
+            # Any other permanent_failure (verb.crash from an unexpected
+            # exception in the twig seam, etc.) → narrated crash terminal.
+            .edge("fetch_item", on="permanent_failure", to="fail_end_crash")
         .human_gate(
             "twig_gate",
             prompt="Twig returned an unrecognised failure. Proceed or abort?",
@@ -1108,6 +1115,9 @@ def build_workflow() -> Workflow:
             )
                 .edge(f"planner_{i}", on="success", to=f"reviewer_{i}")
                 .edge(f"planner_{i}", on="bad_output", to="bad_output_gate")
+                # Catch-all (verb.crash, provider failure, etc.) → narrated
+                # crash terminal (issue #31).
+                .edge(f"planner_{i}", on="permanent_failure", to="fail_end_crash")
             .agent(
                 f"reviewer_{i}",
                 agent="plan_reviewer",
@@ -1115,6 +1125,7 @@ def build_workflow() -> Workflow:
             )
                 .edge(f"reviewer_{i}", on="success", to=f"router_{i}")
                 .edge(f"reviewer_{i}", on="bad_output", to="bad_output_gate")
+                .edge(f"reviewer_{i}", on="permanent_failure", to="fail_end_crash")
             .script(f"router_{i}", verb=f"router_{i}")
                 .edge(f"router_{i}", on="success", to="branch_decomposable")
                 .edge(
@@ -1122,6 +1133,7 @@ def build_workflow() -> Workflow:
                     on="permanent_failure:escalate",
                     to="escalation_gate",
                 )
+                .edge(f"router_{i}", on="permanent_failure", to="fail_end_crash")
         )
         if i < ITER_CAP:
             b = b.edge(
@@ -1155,6 +1167,12 @@ def build_workflow() -> Workflow:
                 "branch_decomposable",
                 on="permanent_failure:too_many_children",
                 to="too_many_children_gate",
+            )
+            # Catch-all (verb.crash, unexpected errors) → narrated terminal.
+            .edge(
+                "branch_decomposable",
+                on="permanent_failure",
+                to="fail_end_crash",
             )
         .human_gate(
             "recursion_depth_gate",
@@ -1224,6 +1242,12 @@ def build_workflow() -> Workflow:
                     on="permanent_failure:cycle_detected",
                     to="cycle_gate",
                 )
+                # Catch-all (verb.crash, etc.) → narrated terminal.
+                .edge(
+                    f"prep_child_{i}",
+                    on="permanent_failure",
+                    to="fail_end_crash",
+                )
             .subworkflow(
                 f"child_{i}",
                 workflow="requiem.workflows.planning",
@@ -1264,12 +1288,24 @@ def build_workflow() -> Workflow:
             )
         .script("record_plan", verb="record_plan")
             .edge("record_plan", on="success", to="end")
+            .edge("record_plan", on="permanent_failure", to="fail_end_crash")
         .script("record_needs_human", verb="record_needs_human")
             .edge("record_needs_human", on="success", to="end_needs_human")
+            .edge(
+                "record_needs_human",
+                on="permanent_failure",
+                to="fail_end_crash",
+            )
         .terminate("end", disposition="completed")
         .terminate("end_needs_human", disposition="completed")
         .terminate("fail_end", disposition="failed")
         .terminate("fail_end_not_found", disposition="failed")
+        # Narrated crash terminal — every script/agent verb routes its
+        # catch-all `permanent_failure` here so a `verb.crash` (or any
+        # un-handled error_kind) hits a terminate node and the verdict
+        # card can name the crashed verb instead of stranding the run
+        # with `route.missing` (issue #31).
+        .terminate("fail_end_crash", disposition="failed")
         .humanize(_humanize_map())
     )
     return b.build()
@@ -1297,6 +1333,7 @@ def _humanize_map() -> dict[str, str]:
         "end_needs_human": "planning",
         "fail_end": "planning",
         "fail_end_not_found": "planning",
+        "fail_end_crash": "planning",
     }
     for i in range(1, ITER_CAP + 1):
         m[f"planner_{i}"] = f"Planner (iteration {i})"
@@ -1511,7 +1548,10 @@ def render_hints() -> dict:
         details[f"router_{i}"] = _detail_router
     for i in range(1, MAX_CHILDREN + 1):
         details[f"prep_child_{i}"] = _detail_prep_child
-    silent = {"start", "end", "end_needs_human", "fail_end", "fail_end_not_found"}
+    silent = {
+        "start", "end", "end_needs_human",
+        "fail_end", "fail_end_not_found", "fail_end_crash",
+    }
     # The prep_child nodes that returned no_more_children are noise for
     # most users; the topology pre-builds MAX_CHILDREN slots even when the
     # planner proposed fewer. They still fire as nodes though, so we
@@ -1542,13 +1582,25 @@ def _detail_prep_child(value: dict) -> str:
 def verdict_card(completed: dict) -> str | None:
     """The Demo Contract §3 verdict card.
 
-    Three shapes — leaf, decomposable (flat single-level), and
-    decomposable+recursive (multi-level tree). Falls back to None if no
-    plan was recorded (the CLI then prints nothing extra).
+    Three success shapes — leaf, decomposable (flat single-level), and
+    decomposable+recursive (multi-level tree) — plus a fourth
+    "crashed" shape for runs where a verb crashed (or returned an
+    un-routed `PermanentFailure`) and the catch-all edge sent the run to
+    ``fail_end_crash``. Without that fourth shape the operator would
+    see only ``route.missing`` and have no narrative for the failure
+    (issue #31).
+
+    Falls back to None if no plan was recorded *and* no crash trace can
+    be reconstructed from ``completed`` (the CLI then prints nothing
+    extra).
     """
     rec = completed.get("record_plan") or completed.get("record_needs_human")
     if not rec:
-        return None
+        # No plan was recorded → either we never reached planning, or a
+        # verb crashed mid-flight. Render a narrated "did not plan"
+        # card from the last failure in ``completed`` so the operator
+        # sees the crashed verb and its error_kind.
+        return _card_crashed(completed)
     v = rec.get("value") or {}
     decomposable = bool(v.get("decomposable"))
     item_id = v.get("item_id", "?")
@@ -1612,6 +1664,50 @@ def verdict_card(completed: dict) -> str | None:
         ]
     lines.append("─" * 69)
     return "\n".join(lines)
+
+
+def _card_crashed(completed: dict) -> str | None:
+    """Render a "did not plan" card for a run that crashed before recording.
+
+    Walks ``completed`` for non-success outcomes (the kernel records the
+    crashed verb's outcome dict in ``completed`` before the router fires,
+    so a ``verb.crash`` is always findable here). Picks the last failure
+    and names the crashed verb plus its ``error_kind`` / message.
+
+    Returns None if there is no failure to narrate — the renderer treats
+    that the same as "no card", preserving the pre-fix silence for
+    truly empty runs.
+
+    Companion to the catch-all ``permanent_failure`` edges added per
+    issue #31: those edges ensure the run terminates cleanly at
+    ``fail_end_crash`` instead of stranding with ``route.missing``, and
+    this helper turns the resulting ``completed`` map into a narrative.
+    """
+    failures: list[tuple[str, dict[str, Any]]] = []
+    for nid, payload in completed.items():
+        if not isinstance(payload, dict):
+            continue
+        kind = payload.get("kind")
+        if kind in ("permanent_failure", "needs_human", "bad_output"):
+            failures.append((nid, payload))
+    if not failures:
+        return None
+    nid, outcome = failures[-1]
+    error_kind = outcome.get("error_kind") or outcome.get("kind", "?")
+    message = (
+        outcome.get("message")
+        or outcome.get("prompt")
+        or outcome.get("kind", "?")
+    )
+    header = "─── Plan: crashed " + "─" * (69 - len("─── Plan: crashed "))
+    return "\n".join([
+        header,
+        "  ✕ Did not plan",
+        f"      Stopped at:  {nid}",
+        f"      Error kind:  {error_kind}",
+        f"      Reason:      {message}",
+        "─" * 69,
+    ])
 
 
 def _tree_stats(children: list[dict[str, Any]]) -> tuple[int, int]:

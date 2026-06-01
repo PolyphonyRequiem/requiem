@@ -572,3 +572,112 @@ def test_bad_output_is_distinct_from_permanent_failure():
     )
     assert bo.error_kind == "schema_mismatch"
     assert isinstance(bo.validation_errors, tuple)
+
+
+# ---- issue #31: catch-all crash narration -----------------------------
+
+
+class _CrashingTwig:
+    """Twig fake whose `show_async` raises an unexpected exception.
+
+    Not a ``TwigClientError`` subclass — the verb's ``except
+    TwigClientError`` won't catch it, so the kernel's ``_execute``
+    catches it instead and produces ``PermanentFailure(error_kind=
+    "verb.crash", message=...)``. This is the exact shape Tchaikovsky
+    saw in the BUG #1 asyncio collision pre-fix (kernel.py:460-464).
+    """
+
+    async def show_async(self, item_id: int):  # noqa: ARG002
+        raise RuntimeError("simulated planning-seat verb crash")
+
+
+async def test_planning_verb_crash_routes_to_narrated_terminal(log_dir: Path):
+    """A verb crash narrates via the verdict card instead of route.missing.
+
+    Issue #31: pre-fix, a ``verb.crash`` in any planning verb stranded
+    the run with ``Failed(error_kind='route.missing')`` and no verdict
+    card. Post-fix, the catch-all ``permanent_failure`` edge from every
+    script/agent verb routes the crash to the ``fail_end_crash``
+    terminate node so the run completes with a narrated card.
+    """
+    # No planner script — the run crashes inside fetch_item before any
+    # agent is invoked.
+    provider = FakeProvider(scripts={"planner": [], "plan_reviewer": []})
+    engine = build_engine(
+        log_dir,
+        item_id=ITEM_ID,
+        twig=_CrashingTwig(),
+        provider=provider,
+    )
+    result = await engine.run("crash")
+
+    # The run terminated cleanly (Completed with failed disposition),
+    # not Failed(route.missing). That alone is the issue #31 fix.
+    assert isinstance(result, Completed), result
+    assert result.disposition == "failed"
+    assert result.final_node == "fail_end_crash"
+
+    # The crash outcome was recorded against the crashing verb.
+    completed = completed_from_log(engine.log_path("crash"))
+    fetch_outcome = completed.get("fetch_item")
+    assert fetch_outcome is not None
+    assert fetch_outcome["kind"] == "permanent_failure"
+    assert fetch_outcome["error_kind"] == "verb.crash"
+    assert "RuntimeError" in fetch_outcome["message"]
+    assert "simulated planning-seat verb crash" in fetch_outcome["message"]
+
+    # The verdict card narrates the crash — naming the verb and the
+    # error_kind — instead of returning None (the pre-fix behaviour).
+    card = verdict_card(completed)
+    assert card is not None
+    assert "Did not plan" in card
+    assert "fetch_item" in card
+    assert "verb.crash" in card
+    assert "RuntimeError" in card
+
+    # The route_taken event for the catch-all `permanent_failure` edge
+    # fired — guards against future refactors that drop the edge.
+    events = list(replay(engine.log_path("crash")))
+    crash_routes = [
+        e for e in events
+        if e["kind"] == "route_taken"
+        and e.get("node_id") == "fetch_item"
+        and e["payload"].get("key") == "permanent_failure"
+        and e["payload"].get("to_node") == "fail_end_crash"
+    ]
+    assert len(crash_routes) == 1, crash_routes
+
+
+async def test_planner_agent_crash_also_narrates(log_dir: Path):
+    """The same catch-all wiring covers agent nodes (not just scripts).
+
+    Exercises the `planner_1` catch-all edge by handing the FakeProvider
+    a script entry shape it can't dispatch — its `invoke` raises
+    `TypeError`, the kernel converts it to `verb.crash`, and the new
+    catch-all edge routes to `fail_end_crash`.
+    """
+    # 42 is neither an Outcome nor a dict, so FakeProvider raises
+    # TypeError on dispatch.
+    provider = FakeProvider(scripts={"planner": [42], "plan_reviewer": []})
+    engine = build_engine(
+        log_dir,
+        item_id=ITEM_ID,
+        twig=_twig(),
+        provider=provider,
+    )
+    result = await engine.run("agent-crash")
+
+    assert isinstance(result, Completed), result
+    assert result.disposition == "failed"
+    assert result.final_node == "fail_end_crash"
+
+    completed = completed_from_log(engine.log_path("agent-crash"))
+    planner_outcome = completed.get("planner_1")
+    assert planner_outcome is not None
+    assert planner_outcome["kind"] == "permanent_failure"
+    assert planner_outcome["error_kind"] == "verb.crash"
+
+    card = verdict_card(completed)
+    assert card is not None
+    assert "planner_1" in card
+    assert "verb.crash" in card
