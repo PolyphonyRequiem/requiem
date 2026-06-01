@@ -78,3 +78,6 @@ Thumbs.db
 .env.*.local
 *.pem
 *.key
+
+# Local run artifacts (alongside *.events.jsonl)
+.runs/

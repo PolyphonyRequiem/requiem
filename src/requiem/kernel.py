@@ -128,10 +128,16 @@ class _AwaitingRoute:
 class _AwaitingGate:
     """`NeedsHuman` was emitted; the kernel needs a handler choice.
 
-    Carries ``prompt`` and ``options`` directly so the arm doesn't have
-    to look them up on the originating node — important when the gate
-    was *bubbled up* from a sub-workflow's child gate (the parent's node
-    is a ``SubWorkflowNode``, which has no ``prompt``/``options``).
+    Carries ``prompt`` + ``options`` directly so the arm doesn't have to
+    look them up on the originating node. Two cases motivate this:
+
+    1. Script-returned ``NeedsHuman``: the gate metadata only exists on
+       the outcome, not on the (non-existent) ``HumanGateNode``.
+    2. Sub-workflow bubble-up: the parent's node is a ``SubWorkflowNode``,
+       which has no ``prompt`` / ``options``; the child's gate text comes
+       through the outcome.
+
+    Reconstructed across a kill+resume from the ``gate_opened`` event.
     """
     node_id: str
     prompt: str = ""
@@ -377,11 +383,19 @@ class Engine:
                         return nxt.result
                     cursor = nxt
 
-                case _AwaitingGate(node_id=nid, prompt=prompt, options=options):
-                    if not prompt:
-                        gate_node = nm[nid]
-                        prompt = getattr(gate_node, "prompt", "") or ""
-                        options = tuple(getattr(gate_node, "options", ()) or ())
+                case _AwaitingGate(node_id=nid, prompt=stored_prompt, options=stored_opts):
+                    gate_node = nm.get(nid)
+                    # Static `human_gate` nodes carry prompt/options on the
+                    # node; script-returned `NeedsHuman` and sub-workflow
+                    # bubble-ups carry them on the cursor. Prefer node attrs
+                    # when present (non-empty); fall back to the cursor.
+                    prompt = (
+                        getattr(gate_node, "prompt", None) if gate_node is not None else None
+                    ) or stored_prompt
+                    options = tuple(
+                        (getattr(gate_node, "options", ()) if gate_node is not None else ())
+                        or stored_opts
+                    )
                     if self.gate_handler is None:
                         return Suspended(run_id, nid, prompt, options)
                     choice = self.gate_handler(nid, prompt, options)
@@ -637,7 +651,7 @@ class Engine:
             case NeedsHuman(prompt=p, options=opts, context=ctx):
                 auto = bool(getattr(self.gate_handler, "__requiem_auto__", False))
                 emitter.emit_gate_opened(node_id, p, list(opts), context=ctx, auto=auto)
-                return _AwaitingGate(node_id, p, tuple(opts))
+                return _AwaitingGate(node_id, prompt=p, options=tuple(opts))
 
             case Success():
                 if isinstance(node, TerminateNode):
@@ -805,8 +819,8 @@ def _reconstruct(
             case "gate_opened":
                 cursor = _AwaitingGate(
                     node,
-                    payload.get("prompt", ""),
-                    tuple(payload.get("options", ()) or ()),
+                    prompt=payload.get("prompt", ""),
+                    options=tuple(payload.get("options", ()) or ()),
                 )
             case "gate_resolved":
                 cursor = _RouteAfterGate(node, payload["choice"])

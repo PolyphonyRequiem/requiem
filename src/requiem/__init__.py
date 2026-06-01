@@ -39,6 +39,12 @@ from requiem.outcomes import (
 )
 from requiem.persistence import CorruptLogError, EventStore, replay
 from requiem.teams import TeamBranch
+from requiem.providers import (
+    AnthropicProvider,
+    OpenAIProvider,
+    default_provider,
+    make_receipt,
+)
 from requiem.clients.gh import (
     GhAuthError,
     GhClient,
@@ -79,6 +85,8 @@ __all__ = [
     "VerbRegistry", "AgentRegistry",
     # agent
     "AgentSpec", "AgentCall", "AgentProvider", "FakeProvider",
+    # providers (real LLMs)
+    "AnthropicProvider", "OpenAIProvider", "default_provider", "make_receipt",
     # toolbelt
     "Toolbelt", "FileClient", "GitClient",
     "FileRead", "FileMissing", "GitShowOk", "GitShowMissing", "GitNotARepo",
