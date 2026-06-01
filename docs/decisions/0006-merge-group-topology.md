@@ -563,8 +563,11 @@ under "Decision log" below as they close.
    from `"mg/, impl/"` to **"per-item review + integration surface"**.
    Option D is accepted. See "Decision log → Q1" below.
 
-2. **Plan-PR realisation: real PR or virtual artefact?** — OPEN. Tracked
-   as Q2 in `docs/briefings/open-questions-wave7.md`.
+2. **Plan-PR realisation: real PR or virtual artefact?** — **CLOSED 2026-06-01.**
+   Resolution: build the plan-PR capability (`plan/<root>` branch + PR-cut
+   verb against the feature trunk). The cut/gate/persist policy is
+   agent-evaluated × user-policy and lives in ADR-0008. See
+   "Decision log → Q2" below.
 
 3. **Atomic co-merge guarantee — how strict?** — OPEN. Tracked as Q5.
 
@@ -636,11 +639,75 @@ trunk or escalates to a PR if the local reviewer flags concerns.
 
 **Follow-up actions:**
 
-1. **Dispatch ADR-0008 (review-surface curation)** as a Wave 7 design
-   seat after the remaining Q's are resolved (Q7 is the natural touch
-   point).
+1. **Dispatch ADR-0008 (curated artifacts across the run lifecycle)** as a
+   Wave 7 design seat after the remaining Q's are resolved (Q7 is the
+   natural touch point). Scope expanded by Q2 to cover plan PR
+   cut/gate/persist in addition to impl-slice review-surface curation.
 2. **Update Mahler-3's parity audit row #7** wording when ADR-0008's
    shape is settled (do it in one pass to avoid two amendments).
+
+---
+
+### Q2 (closed 2026-06-01) — plan-PR realisation
+
+**Decision:** Build the plan-PR capability for v0. A `plan/<root>` branch
+opens a PR against the `feature/<root>` trunk, with the
+JSON-rendered-to-markdown plan as the diff. Whether to use the capability
+on any given run, and what happens to the plan content downstream, is an
+agent-evaluated × user-policy decision deferred to **ADR-0008**.
+
+**The framing that closed it (Daniel's reframe):** the original Q2 binary
+("real PR vs virtual markdown in the feature-PR body") was a false
+dichotomy. The plan PR's lifecycle has three staged decisions, each of
+which is an agent-evaluated policy call, not a static design choice:
+
+| Stage | Question | Owner |
+|---|---|---|
+| **Cut** | Should we open a plan PR for *this* initial planning pass? | Agent evaluates complexity × user policy. Below threshold → no plan PR; the run keeps going. |
+| **Gate** | If cut, impl waits on the plan PR's trunk merge. | Deterministic from the cut decision. |
+| **Persist** | When the feature trunk merges to main, do plan docs ride along, get transformed (squash to an as-built summary), or get stripped? | Agent evaluates "does this still add post-impl value?" × user policy. |
+
+**Invariant amendment:** INV-PLAN-PR-PRECEDES-IMPL is reworded from
+"plan PR merges before impl branches are cut" to:
+
+> **INV-PLAN-PR-PRECEDES-IMPL (revised):** *If* the curator elects to
+> cut a plan PR, the plan PR's merge to the feature trunk precedes any
+> impl-branch cut for the same run. If the curator skips the plan PR
+> (initial-planning complexity below review threshold per agent
+> evaluation × user policy), this invariant is vacuous and impl
+> proceeds directly.
+
+**Why "build the surface" was the v0 call:** without the capability the
+curator has no lever to pull and the gate/replan shape is foreclosed
+forever. With the capability the curator can decide per-run whether to
+use it — including "skip for trivial roots, auto-confirm without
+operator review." Same ~1-day engineering cost as Stravinsky's original
+recommendation; what changes is *when* the capability gets used.
+
+**ADR-0008 scope expansion (this question grew it):** the ADR now covers
+**curated artifacts across the run lifecycle**, not just impl-slice
+review-surface curation. The pattern generalises:
+
+| Family | Cut? | Gate? | Persist? |
+|---|---|---|---|
+| Plan | curator | conditional on cut | curator |
+| Impl slice | `auto_merge` / `local_review` / `pr_review` | depends on review intent | always (it's the code) |
+| *(future)* design docs, ADRs, scratch notes | same pattern | same pattern | same pattern |
+
+**Replan carve-out:** replan policy may differ from initial-plan policy.
+Punted to Q6 (replan in scope for v0). If Q6 = "no replan in v0," replan
+curator policy doesn't need to be settled today.
+
+**Follow-up actions:**
+
+1. **ADR-0008 must address all three stages** (cut, gate, persist) for
+   the plan family in addition to impl-slice review-surface curation.
+2. **Strip-on-persist needs a concrete mechanism.** Candidate: a final
+   commit on the feature trunk before trunk→main merge that removes the
+   plan sidecar (or transforms it). Spec lives in ADR-0008.
+3. **`plan_pr` verb spec.** Lives in implementation work after ADR-0008
+   resolves the policy hooks. Should accept the curator's cut decision
+   as input rather than always cutting.
 
 ---
 

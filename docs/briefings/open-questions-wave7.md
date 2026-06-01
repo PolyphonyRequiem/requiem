@@ -12,6 +12,23 @@
 > **Not authoritative.** Decisions go back into the ADRs and the open
 > questions close there, not here.
 
+> ---
+>
+> **META (added 2026-06-01 during walkthrough):**
+>
+> 1. **ADO-first orientation.** Requiem's #1 customer scenario is pure
+>    ADO. GitHub is supported, not the default. Where the briefing's
+>    existing prose says "GitHub PR" or assumes `gh` as the default,
+>    read "ADO PR by default; GitHub when configured." Q3/Q4 onwards
+>    are framed ADO-first explicitly.
+> 2. **Curator-policy pattern (from Q1).** Several questions below
+>    have "always vs never" binaries that are actually staged: (a) do
+>    we *build the surface*? (b) what's the *agent-evaluated policy*
+>    that decides when to use it? The policy half lands in
+>    **ADR-0008 (curated artifacts across the run lifecycle)** —
+>    seeded by Q1, scope expanded by Q2 to cover plan PR cut + gate +
+>    persist, in addition to impl-slice review-surface curation.
+
 ---
 
 ## Table of contents
@@ -19,7 +36,7 @@
 | # | Slug | Source | Decision needed (one line) |
 |---|------|--------|---------------------------|
 | Q1 | [non-negotiable-7 reading](#q1-non-negotiable-7-reading-strict-mg-prefix-vs-load-bearing) | ADR-0006 OQ1 | **CLOSED 2026-06-01: Option D (load-bearing reading). See "Q1 — closed" below.** |
-| Q2 | [plan-PR realisation](#q2-plan-pr-real-branchpr-vs-markdown-in-the-feature-pr) | ADR-0006 OQ2 | Real `plan/<root>` branch + PR, or markdown in the feature-PR description? |
+| Q2 | [plan-PR realisation](#q2-plan-pr-real-branchpr-vs-markdown-in-the-feature-pr) | ADR-0006 OQ2 | **CLOSED 2026-06-01: build the plan-PR capability; cut/gate/persist policy → ADR-0008. See "Q2 — closed" below.** |
 | Q3 | [platform meaning for git](#q3-what-does-the-platform-mean-for-git-operations) | ADR-0007 Q-C | Is "platform" the PR-host only (GitHub) with twig-side work-item integration, or a richer cross-platform composite? |
 | Q4 | [ADO auth: PAT vs OIDC](#q4-pat-vs-oidc-for-the-adoclient) | ADR-0007 Q-A | Ship the ADO client with PAT (env var) for v0, or block on OIDC? |
 | Q5 | [atomic co-merge recovery](#q5-how-strict-is-the-atomic-co-merge-guarantee-when-one-leaf-fails-mid-trunk) | ADR-0006 OQ3 | Abandon-trunk-and-restart, or roll-forward with a human gate, when one leaf fails after siblings landed? |
@@ -154,7 +171,50 @@ wrong here because the migration D → A is additive while A → D is not
 
 ## Q2: Plan PR — real branch+PR vs markdown in the feature PR
 
-### § Decision needed
+> **STATUS: CLOSED 2026-06-01 during Bruckner walkthrough.**
+>
+> **Resolution: Build the plan-PR capability for v0** (`plan/<root>`
+> branch + PR-cut verb against the feature trunk). Whether to use it
+> on any given run, and what happens to its content downstream, is an
+> **agent-evaluated × user-policy** decision deferred to ADR-0008.
+>
+> The original Q2 binary ("real PR vs virtual markdown") was a false
+> dichotomy. Daniel's framing collapsed it into three staged decisions:
+>
+> | Stage | Question | Owner |
+> |---|---|---|
+> | **Cut** | Should we open a plan PR for *this* run? | Agent evaluates initial-planning complexity × user policy. If below threshold → no plan PR, keep going. |
+> | **Gate** | If cut, impl waits on its trunk merge. | Deterministic from the cut decision. INV-PLAN-PR-PRECEDES-IMPL is reworded "*if* a plan PR is cut, impl waits on its trunk merge." |
+> | **Persist** | When the feature trunk merges to main, do plan docs ride along, get transformed (squash to an as-built summary), or get stripped? | Agent evaluates "does this still add post-impl value?" × user policy. |
+>
+> **Why "build the surface" is the v0 call:** without the capability,
+> the curator has no lever to pull and the gate/replan shape is
+> foreclosed forever. With the capability, the curator can decide
+> per-run whether to use it (including "skip for trivial roots,
+> auto-confirm without operator review"). Same ~1-day cost as
+> Stravinsky's original recommendation; what changes is *when* it
+> gets used.
+>
+> **ADR-0008 scope expansion (this question grew it):** the ADR now
+> covers **curated artifacts across the run lifecycle**, not just
+> impl-slice review-surface curation. The pattern:
+>
+> | Family | Cut? | Gate? | Persist? |
+> |---|---|---|---|
+> | Plan | curator | conditional on cut | curator |
+> | Impl slice | `auto_merge` / `local_review` / `pr_review` | depends on review intent | always (it's the code) |
+> | *(future)* design docs, ADRs, scratch notes | same pattern | same pattern | same pattern |
+>
+> **Replan carve-out:** replan policy may differ from initial-plan
+> policy. Punted to Q6 (replan in scope for v0). If Q6 = "no replan
+> in v0," replan-curator policy doesn't need to be settled today.
+>
+> See [ADR-0006 → Decision log → Q2](../decisions/0006-merge-group-topology.md)
+> for the canonical record.
+
+---
+
+### § Decision needed (historical)
 Is the plan PR a real `plan/<root>` branch with its own GitHub PR
 (reviewable in the browser before any impl branch is cut), or markdown
 rendered into the feature-PR's description body?
