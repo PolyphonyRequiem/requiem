@@ -430,12 +430,12 @@ def build_verb_registry(
     # ---- fetch_plan ---------------------------------------------------
 
     @verbs.register("fetch_plan")
-    def _fetch_plan(ctx):
+    async def _fetch_plan(ctx):
         twig = _require_twig(ctx)
         if isinstance(twig, PermanentFailure):
             return twig
         try:
-            item = twig.show(inputs.item_id)
+            item = await twig.show_async(inputs.item_id)
         except TwigItemNotFoundError as e:
             return PermanentFailure(
                 error_kind="plan.not_found",
@@ -898,7 +898,7 @@ def build_verb_registry(
     # ---- link_pr_to_item ---------------------------------------------
 
     @verbs.register("link_pr_to_item")
-    def _link_pr(ctx):
+    async def _link_pr(ctx):
         if inputs.dry_run:
             return Success(value={"linked": False, "dry_run": True})
         pr = ctx.completed.get("create_pr", {}).get("value", {})
@@ -909,7 +909,7 @@ def build_verb_registry(
         if isinstance(twig, PermanentFailure):
             return twig
         try:
-            twig.comment(
+            await twig.comment_async(
                 inputs.item_id,
                 f"PR opened by Requiem implementation workflow: {url}",
             )
@@ -1284,10 +1284,10 @@ def _detect_default_branch(repo_path: Path) -> str:
 class _DemoTwigClient:
     """In-memory TwigClient stand-in for the CLI demo / unit tests.
 
-    Satisfies the methods our verbs call (``show``, ``comment``) without
-    shelling out to a real `twig` binary. Tests that want to assert
-    error paths instantiate this directly or pass their own duck-typed
-    fake.
+    Satisfies the methods our verbs call (``show_async``, ``comment_async``)
+    without shelling out to a real `twig` binary. Tests that want to
+    assert error paths instantiate this directly or pass their own
+    duck-typed fake.
     """
     item_id: int = 12345
     title: str = "Demo: implementation-workflow walking skeleton"
@@ -1295,7 +1295,7 @@ class _DemoTwigClient:
     raise_on_comment: Exception | None = None
     comments: list[tuple[int, str]] = field(default_factory=list)
 
-    def show(self, item_id: int):
+    async def show_async(self, item_id: int):
         if self.raise_on_show is not None:
             raise self.raise_on_show
         from requiem.clients.twig import TwigItem
@@ -1313,7 +1313,7 @@ class _DemoTwigClient:
             },
         )
 
-    def comment(self, item_id: int, message: str) -> None:
+    async def comment_async(self, item_id: int, message: str) -> None:
         if self.raise_on_comment is not None:
             raise self.raise_on_comment
         self.comments.append((item_id, message))

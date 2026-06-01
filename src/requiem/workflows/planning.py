@@ -160,9 +160,16 @@ class TwigClientProto(Protocol):
 
     Declared as a Protocol so tests can substitute fakes without touching
     the real subprocess seam. The real client satisfies this structurally.
+
+    NOTE: the protocol requires the *async* surface. The sync `show()`
+    wrapper on the real `TwigClient` internally calls `asyncio.run`, which
+    explodes when invoked from a verb running under the kernel's own
+    event loop (see `tests/test_bugbash_regressions.py` —
+    `test_planning_fetch_item_does_not_call_sync_twig`). Verbs must
+    `await twig.show_async(...)` so the call stays on the kernel loop.
     """
 
-    def show(self, item_id: int) -> TwigItem: ...
+    async def show_async(self, item_id: int) -> TwigItem: ...
 
 
 @dataclass
@@ -175,7 +182,7 @@ class FakeTwigClient:
 
     items: dict[int, TwigItem] = field(default_factory=dict)
 
-    def show(self, item_id: int) -> TwigItem:
+    async def show_async(self, item_id: int) -> TwigItem:
         if item_id not in self.items:
             raise TwigItemNotFoundError(f"fake: item {item_id} not found")
         return self.items[item_id]
@@ -224,9 +231,9 @@ def build_verb_registry(
         return Success(value={"current_depth": current_depth, "max_depth": max_depth})
 
     @verbs.register("fetch_item")
-    def _fetch(ctx):
+    async def _fetch(ctx):
         try:
-            item = twig.show(item_id)
+            item = await twig.show_async(item_id)
         except TwigItemNotFoundError as e:
             return PermanentFailure(
                 error_kind="twig_not_found",
