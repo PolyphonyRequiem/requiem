@@ -286,6 +286,18 @@ class Engine:
             return Failed(run_id, final, "cancelled", f"operator cancel: {cursor.reason}")
 
         while True:
+            # If the log already contains a terminal run_completed, the
+            # cursor is _Terminated and we exit here without re-emitting.
+            # This satisfies INV-CANCEL-RESUME-IDEMPOTENT: resuming a
+            # cancelled (or completed) run does NOT grow the log by one
+            # run_completed per resume. Must come BEFORE the pending-
+            # cancel scan, which would otherwise re-fire on every resume.
+            if isinstance(cursor, _Terminated):
+                return Completed(
+                    run_id, cursor.terminal, cursor.final_node,
+                    _projection(list(replay(self.log_path(run_id))))
+                )
+
             # Re-check the log tail for a cancel_requested that arrived after
             # we started looping (in-process cancel). Cheap: O(N) on log size,
             # called once per cursor step; the demo run is ~30 events.
@@ -302,6 +314,8 @@ class Engine:
                 )
             match cursor:
                 case _Terminated(terminal=t, final_node=f):
+                    # Unreachable: handled at top of loop. Kept for
+                    # exhaustiveness of the match statement.
                     return Completed(
                         run_id, t, f, _projection(list(replay(self.log_path(run_id))))
                     )
@@ -378,7 +392,7 @@ class Engine:
                     cursor = _AwaitingRoute(nid, odict, at)
 
                 case _AwaitingRoute(node_id=nid, outcome=odict, attempt=at):
-                    nxt = self._route(nid, odict, at, em, nm, emitter, run_id)
+                    nxt = await self._route(nid, odict, at, em, nm, emitter, run_id)
                     if isinstance(nxt, _Halt):
                         return nxt.result
                     cursor = nxt
@@ -594,7 +608,15 @@ class Engine:
 
     # ---- route dispatch (one match arm per outcome variant) --------
 
-    def _route(
+    _RETRY_AFTER_HARD_CAP_S: float = 60.0
+    """Hard ceiling on `await asyncio.sleep(after)` between retries.
+
+    A buggy provider that echoes ``Retry-After: 999999`` must not block
+    the kernel for ~11 days. Anything above this cap routes to a
+    `NeedsHuman` gate so the operator decides whether the run is worth
+    waiting on (ADR 0004 §4.2; Mozart Open Q #2)."""
+
+    async def _route(
         self,
         node_id: str,
         outcome_dict: dict[str, Any],
@@ -612,9 +634,32 @@ class Engine:
                 emitter.emit_run_completed("cancelled", node_id)
                 return _Halt(Failed(run_id, node_id, "cancelled", f"{cause} at {step}"))
 
-            case RetryableFailure(error_kind=ek, message=msg):
+            case RetryableFailure(error_kind=ek, message=msg, after=after):
                 if attempt <= getattr(node, "retry_max", 0):
-                    emitter.emit_retry_attempted(node_id, attempt, attempt + 1, msg)
+                    # If the provider asked us to wait longer than we're
+                    # willing to block, escalate to a gate. The operator
+                    # can either resume (taking the retry) or cancel.
+                    if after is not None and after > self._RETRY_AFTER_HARD_CAP_S:
+                        prompt = (
+                            f"{node_id}: provider asked for Retry-After={after:.0f}s "
+                            f"(> {self._RETRY_AFTER_HARD_CAP_S:.0f}s cap). "
+                            f"error_kind={ek!r}; message={msg!r}"
+                        )
+                        options = ("retry", "abort")
+                        auto = bool(getattr(self.gate_handler, "__requiem_auto__", False))
+                        emitter.emit_gate_opened(
+                            node_id, prompt, list(options), context={
+                                "retry_after_s": after, "error_kind": ek,
+                            }, auto=auto,
+                        )
+                        return _AwaitingGate(
+                            node_id, prompt=prompt, options=options,
+                        )
+                    if after is not None and after > 0:
+                        await asyncio.sleep(min(after, self._RETRY_AFTER_HARD_CAP_S))
+                    emitter.emit_retry_attempted(
+                        node_id, attempt, attempt + 1, msg, after=after,
+                    )
                     return _AtNode(node_id, attempt + 1)
                 nxt = em.get((node_id, "retry_exhausted"))
                 if nxt is None:

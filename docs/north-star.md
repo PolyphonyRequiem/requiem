@@ -56,6 +56,16 @@ A sub-workflow's events live in its own `{sub_run_id}.events.jsonl` file. The pa
 
 > *Why load-bearing:* without this, recursive workflows (planning that calls planning) cross-contaminate cursors on resume, and INV-RESTART becomes unprovable across nesting layers. Brahms-harness PR #6 surfaced this as a candidate during Phase A; ADR 0005 (sub-workflow invocation primitive) made it law.
 
+### INV-LOG-STRICT-STOP-ON-CORRUPTION
+A partial or unparseable JSON line anywhere in the event log halts `replay()` immediately with `CorruptLogError`. Silently eliding bytes risks dropping a `verb_completed` whose absence would cause re-execution of an already-mutating verb, violating `INV-RESTART` idempotency. The CLI surfaces the error as a recoverable verdict so the operator can decide whether to truncate or repair.
+
+> *Why load-bearing:* this is the strict reading of `INV-NO-CORRUPT-FORWARD` applied to the log substrate itself. Surfaced as a candidate by the Rachmaninov resume-fidelity matrix; ratified to §2 by Saint-Saëns Phase B cleanup. Pinned by `tests/test_resume_pathological.py::test_truncated_mid_line_refuses_to_resume` and `tests/test_resume_fidelity.py::test_m1_truncate_mid_line_refuses_to_resume`.
+
+### INV-CANCEL-RESUME-IDEMPOTENT
+Resuming a run whose log already terminates in `run_completed` does not append any further events. The engine detects the terminal state during cursor reconstruction and short-circuits before any cancel-rescan or emit-loop can fire. Disposition stability is preserved (the operator-visible verdict never changes) AND the log is byte-idempotent across re-resume.
+
+> *Why load-bearing:* without this, every re-resume of a cancelled run grew the log by one `run_completed("cancelled")`, eroding the "the log is the truth" guarantee and producing misleading byte-diffs. Surfaced as a candidate by Rachmaninov Phase B; ratified to §2 by Saint-Saëns Phase B cleanup. Pinned by `tests/test_resume_fidelity.py::test_m4_cancel_mid_flight_short_circuits` (strict `extra == 0` assertion).
+
 ---
 
 ## §3 Vocabulary
@@ -116,8 +126,8 @@ When in doubt, the deep-dive reviews (Boulez + Ravel) define the bar for adding 
 
 > Surfaced by the Phase B / Rachmaninov resume-fidelity matrix (`tests/test_resume_fidelity.py`, `tests/test_resume_fidelity_matrix.py`, `tests/test_resume_pathological.py`). Each candidate is either (a) a documented gap where the kernel's *actual* behaviour deserves to be promoted to an absolute invariant after a Boulez/Ravel-grade review, or (b) a tension between the brief's speculated invariant and what INV-NO-CORRUPT-FORWARD actually implies. Each carries a regression-pin test today so any future change is intentional.
 
-### INV-PARTIAL-LINE-DROP *(candidate; strict-stop adopted instead)*
-A partial JSON line at the end of the event log is **not** silently dropped — the kernel raises `CorruptLogError`. This is the strict-stop reading of `INV-NO-CORRUPT-FORWARD`: silently eliding bytes risks dropping a `verb_completed` whose absence would cause re-execution of an already-mutating verb, violating `INV-RESTART` idempotency. The brief's "drop and resume" framing is rejected in favour of strict-stop until a stronger argument lands.
+### INV-PARTIAL-LINE-DROP *(promoted to §2 — see INV-LOG-STRICT-STOP-ON-CORRUPTION)*
+Ratified by Saint-Saëns Phase B cleanup. The kernel's strict-stop behaviour (raising `CorruptLogError` on any partial JSON line) is now a core invariant; the candidate framing here is retained as a pointer for prior-art readers.
 
 *Pinned by:* `tests/test_resume_pathological.py::test_truncated_mid_line_refuses_to_resume` and `tests/test_resume_fidelity.py::test_m1_truncate_mid_line_refuses_to_resume`.
 
@@ -146,10 +156,10 @@ A zero-byte log file or a missing log file is treated as a fresh run. The Rachma
 
 *Pinned by:* `tests/test_resume_pathological.py::test_empty_log_starts_fresh` and `::test_missing_log_starts_fresh`.
 
-### INV-CANCEL-RESUME-IDEMPOTENT *(candidate; not satisfied today)*
-A run that has reached `terminal=cancelled` re-emits `run_completed("cancelled")` every time it is resumed. The disposition the operator cares about (`cancelled`) is stable, but the log grows by one event per resume — a violation of byte-idempotency for the terminal state. Promotion to an absolute invariant requires `_pending_cancel` to consult whether the cancel has already produced a `run_completed`.
+### INV-CANCEL-RESUME-IDEMPOTENT *(promoted to §2)*
+Ratified by Saint-Saëns Phase B cleanup. Resuming a run whose log already terminates in `run_completed` no longer appends a second `run_completed` — see §2 INV-CANCEL-RESUME-IDEMPOTENT for the full statement.
 
-*Pinned by:* `tests/test_resume_fidelity.py::test_m4_cancel_mid_flight_short_circuits` (asserts the documented `+1` quirk explicitly so a fix is visible).
+*Pinned by:* `tests/test_resume_fidelity.py::test_m4_cancel_mid_flight_short_circuits` (strict `extra == 0` assertion).
 
 ---
 

@@ -117,6 +117,22 @@ def test_retry_collapses_into_single_retry_line():
     assert "Lint" in line and "retrying" in line and "attempt 2" in line
 
 
+def test_retry_attempted_renders_after_suffix_when_provider_set_retry_after():
+    """Saint-Saëns Item G: when the provider returned ``Retry-After: Ns``
+    and the kernel threaded it through ``retry_attempted.payload['after']``,
+    the renderer surfaces it as an inline ``after Ns`` suffix so the
+    operator sees the backoff visibly."""
+    cx = RenderContext(workflow_name="d", humanize={"flaky_lint": "Lint"})
+    cx.attempts["flaky_lint"] = 1
+    ra = _envelope(
+        "retry_attempted", _node="flaky_lint", attempt=1, next_attempt=2,
+        reason="rate limited", after=42.0,
+    )
+    [line] = render_event(ra, cx)
+    assert "after 42.0s" in line
+    assert "attempt 2" in line
+
+
 def test_post_retry_success_says_attempt_n():
     cx = RenderContext(workflow_name="d", humanize={"flaky_lint": "Lint"})
     cx.attempts["flaky_lint"] = 2

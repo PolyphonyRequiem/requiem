@@ -125,15 +125,22 @@ class EventEmitter:
         self._emit("verb_completed", node_id=node_id, outcome=outcome)
 
     def emit_retry_attempted(
-        self, node_id: str, attempt: int, next_attempt: int, reason: str
+        self,
+        node_id: str,
+        attempt: int,
+        next_attempt: int,
+        reason: str,
+        after: float | None = None,
     ) -> None:
-        self._emit(
-            "retry_attempted",
-            node_id=node_id,
-            attempt=attempt,
-            next_attempt=next_attempt,
-            reason=reason,
-        )
+        payload: dict[str, Any] = {
+            "node_id": node_id,
+            "attempt": attempt,
+            "next_attempt": next_attempt,
+            "reason": reason,
+        }
+        if after is not None:
+            payload["after"] = after
+        self._emit("retry_attempted", **payload)
 
     def emit_route_taken(self, from_node: str, key: str, to_node: str) -> None:
         self._emit("route_taken", node_id=from_node, key=key, to_node=to_node)

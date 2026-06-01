@@ -103,6 +103,11 @@ async def test_happy_path_with_schema_returns_success():
     assert receipt["output_tokens"] == 22
     assert receipt["request_id"] == "msg_test_01"
 
+    # ADR 0004 §4.4: receipts are also exposed on the peer field on the
+    # outcome envelope. Same receipt dict in both places at v0 — the
+    # in-value copy stays for backwards-compat.
+    assert out.receipts == (receipt,)
+
     # Request payload sanity: forced tool_choice, the right tool, the charter.
     assert len(seen) == 1
     body = json.loads(seen[0].content.decode("utf-8"))
@@ -177,6 +182,11 @@ async def test_rate_limit_returns_retryable_with_retry_after():
     assert isinstance(out, RetryableFailure)
     assert out.error_kind == "rate_limited"
     assert "retry_after=42s" in out.message
+    # ADR 0004 §4.2: typed ``after`` field carries the same hint so the
+    # kernel can sleep on it without re-parsing the message suffix.
+    assert out.after == 42.0
+    # Peer receipt populated per ADR 0004 §4.4.
+    assert out.receipts and out.receipts[0]["kind"] == "llm_call"
 
 
 async def test_rate_limit_without_header_uses_default_after():

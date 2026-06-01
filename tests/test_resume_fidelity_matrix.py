@@ -31,17 +31,18 @@ crash-point class from the Rachmaninov brief is exhaustively covered:
     10     after gate_resolved, before downstream node             gate M1
     11     after cancel_requested, before short-circuit            demo M4
     12     after retry_attempted, before re-attempt invocation     demo M1
-    13     subworkflow_started before child completes              N/A — no
-                                                                    subworkflow
-                                                                    primitive
-                                                                    in kernel v0
-    14     after subworkflow_completed, before parent routed       N/A — same
+    13     subworkflow_started before child completes              matrix
+                                                                    class13
+    14     after subworkflow_completed, before parent routed       matrix
+                                                                    class14
 
-Crash-points 13/14 are deferred: ``Engine`` v0 has no ``subworkflow`` node
-kind (Berlioz's PR hasn't merged at the time of this branch). When it
-lands, this file should be extended with a subworkflow fixture and two
-additional matrix rows. Documented in the docstring rather than the test
-body to keep the matrix honest about its current scope.
+Crash-points 13/14 are pinned by ``test_class13_crash_mid_subworkflow``
+and ``test_class14_crash_post_subworkflow_completed`` (this file), which
+drive a minimal parent/child fixture pair (borrowing the synthetic-module
+helpers from ``test_subworkflow.py``). They are explicit named tests
+rather than matrix shapes because the subworkflow shape needs paired
+parent + child logs that the SHAPES tuple's "one engine per shape" API
+doesn't model cleanly.
 
 INV-RESTART is the load-bearing assertion: ``Engine.resume(run_id, log_dir)``
 on the truncated log reaches the same terminal disposition as the
@@ -342,3 +343,114 @@ async def test_class6_crash_mid_loop_after_second_iteration(tmp_path: Path) -> N
         if e["kind"] == "verb_completed" and e["node_id"] == "check"
     ]
     assert len(final_check_completions) == 3, final_check_completions
+
+
+# ---- subworkflow crash-points (classes 13 & 14) --------------------
+#
+# These borrow the synthetic-module helpers from ``tests/test_subworkflow.py``
+# rather than re-encoding them; the helpers are the canonical fixtures
+# for building parent/child pairs in-process.
+
+from tests.test_subworkflow import (  # noqa: E402
+    _parent_engine,
+    _parent_wrapping,
+    _register_child_module,
+    _trivial_child_workflow,
+)
+
+
+async def test_class13_crash_mid_subworkflow(tmp_path: Path) -> None:
+    """Brief class 13: crash after ``subworkflow_started``, before the child
+    emits ``subworkflow_completed``.
+
+    Resume must re-attach to the child engine (driving it to completion in
+    its own log) and NOT emit a second ``subworkflow_started`` on the
+    parent — that would re-invoke the child verb, violating INV-RESTART.
+    """
+    cb, cv = _trivial_child_workflow("child_class13")
+    mod = _register_child_module(
+        "tests._matrix_sub_13", builder=cb, verbs_factory=cv,
+    )
+    pb = _parent_wrapping(mod)
+
+    # Capture canonical first.
+    canonical_dir = tmp_path / "c13_canonical"
+    canonical_dir.mkdir()
+    canonical_result = await _parent_engine(pb, canonical_dir).run("c13")
+    assert isinstance(canonical_result, Completed)
+    canonical_parent = list(replay(canonical_dir / "c13.events.jsonl"))
+
+    # Truncate parent log to just after subworkflow_started.
+    cut_at = next(
+        i for i, e in enumerate(canonical_parent)
+        if e["kind"] == "subworkflow_started"
+    ) + 1
+    log_dir = tmp_path / "c13"
+    log_dir.mkdir()
+    _write_truncated(log_dir / "c13.events.jsonl", canonical_parent[:cut_at])
+    # Child log absent — pretend child never produced an event either.
+
+    result = await _parent_engine(pb, log_dir).run("c13")
+    assert isinstance(result, Completed)
+    assert result.disposition == "completed"
+
+    parent_after = list(replay(log_dir / "c13.events.jsonl"))
+    starts = [e for e in parent_after if e["kind"] == "subworkflow_started"]
+    completes = [e for e in parent_after if e["kind"] == "subworkflow_completed"]
+    assert len(starts) == 1, "resume must not emit a second subworkflow_started"
+    assert len(completes) == 1, "resume must drive the child to completion"
+
+
+async def test_class14_crash_post_subworkflow_completed(tmp_path: Path) -> None:
+    """Brief class 14: crash after ``subworkflow_completed``, before the
+    parent's next ``route_taken``.
+
+    Resume must route on the *stored* child outcome — NOT re-invoke the
+    (already-finished) child. The pin is: exactly one ``subworkflow_started``
+    and exactly one ``subworkflow_completed`` in the final log.
+    """
+    cb, cv = _trivial_child_workflow("child_class14")
+    mod = _register_child_module(
+        "tests._matrix_sub_14", builder=cb, verbs_factory=cv,
+    )
+    pb = _parent_wrapping(mod)
+
+    canonical_dir = tmp_path / "c14_canonical"
+    canonical_dir.mkdir()
+    canonical_result = await _parent_engine(pb, canonical_dir).run("c14")
+    assert isinstance(canonical_result, Completed)
+    canonical_parent = list(replay(canonical_dir / "c14.events.jsonl"))
+
+    cut_at = next(
+        i for i, e in enumerate(canonical_parent)
+        if e["kind"] == "subworkflow_completed"
+    ) + 1
+
+    log_dir = tmp_path / "c14"
+    log_dir.mkdir()
+    _write_truncated(log_dir / "c14.events.jsonl", canonical_parent[:cut_at])
+    # Preserve the child's completed log so the parent's resume doesn't
+    # need to re-run the child even by accident.
+    child_log_src = canonical_dir / "c14__call_child.events.jsonl"
+    if child_log_src.exists():
+        (log_dir / "c14__call_child.events.jsonl").write_bytes(
+            child_log_src.read_bytes()
+        )
+
+    result = await _parent_engine(pb, log_dir).run("c14")
+    assert isinstance(result, Completed)
+    assert result.disposition == "completed"
+
+    parent_after = list(replay(log_dir / "c14.events.jsonl"))
+    starts = [e for e in parent_after if e["kind"] == "subworkflow_started"]
+    completes = [e for e in parent_after if e["kind"] == "subworkflow_completed"]
+    assert len(starts) == 1, starts
+    assert len(completes) == 1, completes
+    # Routing must have happened post-resume: a route_taken keyed to
+    # ``call_child`` on a ``success`` arm.
+    routes = [
+        e for e in parent_after
+        if e["kind"] == "route_taken" and e.get("node_id") == "call_child"
+    ]
+    assert len(routes) == 1, routes
+    assert routes[0]["payload"]["key"].startswith("success")
