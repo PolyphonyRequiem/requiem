@@ -51,6 +51,11 @@ The engine does not initiate abandonment. Retry exhaustion routes to *surrender*
 
 > *Why load-bearing:* this closes the "what is abandonment" question definitively. The engine refuses to make irreversible decisions on the operator's behalf.
 
+### INV-SUBWORKFLOW-LOG-ISOLATION
+A sub-workflow's events live in its own `{sub_run_id}.events.jsonl` file. The parent's event log records only `subworkflow_started` / `subworkflow_completed` / `subworkflow_cancelled` markers — never the child's per-step events. `_reconstruct` filters by envelope `run_id`, so even if a child's events somehow bled into the parent's log they cannot advance the parent's cursor. Each engine owns one log file.
+
+> *Why load-bearing:* without this, recursive workflows (planning that calls planning) cross-contaminate cursors on resume, and INV-RESTART becomes unprovable across nesting layers. Brahms-harness PR #6 surfaced this as a candidate during Phase A; ADR 0005 (sub-workflow invocation primitive) made it law.
+
 ---
 
 ## §3 Vocabulary

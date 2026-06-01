@@ -37,6 +37,7 @@ from requiem.dsl import (
     AgentRegistry,
     HumanGateNode,
     ScriptNode,
+    SubWorkflowNode,
     TeamNode,
     TerminateNode,
     VerbRegistry,
@@ -127,10 +128,15 @@ class _AwaitingRoute:
 class _AwaitingGate:
     """`NeedsHuman` was emitted; the kernel needs a handler choice.
 
-    Carries ``prompt`` + ``options`` so a script-returned ``NeedsHuman``
-    (where the gate metadata only exists on the outcome, not on the
-    ``HumanGateNode`` it would for a static gate node) can drive the
-    handler / surface ``Suspended`` identically to a static gate.
+    Carries ``prompt`` + ``options`` directly so the arm doesn't have to
+    look them up on the originating node. Two cases motivate this:
+
+    1. Script-returned ``NeedsHuman``: the gate metadata only exists on
+       the outcome, not on the (non-existent) ``HumanGateNode``.
+    2. Sub-workflow bubble-up: the parent's node is a ``SubWorkflowNode``,
+       which has no ``prompt`` / ``options``; the child's gate text comes
+       through the outcome.
+
     Reconstructed across a kill+resume from the ``gate_opened`` event.
     """
     node_id: str
@@ -143,6 +149,22 @@ class _RouteAfterGate:
     """Handler returned a choice; the kernel must take the matching edge."""
     node_id: str
     choice: str
+
+
+@dataclass(frozen=True, slots=True)
+class _AwaitingSubworkflow:
+    """A `subworkflow_started` event is in the log; the kernel must
+    (re-)attach the child engine and run it to completion.
+
+    Used both for first-entry (no child yet) and for resume after a
+    parent crash mid-child. Re-attach is idempotent: the kernel does
+    NOT emit a second `subworkflow_started` on resume; the child engine
+    handles its own resume via its own log per INV-RESTART.
+    """
+    node_id: str
+    sub_run_id: str
+    sub_workflow_module: str
+    attempt: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,13 +182,15 @@ class _CancelledByOperator:
 
 _Cursor = Union[
     _AtNode, _AwaitingRoute, _AwaitingGate, _RouteAfterGate,
-    _Terminated, _CancelledByOperator,
+    _AwaitingSubworkflow, _Terminated, _CancelledByOperator,
 ]
 
 
 def _cursor_node(cursor: _Cursor) -> str | None:
     """Best-effort: which node would the engine be touching right now?"""
     if isinstance(cursor, (_AtNode, _AwaitingRoute, _AwaitingGate, _RouteAfterGate)):
+        return cursor.node_id
+    if isinstance(cursor, _AwaitingSubworkflow):
         return cursor.node_id
     if isinstance(cursor, _Terminated):
         return cursor.final_node
@@ -250,13 +274,14 @@ class Engine:
             cursor: _Cursor = _AtNode(wf.entry, 1)
             completed: dict[str, dict[str, Any]] = {}
         else:
-            cursor, completed = _reconstruct(replayed, wf.entry)
+            cursor, completed = _reconstruct(replayed, wf.entry, run_id=run_id)
 
         # External-cancel check: a `cancel_requested` event in the log (written
         # by `requiem cancel <run_id>` or a peer process) short-circuits the
         # run per INV-CANCEL-SHORT-CIRCUITS-RETRY.
         if isinstance(cursor, _CancelledByOperator):
             final = cursor.final_node
+            self._propagate_cancel_at(final, nm, emitter, run_id, cursor.reason)
             emitter.emit_run_completed("cancelled", final)
             return Failed(run_id, final, "cancelled", f"operator cancel: {cursor.reason}")
 
@@ -267,6 +292,9 @@ class Engine:
             cancel = _pending_cancel(self.log_path(run_id))
             if cancel is not None:
                 node_for_cancel = _cursor_node(cursor) or "—"
+                self._propagate_cancel_at(
+                    node_for_cancel, nm, emitter, run_id, cancel,
+                )
                 emitter.emit_run_completed("cancelled", node_for_cancel)
                 return Failed(
                     run_id, node_for_cancel, "cancelled",
@@ -281,6 +309,39 @@ class Engine:
                 case _AtNode(node_id=nid, attempt=at):
                     node = nm[nid]
                     emitter.emit_node_entered(nid, attempt=at)
+                    if isinstance(node, SubWorkflowNode):
+                        sub_run_id = node.sub_run_id or f"{run_id}__{nid}"
+                        inputs: dict[str, Any] = {}
+                        if node.inputs_verb is not None:
+                            inputs_fn = self.verbs.get(node.inputs_verb)
+                            inputs_ctx = VerbContext(
+                                run_id=run_id, workflow=wf.name, node_id=nid,
+                                attempt=at, completed=completed,
+                                toolbelt=self.toolbelt, emitter=emitter,
+                            )
+                            try:
+                                produced = inputs_fn(inputs_ctx)
+                                inputs = produced if isinstance(produced, dict) else {}
+                            except Exception as e:  # noqa: BLE001
+                                # An inputs_verb crash is a verb failure on the
+                                # parent — record it like any other verb crash.
+                                odict = outcome_to_dict(PermanentFailure(
+                                    error_kind="subworkflow.inputs_crash",
+                                    message=f"{type(e).__name__}: {e}",
+                                ))
+                                emitter.emit_verb_completed(nid, odict)
+                                completed[nid] = odict
+                                cursor = _AwaitingRoute(nid, odict, at)
+                                continue
+                        emitter.emit_subworkflow_started(
+                            nid, sub_run_id=sub_run_id,
+                            sub_workflow_module=node.workflow_module,
+                            inputs_summary=inputs,
+                        )
+                        cursor = _AwaitingSubworkflow(
+                            nid, sub_run_id, node.workflow_module, at
+                        )
+                        continue
                     outcome = await self._execute(
                         node,
                         VerbContext(
@@ -298,6 +359,24 @@ class Engine:
                     completed[nid] = odict
                     cursor = _AwaitingRoute(nid, odict, at)
 
+                case _AwaitingSubworkflow(
+                    node_id=nid, sub_run_id=srid,
+                    sub_workflow_module=mod, attempt=at,
+                ):
+                    node = nm[nid]
+                    outcome = await self._run_subworkflow(
+                        nid, srid, mod, node, run_id, completed, emitter,
+                    )
+                    odict = outcome_to_dict(outcome)
+                    disposition = _disposition_for_outcome(outcome)
+                    emitter.emit_subworkflow_completed(
+                        nid, sub_run_id=srid, disposition=disposition,
+                        outcome=odict,
+                        outcome_summary=_summarise_outcome(odict),
+                    )
+                    completed[nid] = odict
+                    cursor = _AwaitingRoute(nid, odict, at)
+
                 case _AwaitingRoute(node_id=nid, outcome=odict, attempt=at):
                     nxt = self._route(nid, odict, at, em, nm, emitter, run_id)
                     if isinstance(nxt, _Halt):
@@ -305,13 +384,18 @@ class Engine:
                     cursor = nxt
 
                 case _AwaitingGate(node_id=nid, prompt=stored_prompt, options=stored_opts):
-                    gate_node = nm[nid]
+                    gate_node = nm.get(nid)
                     # Static `human_gate` nodes carry prompt/options on the
-                    # node; script-returned `NeedsHuman` carries them on the
-                    # cursor (populated when the outcome routed). Use the
-                    # node attrs when available; fall back to the cursor.
-                    prompt = getattr(gate_node, "prompt", None) or stored_prompt
-                    options = tuple(getattr(gate_node, "options", ()) or stored_opts)
+                    # node; script-returned `NeedsHuman` and sub-workflow
+                    # bubble-ups carry them on the cursor. Prefer node attrs
+                    # when present (non-empty); fall back to the cursor.
+                    prompt = (
+                        getattr(gate_node, "prompt", None) if gate_node is not None else None
+                    ) or stored_prompt
+                    options = tuple(
+                        (getattr(gate_node, "options", ()) if gate_node is not None else ())
+                        or stored_opts
+                    )
                     if self.gate_handler is None:
                         return Suspended(run_id, nid, prompt, options)
                     choice = self.gate_handler(nid, prompt, options)
@@ -397,6 +481,116 @@ class Engine:
                     details={"outcome": outcome_to_dict(outcome)},
                 )
         return Success(value={"team_id": node.team_id, "findings": findings})
+
+    # ---- sub-workflow dispatch (ADR 0005) -------------------------
+
+    async def _run_subworkflow(
+        self,
+        node_id: str,
+        sub_run_id: str,
+        module_path: str,
+        node: Any,
+        parent_run_id: str,
+        completed: dict[str, dict[str, Any]],
+        emitter: EventEmitter,
+    ) -> Outcome:
+        """Spawn (or re-attach to) a child workflow and map its result.
+
+        The child engine writes to its OWN ``{sub_run_id}.events.jsonl``
+        (INV-SUBWORKFLOW-LOG-ISOLATION). Resume is automatic: the child's
+        own ``run()`` does its own ``_reconstruct`` over its own log.
+        """
+        import importlib  # local to avoid top-level cost when unused
+        import inspect
+
+        try:
+            mod = importlib.import_module(module_path)
+        except Exception as e:  # noqa: BLE001
+            return PermanentFailure(
+                error_kind="subworkflow.import_failed",
+                message=f"could not import {module_path!r}: {type(e).__name__}: {e}",
+            )
+
+        factory = getattr(mod, "build_engine", None)
+        if factory is None:
+            return PermanentFailure(
+                error_kind="subworkflow.no_build_engine",
+                message=f"module {module_path!r} has no build_engine(log_dir)",
+            )
+
+        try:
+            sig = inspect.signature(factory)
+            kwargs: dict[str, Any] = {}
+            # The kernel hands the child the *same* log_dir; child's run_id
+            # (sub_run_id) makes the filename distinct.
+            if "log_dir" in sig.parameters:
+                child_engine = factory(log_dir=self.log_dir, **kwargs)
+            else:
+                child_engine = factory(self.log_dir, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            return PermanentFailure(
+                error_kind="subworkflow.build_failed",
+                message=f"{module_path}.build_engine raised "
+                        f"{type(e).__name__}: {e}",
+            )
+
+        if not isinstance(child_engine, Engine):
+            return PermanentFailure(
+                error_kind="subworkflow.bad_factory",
+                message=f"{module_path}.build_engine did not return an Engine",
+            )
+
+        try:
+            result = await child_engine.run(sub_run_id)
+        except Exception as e:  # noqa: BLE001
+            return PermanentFailure(
+                error_kind="subworkflow.run_crashed",
+                message=f"child run crashed: {type(e).__name__}: {e}",
+            )
+
+        return _child_result_to_outcome(result, node_id, sub_run_id)
+
+    def _propagate_cancel_to_child(
+        self, sub_run_id: str, *, reason: str
+    ) -> None:
+        """Write a ``cancel_requested`` event into the child's log.
+
+        Idempotent: if the child already has a cancel marker we don't add
+        a second one (the child's first short-circuit is enough).
+        """
+        child_log = self.log_dir / f"{sub_run_id}.events.jsonl"
+        for ev in replay(child_log):
+            if ev.get("kind") == "cancel_requested":
+                return
+        store = EventStore(child_log)
+        emitter = EventEmitter(sub_run_id, store.append)
+        emitter.emit_cancel_requested(reason=reason, requested_by="parent")
+
+    def _propagate_cancel_at(
+        self,
+        node_id: str | None,
+        nm: dict[str, Any],
+        emitter: EventEmitter,
+        parent_run_id: str,
+        reason: str,
+    ) -> None:
+        """If ``node_id`` is a SubWorkflowNode, propagate cancel to the child.
+
+        Called from both the top-of-``run`` short-circuit and the in-loop
+        cancel detection so cancellation is fan-out idempotent regardless
+        of when the cancel arrives. INV-CANCEL propagates through every
+        active sub-workflow layer.
+        """
+        if not node_id:
+            return
+        node = nm.get(node_id)
+        if not isinstance(node, SubWorkflowNode):
+            return
+        sub_run_id = node.sub_run_id or f"{parent_run_id}__{node_id}"
+        self._propagate_cancel_to_child(sub_run_id, reason=f"parent: {reason}")
+        emitter.emit_subworkflow_cancelled(
+            node_id, sub_run_id=sub_run_id, reason=f"parent: {reason}",
+        )
 
     # ---- route dispatch (one match arm per outcome variant) --------
 
@@ -487,24 +681,125 @@ class _Halt:
     result: RunResult
 
 
+# ---- sub-workflow helpers (ADR 0005) -------------------------------
+
+
+def _child_result_to_outcome(
+    result: RunResult, parent_node_id: str, sub_run_id: str
+) -> Outcome:
+    """Map a child ``RunResult`` to the parent's verb outcome.
+
+    The parent's router then takes the standard edges (``success``,
+    ``permanent_failure``, ``needs_human``, ``cancelled``) — no new edge
+    keys, no special routing path.
+    """
+    if isinstance(result, Completed):
+        if result.disposition == "completed":
+            return Success(value={
+                "sub_run_id": sub_run_id,
+                "child_disposition": result.disposition,
+                "child_final_node": result.final_node,
+                "child_projection": result.projection,
+            })
+        if result.disposition == "cancelled":
+            return Cancelled(cause="operator", at_step=parent_node_id)
+        # Any other terminal disposition (e.g. ``failed``) — the child
+        # voluntarily reached a `terminate(disposition="failed")` node, so
+        # the parent treats it as a permanent failure.
+        return PermanentFailure(
+            error_kind=f"subworkflow.{result.disposition}",
+            message=f"child workflow ended with disposition={result.disposition!r}",
+            details={
+                "sub_run_id": sub_run_id,
+                "child_final_node": result.final_node,
+            },
+        )
+    if isinstance(result, Suspended):
+        return NeedsHuman(
+            gate=f"{parent_node_id}/{result.node_id}",
+            prompt=result.prompt,
+            options=tuple(result.options),
+            context={
+                "sub_run_id": sub_run_id,
+                "child_node_id": result.node_id,
+            },
+        )
+    if isinstance(result, Failed):
+        if result.error_kind == "cancelled":
+            return Cancelled(cause="operator", at_step=parent_node_id)
+        return PermanentFailure(
+            error_kind=f"subworkflow.{result.error_kind}",
+            message=result.message,
+            details={
+                "sub_run_id": sub_run_id,
+                "child_node_id": result.node_id,
+            },
+        )
+    return PermanentFailure(  # defensive: future RunResult variants
+        error_kind="subworkflow.unknown_result",
+        message=f"child returned unknown RunResult: {type(result).__name__}",
+    )
+
+
+def _disposition_for_outcome(outcome: Outcome) -> str:
+    """Human-readable disposition tag for ``subworkflow_completed``."""
+    if isinstance(outcome, Success):
+        return "completed"
+    if isinstance(outcome, NeedsHuman):
+        return "needs_human"
+    if isinstance(outcome, Cancelled):
+        return "cancelled"
+    return "failed"
+
+
+def _summarise_outcome(odict: dict[str, Any]) -> dict[str, Any]:
+    """Best-effort short summary for the event payload (full outcome stays in ``outcome``)."""
+    kind = odict.get("kind", "?")
+    if kind == "success":
+        value = odict.get("value", {})
+        return {
+            "kind": kind,
+            "sub_run_id": value.get("sub_run_id"),
+            "child_final_node": value.get("child_final_node"),
+        }
+    if kind in ("permanent_failure", "bad_output"):
+        return {"kind": kind, "error_kind": odict.get("error_kind")}
+    if kind == "needs_human":
+        return {"kind": kind, "gate": odict.get("gate")}
+    if kind == "cancelled":
+        return {"kind": kind, "cause": odict.get("cause")}
+    return {"kind": kind}
+
+
 # ---- reconstruct: a pure fold over the event log -------------------
 
 
 def _reconstruct(
     events: list[dict[str, Any]],
     entry: str,
+    *,
+    run_id: str | None = None,
 ) -> tuple[_Cursor, dict[str, dict[str, Any]]]:
     """Fold the event log into a single `_Cursor` describing where to resume.
 
     One match arm per event kind; no "look at the last route_taken vs the
     last verb_completed" reasoning. Each event either advances the cursor
     or records side state (`completed`, `last_attempt`).
+
+    If ``run_id`` is provided, events whose envelope ``run_id`` does not
+    match are skipped — this enforces ``INV-SUBWORKFLOW-LOG-ISOLATION``
+    (ADR 0005): a child workflow's events MUST NOT advance the parent's
+    cursor, even in the (defensive) case where they bleed into the parent's
+    log file. Brahms-harness PR #6's finding made law.
     """
     cursor: _Cursor = _AtNode(entry, 1)
     completed: dict[str, dict[str, Any]] = {}
     last_attempt = 1
 
     for e in events:
+        if run_id is not None and e.get("run_id") != run_id:
+            # INV-SUBWORKFLOW-LOG-ISOLATION: foreign-run event ignored.
+            continue
         kind = e["kind"]
         payload = e["payload"]
         node = e.get("node_id")
@@ -525,10 +820,29 @@ def _reconstruct(
                 cursor = _AwaitingGate(
                     node,
                     prompt=payload.get("prompt", ""),
-                    options=tuple(payload.get("options", ())),
+                    options=tuple(payload.get("options", ()) or ()),
                 )
             case "gate_resolved":
                 cursor = _RouteAfterGate(node, payload["choice"])
+            case "subworkflow_started":
+                cursor = _AwaitingSubworkflow(
+                    node,
+                    payload["sub_run_id"],
+                    payload["sub_workflow_module"],
+                    last_attempt,
+                )
+            case "subworkflow_completed":
+                # The full outcome is preserved in the payload precisely so
+                # that a crash between subworkflow_completed and the next
+                # route step resumes without re-invoking the (now-finished)
+                # child engine. The cursor jumps straight to routing.
+                outcome = payload["outcome"]
+                completed[node] = outcome
+                cursor = _AwaitingRoute(node, outcome, last_attempt)
+            case "subworkflow_cancelled":
+                # Recorded for observability; cancel_requested (separately
+                # written) drives the resume short-circuit.
+                pass
             case "run_completed":
                 cursor = _Terminated(
                     payload.get("terminal", "completed"),
@@ -554,6 +868,7 @@ def _projection(events: list[dict[str, Any]]) -> dict[str, Any]:
     verbs_done = 0
     retries = 0
     team_branches = 0
+    subworkflows_done = 0
     terminal: str | None = None
     for e in events:
         k = e["kind"]
@@ -565,6 +880,13 @@ def _projection(events: list[dict[str, Any]]) -> dict[str, Any]:
             retries += 1
         elif k == "team_branch_completed":
             team_branches += 1
+        elif k == "subworkflow_completed":
+            # Subworkflow nodes don't emit `verb_completed` (the
+            # subworkflow_completed event IS the verb-completion signal —
+            # see ADR 0005); count them here so the projection still
+            # totals every node that produced an outcome.
+            verbs_done += 1
+            subworkflows_done += 1
         elif k == "run_completed":
             terminal = e["payload"].get("terminal")
     return {
@@ -572,6 +894,7 @@ def _projection(events: list[dict[str, Any]]) -> dict[str, Any]:
         "verbs_completed": verbs_done,
         "retries": retries,
         "team_branches_completed": team_branches,
+        "subworkflows_completed": subworkflows_done,
         "terminal": terminal,
         "total_events": len(events),
     }

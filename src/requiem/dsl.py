@@ -65,7 +65,44 @@ class TerminateNode(BaseModel):
     disposition: Literal["completed", "failed", "cancelled"] = "completed"
 
 
-NodeModel = Union[ScriptNode, AgentNode, TeamNode, HumanGateNode, TerminateNode]
+class SubWorkflowNode(BaseModel):
+    """Invokes another workflow as a node within the parent.
+
+    The child workflow is loaded by importable module path (same convention
+    as ``requiem run <module>``) and given its own Engine instance. The
+    child writes to its OWN ``{sub_run_id}.events.jsonl`` log so the
+    parent's log stays a clean record of the parent's transitions (Bach A
+    purity). The parent's log records ``subworkflow_started`` /
+    ``subworkflow_completed`` markers — enough to resume after a crash.
+
+    See ADR 0005 and ``INV-SUBWORKFLOW-LOG-ISOLATION`` in the north-star.
+    """
+
+    kind: Literal["subworkflow"] = "subworkflow"
+    node_id: str
+    workflow_module: str
+    inputs_verb: str | None = None
+    """Optional verb name that returns a dict of inputs for the child.
+
+    The returned dict is recorded in ``subworkflow_started.inputs_summary``
+    for observability, and passed to the child's ``build_engine`` as an
+    ``inputs`` kwarg if the factory accepts one. v0 author-cooperative
+    contract: child workflows are responsible for fetching their own inputs
+    via the toolbelt — passing inputs across engine instances is best-effort.
+    """
+    sub_run_id: str | None = None
+    """Optional override for the child run_id.
+
+    Defaults to ``f'{parent_run_id}__{node_id}'`` (double underscore — ``::``
+    is unsafe on Windows paths). Three-level nesting yields
+    ``g__p__c``, all distinct files in the same log_dir.
+    """
+    retry_max: int = 0
+
+
+NodeModel = Union[
+    ScriptNode, AgentNode, TeamNode, HumanGateNode, TerminateNode, SubWorkflowNode
+]
 
 
 class Edge(BaseModel):
@@ -202,6 +239,37 @@ class WorkflowBuilder:
     ) -> "WorkflowBuilder":
         self._nodes.append(
             TerminateNode(node_id=node_id, disposition=disposition)  # type: ignore[arg-type]
+        )
+        return self
+
+    def subworkflow(
+        self,
+        node_id: str,
+        *,
+        workflow: str,
+        inputs_verb: str | None = None,
+        sub_run_id: str | None = None,
+        retry_max: int = 0,
+    ) -> "WorkflowBuilder":
+        """Add a sub-workflow invocation node.
+
+        ``workflow`` is the importable module path of the child workflow
+        (e.g. ``requiem.workflows.code_review_demo``). The module must
+        expose ``build_engine(log_dir, ...)`` per the standard contract.
+
+        ``inputs_verb`` (optional) names a registered verb that returns a
+        dict; it's recorded in ``subworkflow_started.inputs_summary`` and
+        forwarded to the child's ``build_engine`` as an ``inputs`` kwarg
+        if the factory accepts one. See ADR 0005.
+        """
+        self._nodes.append(
+            SubWorkflowNode(
+                node_id=node_id,
+                workflow_module=workflow,
+                inputs_verb=inputs_verb,
+                sub_run_id=sub_run_id,
+                retry_max=retry_max,
+            )
         )
         return self
 
