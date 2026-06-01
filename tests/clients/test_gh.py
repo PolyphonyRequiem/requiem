@@ -359,6 +359,29 @@ def test_all_errors_subclass_gh_client_error() -> None:
         assert issubclass(cls, GhClientError)
 
 
+# ---- subprocess kwarg hygiene (Schumann's note) -----------------------
+
+
+def test_stdin_is_devnull_when_no_body_pytest_win_314_safe() -> None:
+    """pytest's captured stdin isn't inheritable on Windows + Python 3.14.
+
+    Every spawn that does not need a stdin body must pass DEVNULL
+    explicitly. This test pins the convention so a refactor that drops
+    back to the inheriting default fails loudly.
+    """
+    p, calls = _patch_subprocess(stdout=json.dumps(_pr_payload()))
+    with p:
+        asyncio.run(GhClient().pr_view("r/x", 1))
+    assert calls[0]["kwargs"]["stdin"] is asyncio.subprocess.DEVNULL
+
+
+def test_stdin_is_pipe_when_api_body_is_present() -> None:
+    p, calls = _patch_subprocess(stdout="{}")
+    with p:
+        asyncio.run(GhClient().api("/x", method="POST", body={"a": 1}))
+    assert calls[0]["kwargs"]["stdin"] is asyncio.subprocess.PIPE
+
+
 # ---- real-tool smoke (opt-in) ----------------------------------------
 
 
@@ -377,8 +400,11 @@ def test_real_gh_binary_is_invokable() -> None:
         pytest.skip("gh not on PATH on this machine")
 
     async def go() -> tuple[int, str]:
+        # stdin=DEVNULL is mandatory under pytest on Win+3.14
+        # (Schumann's note); also harmless everywhere else.
         proc = await asyncio.create_subprocess_exec(
             "gh", "--version",
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

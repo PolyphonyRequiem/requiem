@@ -398,11 +398,20 @@ class GhClient:
         self, argv: tuple[str, ...], *, stdin: bytes | None = None
     ) -> str:
         """Spawn gh and return decoded stdout, or raise a typed GhClientError."""
+        # `stdin` is always explicit: PIPE when we have a body to send,
+        # DEVNULL otherwise. Inheriting stdin (the default) is broken on
+        # Python 3.14 + Windows under pytest — pytest's captured stdin
+        # isn't an inheritable handle, and the spawn fails before gh
+        # ever runs. Schumann (fs seat) flagged this from their seat.
+        stdin_arg: Any = (
+            asyncio.subprocess.PIPE if stdin is not None
+            else asyncio.subprocess.DEVNULL
+        )
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 cwd=str(self._cwd) if self._cwd is not None else None,
-                stdin=asyncio.subprocess.PIPE if stdin is not None else None,
+                stdin=stdin_arg,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
