@@ -81,6 +81,13 @@ class Workflow(BaseModel):
     entry: str
     nodes: list[NodeModel] = Field(default_factory=list)
     edges: list[Edge] = Field(default_factory=list)
+    humanize: dict[str, str] = Field(default_factory=dict)
+    """Per-node human-readable labels for the CLI renderer.
+
+    Maps `node_id` → noun phrase used in narration lines
+    (e.g. `"read_snippet"` → `"Read sample_snippet.py"`). Default empty:
+    the renderer falls back to the raw `node_id`.
+    """
 
     def validate_topology(self) -> list[str]:
         errs: list[str] = []
@@ -111,6 +118,7 @@ class WorkflowBuilder:
         self._entry: str | None = None
         self._nodes: list[NodeModel] = []
         self._edges: list[Edge] = []
+        self._humanize: dict[str, str] = {}
 
     def entry(self, node_id: str) -> "WorkflowBuilder":
         self._entry = node_id
@@ -185,6 +193,14 @@ class WorkflowBuilder:
         self._edges.append(Edge(from_node=from_node, on=on, to_node=to))
         return self
 
+    def humanize(self, mapping: dict[str, str]) -> "WorkflowBuilder":
+        """Register human-readable noun phrases for nodes.
+
+        Merges into the existing map; later calls override earlier ones.
+        """
+        self._humanize.update(mapping)
+        return self
+
     def build(self) -> Workflow:
         if self._entry is None:
             raise ValueError(f"workflow {self._name!r} has no entry")
@@ -193,6 +209,7 @@ class WorkflowBuilder:
             entry=self._entry,
             nodes=self._nodes,
             edges=self._edges,
+            humanize=self._humanize,
         )
         errs = wf.validate_topology()
         if errs:

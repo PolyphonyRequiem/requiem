@@ -157,6 +157,14 @@ class Engine:
     toolbelt: Toolbelt
     log_dir: Path
     gate_handler: GateHandler | None = None
+    on_event: Callable[[dict[str, Any]], None] | None = None
+    """Optional observer fired after each event is durably appended.
+
+    The CLI uses this to stream live narration during `requiem run`. The
+    callback receives the full envelope including `event_id`. Exceptions
+    raised by the observer propagate (the kernel does not swallow renderer
+    bugs — fail loud).
+    """
     _state: dict[str, str] = field(default_factory=dict)
 
     def log_path(self, run_id: str) -> Path:
@@ -168,7 +176,18 @@ class Engine:
         if errs:
             raise ValueError(f"workflow invalid: {errs}")
         store = EventStore(self.log_path(run_id))
-        emitter = EventEmitter(run_id, store.append)
+        append = store.append
+        if self.on_event is not None:
+            base_append = append
+            observer = self.on_event
+
+            def append_and_notify(envelope: dict[str, Any]) -> int:
+                eid = base_append(envelope)
+                observer({**envelope, "event_id": eid})
+                return eid
+
+            append = append_and_notify
+        emitter = EventEmitter(run_id, append)
 
         nm: dict[str, Any] = {n.node_id: n for n in wf.nodes}
         em: dict[tuple[str, str], str] = {
@@ -225,7 +244,8 @@ class Engine:
                     choice = self.gate_handler(
                         nid, gate_node.prompt, tuple(gate_node.options)
                     )
-                    emitter.emit_gate_resolved(nid, choice)
+                    auto = bool(getattr(self.gate_handler, "__requiem_auto__", False))
+                    emitter.emit_gate_resolved(nid, choice, auto=auto)
                     cursor = _RouteAfterGate(nid, choice)
 
                 case _RouteAfterGate(node_id=nid, choice=c):
@@ -363,8 +383,9 @@ class Engine:
                 emitter.emit_route_taken(node_id, "permanent_failure", nxt)
                 return _AtNode(nxt, 1)
 
-            case NeedsHuman(prompt=p, options=opts):
-                emitter.emit_gate_opened(node_id, p, list(opts))
+            case NeedsHuman(prompt=p, options=opts, context=ctx):
+                auto = bool(getattr(self.gate_handler, "__requiem_auto__", False))
+                emitter.emit_gate_opened(node_id, p, list(opts), context=ctx, auto=auto)
                 return _AwaitingGate(node_id)
 
             case Success():

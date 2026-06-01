@@ -194,7 +194,7 @@ def build_verb_registry(snippet_path: Path) -> VerbRegistry:
     def _archive(ctx):
         verdict = ctx.completed["synthesize"]["value"]["parsed"]
         team = ctx.completed["review_team"]["value"]
-        out = snippet_path.parent / ".runs" / f"{ctx.run_id}.summary.md"
+        out = snippet_path.parent / f"{ctx.run_id}.summary.md"
         out.parent.mkdir(parents=True, exist_ok=True)
         body = [
             f"# code-review summary — {ctx.run_id}",
@@ -267,6 +267,17 @@ def build_workflow() -> Workflow:
                 .edge("archive", on="success", to="end")
             .terminate("end", disposition="completed")
             .terminate("fail_end", disposition="failed")
+            .humanize({
+                "start":        "Starting code-review",
+                "read_snippet": "Read sample_snippet.py",
+                "flaky_lint":   "Lint",
+                "review_team":  "reviewers",
+                "synthesize":   "Synthesized verdict",
+                "human_gate":   "approve verdict?",
+                "archive":      "Wrote summary",
+                "end":          "code-review",
+                "fail_end":     "code-review",
+            })
             .build()
     )
 
@@ -275,10 +286,93 @@ def build_workflow() -> Workflow:
 
 
 def _default_gate_handler(node_id: str, prompt: str, options: tuple[str, ...]) -> str:
-    """Demo gate handler: prints the prompt and auto-picks `approve`."""
-    print(f"  [gate {node_id}] {prompt}")
-    print(f"  [gate {node_id}] options: {options} → auto-picking 'approve'")
+    """Demo gate handler: auto-picks `approve`.
+
+    Marked with ``__requiem_auto__ = True`` so the kernel stamps
+    ``gate_resolved.auto`` and ``gate_opened.auto``; the CLI renderer then
+    appends ``(auto-approved for demo)`` per Demo Contract §3.9.
+    """
     return "approve"
+
+
+_default_gate_handler.__requiem_auto__ = True  # type: ignore[attr-defined]
+
+
+# ---- render hints (consumed by `requiem.cli.render`) ---------------
+
+
+def _detail_read_snippet(value: dict) -> str:
+    return f"{value.get('loc', '?')} lines"
+
+
+def _detail_flaky_lint(value: dict) -> str:
+    return "all checks green"
+
+
+def _detail_synthesize(value: dict) -> str:
+    parsed = value.get("parsed") or {}
+    rec = parsed.get("recommend_merge")
+    sevs = parsed.get("severity_seen") or []
+    counts: dict[str, int] = {}
+    for s in sevs:
+        counts[s] = counts.get(s, 0) + 1
+    breakdown = ", ".join(f"{n} {sev}" for sev, n in counts.items())
+    head = "merge" if rec else "don't merge"
+    return f"{head} ({breakdown})" if breakdown else head
+
+
+def _detail_archive(value: dict) -> str:
+    return f"to {value.get('summary_path', '?')}"
+
+
+def _gate_context_human_gate(completed: dict) -> str:
+    synth = completed.get("synthesize", {}).get("value", {}).get("parsed") or {}
+    if not synth:
+        return ""
+    head = "merge" if synth.get("recommend_merge") else "don't merge"
+    return f"verdict: {head} — top finding: {synth.get('top_finding', '?')}"
+
+
+def render_hints() -> dict:
+    """Optional CLI hook: per-node detail formatters + artifact name + gate context."""
+    return {
+        "artifact_name": "sample_snippet.py",
+        "details": {
+            "read_snippet": _detail_read_snippet,
+            "flaky_lint":   _detail_flaky_lint,
+            "synthesize":   _detail_synthesize,
+            "archive":      _detail_archive,
+        },
+        "gate_contexts": {
+            "human_gate": _gate_context_human_gate,
+        },
+        # Suppress narration for nodes whose story another event already tells:
+        # `start` is a workflow stub (run_started covers it); `review_team`'s
+        # aggregation success is implicit from the three branch lines; `end`
+        # and `fail_end` are terminators (run_completed covers them).
+        "silent_nodes": frozenset({"start", "review_team", "end", "fail_end"}),
+    }
+
+
+def verdict_card(completed: dict) -> str | None:
+    """Optional CLI hook: post-run verdict summary (Demo Contract §3.4/§4.4)."""
+    synth = completed.get("synthesize", {}).get("value", {}).get("parsed") or {}
+    archive = completed.get("archive", {}).get("value") or {}
+    if not synth:
+        return None
+    rec = synth.get("recommend_merge", False)
+    head = "✓ Merge" if rec else "🚫 Don't merge"
+    lines = [
+        "─── Verdict ─────────────────────────────────────────────────────────",
+        f"  {head}",
+        f"      Top finding:  {synth.get('top_finding', '—')}",
+        f"      Rationale:    {synth.get('rationale', '—')}",
+    ]
+    sp = archive.get("summary_path")
+    if sp:
+        lines.append(f"  → summary: {sp}")
+    lines.append("─────────────────────────────────────────────────────────────────────")
+    return "\n".join(lines)
 
 
 def build_engine(

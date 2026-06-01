@@ -18,6 +18,27 @@ from pydantic import BaseModel, ConfigDict, Field
 SCHEMA_VERSION = 1
 
 
+EVENT_KINDS: frozenset[str] = frozenset({
+    "run_started",
+    "node_entered",
+    "verb_invoked",
+    "verb_completed",
+    "retry_attempted",
+    "route_taken",
+    "team_dispatched",
+    "team_branch_completed",
+    "gate_opened",
+    "gate_resolved",
+    "run_completed",
+})
+"""Sealed catalogue of kinds the kernel emits.
+
+The renderer-registry exhaustiveness test (`tests/test_renderer_registry.py`)
+treats this as the source of truth: every kind here must have a renderer,
+and every renderer key must appear here.
+"""
+
+
 class Event(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -116,12 +137,22 @@ class EventEmitter:
         )
 
     def emit_gate_opened(
-        self, node_id: str, prompt: str, options: list[str]
+        self, node_id: str, prompt: str, options: list[str],
+        *, context: dict[str, Any] | None = None, auto: bool = False,
     ) -> None:
-        self._emit("gate_opened", node_id=node_id, prompt=prompt, options=options)
+        self._emit(
+            "gate_opened",
+            node_id=node_id,
+            prompt=prompt,
+            options=options,
+            context=context or {},
+            auto=auto,
+        )
 
-    def emit_gate_resolved(self, node_id: str, choice: str) -> None:
-        self._emit("gate_resolved", node_id=node_id, choice=choice)
+    def emit_gate_resolved(
+        self, node_id: str, choice: str, *, auto: bool = False
+    ) -> None:
+        self._emit("gate_resolved", node_id=node_id, choice=choice, auto=auto)
 
     def emit_run_completed(self, terminal: str, final_node: str) -> None:
         self._emit("run_completed", terminal=terminal, final_node=final_node)
