@@ -38,7 +38,7 @@
 | Q1 | [non-negotiable-7 reading](#q1-non-negotiable-7-reading-strict-mg-prefix-vs-load-bearing) | ADR-0006 OQ1 | **CLOSED 2026-06-01: Option D (load-bearing reading). See "Q1 — closed" below.** |
 | Q2 | [plan-PR realisation](#q2-plan-pr-real-branchpr-vs-markdown-in-the-feature-pr) | ADR-0006 OQ2 | **CLOSED 2026-06-01: build the plan-PR capability; cut/gate/persist policy → ADR-0008. See "Q2 — closed" below.** |
 | Q3 | [platform meaning for git](#q3-what-does-the-platform-mean-for-git-operations) | ADR-0007 Q-C | **CLOSED 2026-06-01: Option (i) — single `PrPlatform` Protocol; PR host and work-item tracker are orthogonal but only the former gets a Protocol in v0. See "Q3 — closed" below.** |
-| Q4 | [ADO auth: PAT vs OIDC](#q4-pat-vs-oidc-for-the-adoclient) | ADR-0007 Q-A | Ship the ADO client with PAT (env var) for v0, or block on OIDC? |
+| Q4 | [ADO auth: PAT vs OIDC](#q4-pat-vs-oidc-for-the-adoclient) | ADR-0007 Q-A | **CLOSED 2026-06-01: OIDC required (PAT not supported in primary v0 org). See "Q4 — closed" below.** |
 | Q5 | [atomic co-merge recovery](#q5-how-strict-is-the-atomic-co-merge-guarantee-when-one-leaf-fails-mid-trunk) | ADR-0006 OQ3 | Abandon-trunk-and-restart, or roll-forward with a human gate, when one leaf fails after siblings landed? |
 | Q6 | [replan mid-flight in scope](#q6-is-replan-mid-flight-in-scope-for-v0) | ADR-0006 OQ4 | Is mid-flight replan in scope for v0 (implies stable planner-declared item ids)? |
 | Q7 | [review-group labels](#q7-should-the-planner-emit-review_group-labels) | ADR-0006 OQ5 | Does the planner emit `review_group: "data-layer"`-style UI labels (no branch impact)? |
@@ -366,7 +366,42 @@ which scenario the new `AdoClient` unblocks.
 
 ## Q4: PAT vs OIDC for the AdoClient
 
-### § Decision needed
+> **STATUS: CLOSED 2026-06-01 during Bruckner walkthrough.**
+>
+> **Resolution: OIDC required.** PATs are not supported in Daniel's
+> primary ADO org; `AZURE_DEVOPS_EXT_PAT` is not a viable v0 path for
+> the #1 customer scenario. `AdoClient` ships with `azure-identity` +
+> `DefaultAzureCredential` as the credential-discovery step. Britten's
+> draft recommendation and Mahler-3's "today-workflow uses PATs"
+> evidence are both superseded.
+>
+> **Daniel's framing:** *"OIDC is the scenario I need to support,
+> PAT is not supported in my org."*
+>
+> **Implementation hook:** wrap the credential source in a
+> `CredentialProvider`-shaped seam inside `AdoClient` so PAT support
+> remains an additive option (for non-OIDC-enabled tenants or local
+> dev outside the locked-down org) without re-plumbing the client.
+> Default = OIDC; PAT = additive fallback only.
+>
+> **Parking-lot follow-up (NOT closed here):** if the work-item-side
+> surface (`twig.comment_async` et al.) authenticates to ADO via PAT,
+> the Q1/Q3 orthogonality story has a parity gap of its own. Three
+> possibilities, listed for resolution before v0 ships:
+>
+> 1. `twig` already has an OIDC path Bruckner / Mahler didn't capture.
+> 2. Daniel doesn't run `twig` against this org.
+> 3. The work-item-side credential story needs its own fix (twig-side
+>    OIDC support, or a new ADR).
+>
+> Tracked here until Daniel confirms which is true.
+>
+> See [ADR-0007 → Q-A closure](../decisions/0007-pr-lifecycle-architecture.md)
+> for the canonical record.
+
+---
+
+### § Decision needed (historical)
 Ship the new `AdoClient` reading `AZURE_DEVOPS_EXT_PAT` for v0 and defer
 OIDC, or block on OIDC?
 

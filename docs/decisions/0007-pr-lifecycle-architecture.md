@@ -752,6 +752,35 @@ Daniel rules.
 
 #### Q-A. PAT vs OIDC for `AdoClient` auth
 
+> **CLOSED 2026-06-01 during Bruckner walkthrough.** Resolution:
+> **OIDC is required.** PATs are not supported in Daniel's primary
+> ADO org; `AZURE_DEVOPS_EXT_PAT` is not a viable v0 path for the
+> #1 customer scenario. Wire `azure-identity` + `DefaultAzureCredential`
+> as the credential-discovery step for `AdoClient`. Britten's draft
+> recommendation and Mahler-3's "today-workflow uses PATs" evidence
+> are both superseded by this decision.
+>
+> **Daniel's framing:** *"OIDC is the scenario I need to support,
+> PAT is not supported in my org."*
+>
+> **Implementation hook:** wrap the credential source in a
+> `CredentialProvider`-shaped seam inside `AdoClient` so PAT-based
+> envs (e.g. local dev outside the locked-down org, or
+> non-OIDC-enabled tenants) remain a possible additive option
+> without re-plumbing the client. Default = OIDC; PAT = additive
+> fallback only.
+>
+> **Open follow-up (NOT this ADR's call):** if the work-item-side
+> surface (`twig.comment_async`, `twig.update_item_async`)
+> authenticates to ADO via PAT, that path is *also* broken in the
+> primary v0 org and the Q1/Q3 orthogonality story has a parity
+> gap. Three possibilities, listed for resolution:
+> (a) `twig` already has an OIDC path Bruckner / Mahler didn't
+> capture; (b) Daniel doesn't run `twig` against this org;
+> (c) the work-item-side credential story needs its own ADR /
+> twig-side fix before v0 ships. Tracked as a parking-lot item
+> until Daniel confirms which is true.
+
 `GhClient` doesn't manage auth — it delegates to `gh auth`. The
 equivalent for ADO is either `AZURE_DEVOPS_EXT_PAT` (a PAT in env) or
 federated OIDC via `az login`. Daniel's single-operator workflow today
