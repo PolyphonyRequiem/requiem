@@ -39,7 +39,7 @@
 | Q2 | [plan-PR realisation](#q2-plan-pr-real-branchpr-vs-markdown-in-the-feature-pr) | ADR-0006 OQ2 | **CLOSED 2026-06-01: build the plan-PR capability; cut/gate/persist policy → ADR-0008. See "Q2 — closed" below.** |
 | Q3 | [platform meaning for git](#q3-what-does-the-platform-mean-for-git-operations) | ADR-0007 Q-C | **CLOSED 2026-06-01: Option (i) — single `PrPlatform` Protocol; PR host and work-item tracker are orthogonal but only the former gets a Protocol in v0. See "Q3 — closed" below.** |
 | Q4 | [ADO auth: PAT vs OIDC](#q4-pat-vs-oidc-for-the-adoclient) | ADR-0007 Q-A | **CLOSED 2026-06-01: OIDC required (PAT not supported in primary v0 org). See "Q4 — closed" below.** |
-| Q5 | [atomic co-merge recovery](#q5-how-strict-is-the-atomic-co-merge-guarantee-when-one-leaf-fails-mid-trunk) | ADR-0006 OQ3 | Abandon-trunk-and-restart, or roll-forward with a human gate, when one leaf fails after siblings landed? |
+| Q5 | [atomic co-merge recovery](#q5-how-strict-is-the-atomic-co-merge-guarantee-when-one-leaf-fails-mid-trunk) | ADR-0006 OQ3 | **CLOSED 2026-06-01: curator-decided recovery; human-gate roll-forward a required menu option; abandon-trunk is terminal, not default. See "Q5 — closed" below.** |
 | Q6 | [replan mid-flight in scope](#q6-is-replan-mid-flight-in-scope-for-v0) | ADR-0006 OQ4 | Is mid-flight replan in scope for v0 (implies stable planner-declared item ids)? |
 | Q7 | [review-group labels](#q7-should-the-planner-emit-review_group-labels) | ADR-0006 OQ5 | Does the planner emit `review_group: "data-layer"`-style UI labels (no branch impact)? |
 | Q8 | [same-root run-lock UX](#q8-same-root-run-lock-ux-refuse-or-attach) | ADR-0006 OQ6 | Refuse-or-attach (polyphony's behaviour) or plain refusal when a fresh run hits an existing trunk? |
@@ -449,7 +449,45 @@ swap as the post-v0 follow-up.**
 
 ## Q5: How strict is the atomic co-merge guarantee when one leaf fails mid-trunk?
 
-### § Decision needed
+> **STATUS: CLOSED 2026-06-01 during Bruckner walkthrough.**
+>
+> **Resolution: curator-decided recovery, with human-gate roll-forward
+> a required option.** The same agent that selects a leaf's review
+> surface (Q1) and the plan's cut/gate/persist (Q2) selects the
+> recovery action when a leaf fails to integrate — per-slice,
+> agent-evaluated × user-policy. The recovery-action menu *must*
+> include human-gate roll-forward (halt at `needs_human`; operator
+> retries, patches, skips-with-justification, or aborts). Abandon-trunk
+> is retained as the terminal selectable action, **not** the default.
+>
+> **Daniel's framing:** *"curator decides is generally right, but
+> policy should allow for human gate roll forward."*
+>
+> **Recovery-action menu:** auto-retry (mechanical), rebase+retry
+> (drift), human-gate roll-forward *(required)*, abandon-trunk
+> *(terminal)*. See ADR-0006 Decision-log → Q5 for the full table and
+> the grounding scenario.
+>
+> **Why not abandon-by-default:** it produces the worst single-operator
+> UX and inverts the Q1 reframe — an `auto_merge` leaf already on the
+> trunk would get discarded when a sibling fails, making `auto_merge`
+> *less* durable than `pr_review`. Roll-forward preserves all
+> already-merged work.
+>
+> **Scope of the atomic promise:** only the **trunk→main** step is
+> atomic (whole root lands on `main` or `main` never sees it).
+> Intermediate trunk integrations are recoverable per the menu.
+>
+> **Forward dependency:** Q9's drift-rebase verb must handle "rebase a
+> trunk holding partially-completed work." Policy menu lives in
+> ADR-0008.
+>
+> See [ADR-0006 → Decision log → Q5](../decisions/0006-merge-group-topology.md)
+> for the canonical record + grounding scenario.
+
+---
+
+### § Decision needed (historical)
 Under Option D, if leaf B fails to land on the trunk after leaf A
 succeeded, do we (a) **abandon the trunk** — delete the branch and
 re-run the root — or (b) **roll forward** — `needs_human` gate lets the
