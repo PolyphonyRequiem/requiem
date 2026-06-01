@@ -39,6 +39,16 @@ from requiem.outcomes import (
 )
 from requiem.persistence import CorruptLogError, EventStore, replay
 from requiem.teams import TeamBranch
+from requiem.clients.gh import (
+    GhAuthError,
+    GhClient,
+    GhClientError,
+    GhNotFoundError,
+    GhPullRequest,
+    GhRateLimitedError,
+    GhServerError,
+    GhUnknownError,
+)
 from requiem.toolbelt import (
     FileClient,
     FileMissing,
@@ -72,6 +82,10 @@ __all__ = [
     # toolbelt
     "Toolbelt", "FileClient", "GitClient",
     "FileRead", "FileMissing", "GitShowOk", "GitShowMissing", "GitNotARepo",
+    # clients.gh
+    "GhClient", "GhPullRequest",
+    "GhClientError", "GhRateLimitedError", "GhNotFoundError",
+    "GhAuthError", "GhServerError", "GhUnknownError",
     # teams
     "TeamBranch",
     # kernel
