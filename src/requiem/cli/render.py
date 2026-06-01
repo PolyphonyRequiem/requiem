@@ -59,14 +59,31 @@ DetailFn = Callable[[dict[str, Any]], str]
 GateContextFn = Callable[[dict[str, dict[str, Any]]], str]
 """Pulls a gate-context line out of the streamed `completed` map."""
 
+SubworkflowDetailFn = Callable[[dict[str, Any]], str]
+"""Turns a subworkflow_completed `outcome` payload into a short detail phrase.
+
+The full SDLC demo (and any other parent workflow that composes children)
+uses this to render stage-level narration like ``"✓ Planned — 1 leaf"``
+instead of the generic ``"Child workflow returned: completed (plan)"``.
+"""
+
 
 @dataclass
 class RenderContext:
     workflow_name: str = ""
     artifact_name: str = ""
+    active_workflow_stack: list[str] = field(default_factory=list)
+    """Stack of ``run_started.payload.workflow`` names — pushed on
+    ``run_started``, popped on ``run_completed``. Lets child workflows
+    that share the parent's render context (e.g. the full-SDLC demo's
+    live narration) label correctly without leaking into the parent's
+    own terminator line.
+    """
     humanize: dict[str, str] = field(default_factory=dict)
     details: dict[str, DetailFn] = field(default_factory=dict)
     gate_contexts: dict[str, GateContextFn] = field(default_factory=dict)
+    subworkflow_details: dict[str, SubworkflowDetailFn] = field(default_factory=dict)
+    """Per-subworkflow-node detail formatter (parent-narration polish)."""
     silent_nodes: frozenset[str] = field(default_factory=frozenset)
     """Nodes whose `verb_completed` line is suppressed.
 
@@ -107,6 +124,7 @@ def _register(kind: str) -> Callable[[Renderer], Renderer]:
 @_register("run_started")
 def _r_run_started(ev: dict[str, Any], cx: RenderContext) -> RenderResult:
     wf = ev["payload"].get("workflow") or cx.workflow_name or "workflow"
+    cx.active_workflow_stack.append(wf)
     suffix = f" on {cx.artifact_name}" if cx.artifact_name else ""
     return [f"{GLYPH_ACTION} run_started — {wf}{suffix}"]
 
@@ -265,7 +283,16 @@ def _r_subworkflow_completed(ev: dict[str, Any], cx: RenderContext) -> RenderRes
     outcome = p.get("outcome") or {}
     cx.completed[node] = outcome
     label = cx.label(node)
+    detail_fn = cx.subworkflow_details.get(node)
     if disposition == "completed":
+        if detail_fn is not None:
+            try:
+                detail = detail_fn(outcome)
+            except Exception as e:  # noqa: BLE001
+                detail = f"<sub-detail render error: {type(e).__name__}>"
+            if detail:
+                return [f"{GLYPH_OK} {label} — {detail}"]
+            return [f"{GLYPH_OK} {label}"]
         return [f"{GLYPH_OK} Child workflow returned: {disposition} ({label})"]
     if disposition == "needs_human":
         # The parent's `gate_opened` event (queued right after) tells the
@@ -273,6 +300,13 @@ def _r_subworkflow_completed(ev: dict[str, Any], cx: RenderContext) -> RenderRes
         return []
     if disposition == "cancelled":
         return [f"{GLYPH_END} Child workflow returned: cancelled ({label})"]
+    if detail_fn is not None:
+        try:
+            detail = detail_fn(outcome)
+        except Exception as e:  # noqa: BLE001
+            detail = f"<sub-detail render error: {type(e).__name__}>"
+        if detail:
+            return [f"{GLYPH_FAIL} {label} — {detail}"]
     return [f"{GLYPH_FAIL} Child workflow returned: {disposition} ({label})"]
 
 
@@ -287,7 +321,11 @@ def _r_subworkflow_cancelled(ev: dict[str, Any], cx: RenderContext) -> RenderRes
 def _r_run_completed(ev: dict[str, Any], cx: RenderContext) -> RenderResult:
     p = ev["payload"]
     terminal = (p.get("terminal") or "?").title()
-    wf = cx.workflow_name or "workflow"
+    wf = (
+        cx.active_workflow_stack.pop()
+        if cx.active_workflow_stack
+        else (cx.workflow_name or "workflow")
+    )
     suffix = f" on {cx.artifact_name}" if cx.artifact_name else ""
     return [f"{GLYPH_END} {terminal} — {wf}{suffix}"]
 
@@ -344,6 +382,7 @@ __all__ = [
     "Renderer",
     "DetailFn",
     "GateContextFn",
+    "SubworkflowDetailFn",
     "render_event",
     "style_for_line",
     "exit_code_for",

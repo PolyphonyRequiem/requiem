@@ -132,6 +132,8 @@ def _render_context_for(mod: ModuleType | None, workflow_name: str,
         cx.details.update(hints["details"])
     if "gate_contexts" in hints:
         cx.gate_contexts.update(hints["gate_contexts"])
+    if "subworkflow_details" in hints:
+        cx.subworkflow_details.update(hints["subworkflow_details"])
     if "silent_nodes" in hints:
         cx.silent_nodes = frozenset(hints["silent_nodes"])
     return cx
@@ -152,6 +154,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     _say(f"requiem run — {args.workflow_module}  (run_id={run_id})", style="bold")
     _say(f"log: {engine.log_path(run_id)}", style="dim")
+    _print_preamble(mod)
     _say("─" * 72, style="dim")
 
     def _observer(envelope: dict[str, Any]) -> None:
@@ -181,6 +184,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
     _say(f"requiem resume — {args.workflow_module}  (run_id={args.run_id})", style="bold")
     _say(f"log: {log_path}", style="dim")
+    _print_preamble(mod)
     _say("─" * 72, style="dim")
 
     prior = list(replay(log_path))
@@ -557,6 +561,30 @@ def _make_interactive_gate_handler(cx: RenderContext):
 
 
 # ---- post-run helpers ----------------------------------------------
+
+
+def _print_preamble(mod: ModuleType | None) -> None:
+    """Print the workflow's preamble (vignette + stakes) before the run.
+
+    Per Debussy Demo Contract §3.1 (workday framing) and §3.2 (stakes).
+    Workflow modules opt in by exposing ``preamble() -> str | None`` that
+    returns ready-to-print text. The CLI prints it after the ``log:``
+    line and before the first horizontal rule.
+    """
+    if mod is None:
+        return
+    fn = getattr(mod, "preamble", None)
+    if fn is None:
+        return
+    try:
+        text = fn()
+    except Exception as e:  # noqa: BLE001
+        _say(f"(preamble render error: {type(e).__name__}: {e})", style="red")
+        return
+    if not text:
+        return
+    _say()
+    _say(text)
 
 
 def _print_verdict_card(mod: ModuleType | None, cx: RenderContext) -> None:
