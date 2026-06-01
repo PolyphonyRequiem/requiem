@@ -254,6 +254,86 @@ class TwigClient:
         """
         await self._run(["comment", "--id", str(item_id), "--message", message])
 
+    async def create_child_async(
+        self,
+        *,
+        parent_id: int,
+        title: str,
+        work_item_type: str,
+        area_path: str | None = None,
+        description: str | None = None,
+    ) -> TwigItem:
+        """Create a child work item under ``parent_id`` and return it.
+
+        Added for Wave 6 (Mahler-3 parity audit §2.4) to unblock
+        recursive plan child seeding into ADO. The recursive ``planning``
+        workflow currently spawns child sub-workflows over synthesised
+        item ids; once a topology design lands (Stravinsky's ADR-0006)
+        the seeding step calls this method instead.
+
+        ## Inferred CLI contract
+
+        Polyphony's ``twig`` ships a dedicated ``create-child`` verb;
+        the local twig binary (0.81) exposes the same shape via
+        ``twig new --parent <id> --title <str> --type <str>``. We invoke
+        the polyphony-canonical form here so the seam reads the same as
+        the rest of the file:
+
+            twig create-child --parent <id> --title <str>
+                              --work-item-type <str>
+                              [--area-path <str>]
+                              [--description <str>]
+                              --output json
+
+        On exit 0, stdout is JSON with at least an ``id`` field; we lift
+        it via the same ``_coerce_item`` path as ``show_async``. The
+        binary may emit additional fields (``title``, ``state``, etc.)
+        — if any are missing we fall back to a follow-up
+        ``show_async(new_id)`` so callers always get a complete
+        ``TwigItem``. This mirrors ``set_state_async``'s thin-payload
+        guard.
+
+        Failure paths route through the same ``_classify_failure`` table
+        as every other call — rate limit → ``TwigRateLimitedError``,
+        ``parent not found`` → ``TwigItemNotFoundError``, anything else
+        → ``TwigUnknownError`` (Ravel's L-1 caveat). Verbs are expected
+        to convert ``TwigUnknownError`` to ``NeedsHuman`` rather than
+        auto-retry; auto-retrying an unclassified failure would violate
+        ``INV-NO-CORRUPT-FORWARD``.
+
+        Not yet wired into the planning workflow — that wiring is
+        Stravinsky's ADR-0006 work. This method is design-neutral
+        infrastructure that any topology alternative still needs.
+        """
+        argv = [
+            "create-child",
+            "--parent", str(parent_id),
+            "--title", title,
+            "--work-item-type", work_item_type,
+        ]
+        if area_path is not None:
+            argv.extend(["--area-path", area_path])
+        if description is not None:
+            argv.extend(["--description", description])
+        argv.extend(["--output", "json"])
+
+        stdout, _ = await self._run(argv)
+        payload = _parse_json(stdout)
+        if {"id", "state", "type"}.issubset(payload):
+            return _coerce_item(payload)
+        # Thin payload — twig acknowledged the create but didn't echo
+        # the full item. Re-fetch via `show` so callers always get a
+        # complete TwigItem (same belt-and-brace as set_state_async).
+        try:
+            new_id = int(payload["id"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise TwigUnknownError(
+                f"twig create-child JSON missing/invalid 'id': {e!r}",
+                exit_code=0,
+                stderr=json.dumps(payload)[:500],
+            ) from e
+        return await self.show_async(new_id)
+
     # -- sync surface (sugar for the common case) ------------------------
 
     def show(self, item_id: int) -> TwigItem:
@@ -267,6 +347,25 @@ class TwigClient:
 
     def comment(self, item_id: int, message: str) -> None:
         return asyncio.run(self.comment_async(item_id, message))
+
+    def create_child(
+        self,
+        *,
+        parent_id: int,
+        title: str,
+        work_item_type: str,
+        area_path: str | None = None,
+        description: str | None = None,
+    ) -> TwigItem:
+        return asyncio.run(
+            self.create_child_async(
+                parent_id=parent_id,
+                title=title,
+                work_item_type=work_item_type,
+                area_path=area_path,
+                description=description,
+            )
+        )
 
     # -- runner ----------------------------------------------------------
 

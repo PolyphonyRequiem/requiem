@@ -333,6 +333,229 @@ class TestListChildren:
         assert children == []
 
 
+# ---- create_child (Wave 6 / Liszt) -------------------------------------
+
+
+_NEW_CHILD_JSON = json.dumps(
+    {
+        "id": 4242,
+        "title": "New child seeded by recursive plan",
+        "type": "Task",
+        "state": "New",
+        "areaPath": "PolyphonyRequiem\\v0",
+        "parentId": 1234,
+    }
+)
+
+
+class TestCreateChild:
+    """Coverage for the create_child seam added for Mahler-3 §2.4.
+
+    Mirrors the other client-method test classes: scripted subprocess
+    fakes, an argv-shape assertion, the same error taxonomy as the rest
+    of the table, and a thin-payload guard that delegates to
+    ``show_async`` (analogous to ``set_state_async``).
+    """
+
+    def test_happy_create_returns_typed_item(self):
+        fake = _scripted(_NEW_CHILD_JSON, returncode=0)
+        with patch(_PATCH_TARGET, fake):
+            item = asyncio.run(
+                TwigClient().create_child_async(
+                    parent_id=1234,
+                    title="New child seeded by recursive plan",
+                    work_item_type="Task",
+                )
+            )
+        assert isinstance(item, TwigItem)
+        assert item.id == 4242
+        assert item.parent_id == 1234
+        assert item.work_item_type == "Task"
+        assert item.title == "New child seeded by recursive plan"
+
+    def test_create_passes_expected_argv(self):
+        """Polyphony's twig contract: --parent / --title / --work-item-type."""
+        fake = _scripted(_NEW_CHILD_JSON, returncode=0)
+        with patch(_PATCH_TARGET, fake):
+            asyncio.run(
+                TwigClient().create_child_async(
+                    parent_id=1234,
+                    title="New child",
+                    work_item_type="Task",
+                )
+            )
+        args = list(fake.captured["args"])
+        assert args[0] == "twig"
+        assert args[1:] == [
+            "create-child",
+            "--parent", "1234",
+            "--title", "New child",
+            "--work-item-type", "Task",
+            "--output", "json",
+        ]
+
+    def test_create_includes_optional_area_and_description(self):
+        fake = _scripted(_NEW_CHILD_JSON, returncode=0)
+        with patch(_PATCH_TARGET, fake):
+            asyncio.run(
+                TwigClient().create_child_async(
+                    parent_id=1234,
+                    title="New child",
+                    work_item_type="Task",
+                    area_path="PolyphonyRequiem\\v0",
+                    description="Spawned by recursive planning.",
+                )
+            )
+        args = list(fake.captured["args"])
+        # Order: positional verb, parent, title, type, optionals, output.
+        assert args[1:] == [
+            "create-child",
+            "--parent", "1234",
+            "--title", "New child",
+            "--work-item-type", "Task",
+            "--area-path", "PolyphonyRequiem\\v0",
+            "--description", "Spawned by recursive planning.",
+            "--output", "json",
+        ]
+
+    def test_create_omits_optionals_when_none(self):
+        """Defaults must not become empty-string flags (twig would reject)."""
+        fake = _scripted(_NEW_CHILD_JSON, returncode=0)
+        with patch(_PATCH_TARGET, fake):
+            asyncio.run(
+                TwigClient().create_child_async(
+                    parent_id=1234,
+                    title="New child",
+                    work_item_type="Task",
+                )
+            )
+        args = list(fake.captured["args"])
+        assert "--area-path" not in args
+        assert "--description" not in args
+
+    def test_create_refetches_when_payload_is_thin(self):
+        """If create-child returns just `{id: N}`, fall back to `show N`.
+
+        Mirrors ``set_state_async``'s belt-and-brace so callers always
+        get a complete ``TwigItem`` regardless of twig version drift in
+        the create response shape.
+        """
+        calls: list[list[str]] = []
+
+        async def factory(*args, **kwargs):
+            calls.append(list(args))
+            if "create-child" in args:
+                return _FakeProc(b'{"id": 4242}', b"", 0)
+            return _FakeProc(_NEW_CHILD_JSON.encode(), b"", 0)
+
+        with patch(_PATCH_TARGET, factory):
+            item = asyncio.run(
+                TwigClient().create_child_async(
+                    parent_id=1234,
+                    title="New child",
+                    work_item_type="Task",
+                )
+            )
+        assert item.id == 4242
+        assert item.title == "New child seeded by recursive plan"
+        # We expect two subprocess calls: create-child, then show.
+        assert len(calls) == 2
+        assert "create-child" in calls[0]
+        assert "show" in calls[1]
+        assert "4242" in calls[1]
+
+    def test_create_thin_payload_missing_id_raises_unknown(self):
+        """A create response with no `id` field is a schema drift signal."""
+        fake = _scripted(b'{"ok": true}', returncode=0)
+        with patch(_PATCH_TARGET, fake):
+            with pytest.raises(TwigUnknownError):
+                asyncio.run(
+                    TwigClient().create_child_async(
+                        parent_id=1234,
+                        title="New child",
+                        work_item_type="Task",
+                    )
+                )
+
+    def test_create_invalid_json_raises_unknown(self):
+        fake = _scripted("not json at all", returncode=0)
+        with patch(_PATCH_TARGET, fake):
+            with pytest.raises(TwigUnknownError):
+                asyncio.run(
+                    TwigClient().create_child_async(
+                        parent_id=1234,
+                        title="New child",
+                        work_item_type="Task",
+                    )
+                )
+
+    def test_create_rate_limited_raises_typed_error(self):
+        fake = _scripted("", b"Rate limit exceeded; retry after 30s", returncode=1)
+        with patch(_PATCH_TARGET, fake):
+            with pytest.raises(TwigRateLimitedError) as exc:
+                asyncio.run(
+                    TwigClient().create_child_async(
+                        parent_id=1234,
+                        title="New child",
+                        work_item_type="Task",
+                    )
+                )
+        from datetime import timedelta as _td
+        assert exc.value.retry_after == _td(seconds=30)
+
+    def test_create_parent_not_found_raises_typed_error(self):
+        """If the parent doesn't exist, twig returns not_found on exit 1."""
+        fake = _scripted("", b"error: parent work item not found", returncode=1)
+        with patch(_PATCH_TARGET, fake):
+            with pytest.raises(TwigItemNotFoundError):
+                asyncio.run(
+                    TwigClient().create_child_async(
+                        parent_id=999999,
+                        title="New child",
+                        work_item_type="Task",
+                    )
+                )
+
+    def test_create_unknown_failure_raises_unknown_not_retryable(self):
+        """Ravel's L-1 caveat: unclassified exit 1 must be UnknownError."""
+        fake = _scripted("", b"workflow validation failed for ItemType=Task", returncode=1)
+        with patch(_PATCH_TARGET, fake):
+            with pytest.raises(TwigUnknownError) as exc:
+                asyncio.run(
+                    TwigClient().create_child_async(
+                        parent_id=1234,
+                        title="New child",
+                        work_item_type="Task",
+                    )
+                )
+        assert exc.value.exit_code == 1
+        assert not isinstance(exc.value, (TwigRateLimitedError, TwigItemNotFoundError))
+
+    def test_create_stdin_is_devnull(self):
+        """Schumann's caveat: every subprocess call must pin stdin=DEVNULL."""
+        fake = _scripted(_NEW_CHILD_JSON, returncode=0)
+        with patch(_PATCH_TARGET, fake):
+            asyncio.run(
+                TwigClient().create_child_async(
+                    parent_id=1234,
+                    title="New child",
+                    work_item_type="Task",
+                )
+            )
+        assert fake.captured["kwargs"]["stdin"] == asyncio.subprocess.DEVNULL
+
+    def test_sync_create_child_wraps_async(self):
+        fake = _scripted(_NEW_CHILD_JSON, returncode=0)
+        with patch(_PATCH_TARGET, fake):
+            item = TwigClient().create_child(
+                parent_id=1234,
+                title="New child",
+                work_item_type="Task",
+            )
+        assert isinstance(item, TwigItem)
+        assert item.id == 4242
+
+
 # ---- cwd / executable failure modes ------------------------------------
 
 
