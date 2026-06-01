@@ -1,0 +1,677 @@
+# ADR 0006 (DRAFT) — Merge-Group Topology for Implementation
+
+**Status:** DRAFT — proposed for review by Daniel during Wave 6 (Stravinsky seat).
+**Date:** 2026-06 (Wave 6)
+**Author:** Stravinsky (design-research seat)
+**Supersedes:** none (first MG-topology decision; replaces the implicit
+"single `feature/<item_id>` branch" baked into `implementation.py`).
+**Superseded by:** —
+
+---
+
+## Context
+
+Wave 5 Mahler-3 audit
+([`docs/references/v0-parity-readiness.md` §2.3, §9 row #7](../references/v0-parity-readiness.md))
+verdicted **NO-GO for full §9 v0** with merge-group topology absent as one
+of five blocking gaps. The audit's exact words:
+
+> **Merge-group topology absent (non-negotiable #7).** The single-leaf
+> `implementation.py` cannot represent polyphony's `mg/` + `impl/` branch
+> structure. Backfilling this is multi-day work and touches branch
+> naming, PR ordering, scope-close logic.
+
+Daniel opened this for redesign on entering Wave 6:
+
+> "I'm open to rethinking the merge-group topology design by the way.
+> Not convinced we had it right before."
+
+This ADR is the rethink. It is a **decision document**, not an
+implementation. The deliverable is one recommended topology with explicit
+trade-offs and a list of open questions Daniel must close before any
+code lands.
+
+### What we have today
+
+`src/requiem/workflows/implementation.py:385` hard-codes:
+
+```python
+branch_name = f"feature/{inputs.item_id}"
+```
+
+One workflow run = one leaf item = one branch `feature/<item_id>` =
+one GitHub PR merged to `main` independently. There is no notion of
+sibling items, no integration surface, no plan-vs-impl PR split, no
+worktree, and no atomic-co-merge guarantee. `full_sdlc.py:55-59`
+explicitly says:
+
+> Multi-leaf plans: `plan` may produce decomposable trees, but the demo
+> collapses them to one leaf in the implementation stage. Real fan-out
+> is Berlioz-Phase-D's job.
+
+Planning today (`src/requiem/workflows/planning.py`) recurses freely
+and produces a fully recursive `PlanResult` tree (one `PlanResult` per
+node, `children: list[PlanResult]`,
+[`planning.py:160-176`](../../src/requiem/workflows/planning.py))
+but execution flattens to a single leaf. **The tree-of-plan-output
+already exists; what's missing is a tree-of-execution that consumes it.**
+
+### What polyphony does
+
+Polyphony's branch model (Rev 4) is documented in the
+[`polyphony-branch-model` skill](../../.github/skills/polyphony-branch-model/SKILL.md)
+([mirror in the squad-spike repo](file:///C:/Users/dangreen/projects/polyphony-squad-spike/.github/skills/polyphony-branch-model/SKILL.md))
+and is summarised here only enough to make the trade-offs explicit:
+
+```
+main
+ └── feature/{root_id}                            ← integration trunk
+      ├── plan/{root_id}                          ← root plan branch
+      │    └── plan/{root_id}-{item_id}           ← descendant plan
+      ├── mg/{root_id}_{mg_id}                       ← top MG
+      │    ├── impl/{root_id}-{item_id}              ← impl branch (flat)
+      │    └── mg/{root_id}_{mg_id}_{nested_mg_id}   ← nested MG
+      │         ├── impl/{root_id}-{owner_item_id}
+      │         └── impl/{root_id}-{descendant_id}
+      └── evidence/{root_id}-{item_id}            ← evidence branch
+```
+
+Plus: driver-enforced promotion gates per layer; stable planner-declared
+MG ids (`^[a-z][a-z0-9-]{0,30}$`); a default-nest trigger
+(decomposable AND implementable → nested MG); mandatory merge commits
+at all promote-chain layers; a topology hash committed to a run
+manifest on the feature branch; same-root run lock; renegotiation flow
+with parent-plan-generation serialisation; cross-sibling code-dependency
+rebase with materialisation gate; an `_` vs `-` vs `/` three-delimiter
+discipline forced by git's ref namespace; depth-3 warning / depth-5
+hard stop.
+
+It is *a lot*. The skill file alone is 628 lines.
+
+---
+
+## The problem MGs actually solve
+
+Before evaluating options we have to name what work the MG layer does.
+Each candidate problem gets a one-line statement, a citation if I have
+one, and a marker:
+
+| # | Problem | What it means | Status in v0 Requiem |
+|---|---------|---------------|----------------------|
+| **P1** | **Per-item review attribution** | Reviewer sees one PR per work item, even when items co-merge. Reviewer comments and ADO PR-links are 1:1 with items. | Trivially solved when there's one leaf. Not solved for fan-out. ([skill §"Isolation scope ↔ branch contract"](file:///C:/Users/dangreen/projects/polyphony-squad-spike/.github/skills/polyphony-branch-model/SKILL.md), line ~500). |
+| **P2** | **Atomic co-merge of related items** | When sibling leaves are designed to land together (e.g. "data layer + migration"), either both land or neither lands. No "A merged, B failed, A is now orphaned in `main`" failure mode. | **Not solved today.** With one leaf there is no question. Fan-out without an integration surface would expose this. |
+| **P3** | **Cross-sibling code dependency** | Leaf B compiles/tests against leaf A's code. B's branch needs A's commits in its base. | Not solved today (no fan-out). Polyphony solves this with `(scope, cross_mg_code_dep)` policy + materialisation-gated auto-rebase ([skill §"Cross-sibling code dependencies"](file:///C:/Users/dangreen/projects/polyphony-squad-spike/.github/skills/polyphony-branch-model/SKILL.md) lines 329-381). |
+| **P4** | **Test / CI containment** | A failing test on item B shouldn't block item A from progressing. | Today both share `main`; tests on A's PR are independent of B's. With an integration surface this becomes a real question (whose tests run on the integration branch?). |
+| **P5** | **Reviewer cognitive load** | A 50-file feature PR is unreviewable; 50 micro-PRs are review-fatiguing. The MG layer is a "natural read unit" between leaf and feature. | Today there is only the leaf level; no aggregator above it. |
+| **P6** | **Plan-PR vs impl-PR separation** | The operator can review the *plan* (what we propose to do) before any code is written, then the *implementation* on its own PR. Two distinct review surfaces with two distinct mental modes. | Not solved today. `planning.py` writes a plan artefact (`<run_id>.plan.tree.json`) but does not open a PR. ([Mahler-3 §9 row #6](../references/v0-parity-readiness.md) — "Plan PR open/merge ❌"). |
+| **P7** | **Topology stability under replanning** | Re-running planning on a subtree doesn't rename branches that already have open PRs. | Not relevant today (no fan-out). Polyphony solves this with planner-declared stable MG ids + a topology hash gate. |
+| **P8** | **Same-root concurrent-run prevention** | Two operators (or one operator twice) can't simultaneously drive the same root and stomp each other's branches. | Partially solved by `root_dispatch`'s deterministic `root_run_id` ([`root_dispatch.py:1-44`](../../src/requiem/workflows/root_dispatch.py)) — second dispatch reuses the manifest. No lock today, but INV-SINGLE-PROCESS + same-process re-entry covers the common case. |
+| **P9** | **Parallel work on independent items** | When items have no code dependency, agents can work on them concurrently. | Not solved today (no fan-out, no worktree). Polyphony solves this with per-item worktrees. |
+| **P10** | **Driver-enforced merge ordering** | Parent merge gates wait for children. Git ancestry alone is not the canonical signal — PR-state-plus-requirement-disposition is. | Not relevant today (no children to wait on). |
+
+### Wheat-vs-chaff classification of polyphony's MG model
+
+For each piece of polyphony's MG machinery, my call:
+
+| Polyphony piece | Classification | Reasoning |
+|-----------------|----------------|-----------|
+| `feature/{root}` integration trunk | **LOAD-BEARING** | Solves P2 (atomic co-merge) and gives P3 a natural answer (siblings branch off the same trunk). Required for any fan-out story. |
+| `impl/{root}-{item}` per-leaf branch | **LOAD-BEARING** | Solves P1 (per-item review attribution). |
+| `plan/{root}` plan branch + plan PR | **LOAD-BEARING** | Solves P6 (plan-vs-impl review surfaces). Polyphony's most operator-loved feature in dogfood per the inventory. |
+| `mg/{root}_{mg_id}` top-MG branch | **LOAD-BEARING for large fan-outs, OPTIMISATION for small ones** | Solves P5 (cognitive load) when there are many leaves. For ≤5 leaves the feature trunk *is* the natural aggregator and an MG layer is overhead. |
+| Nested `mg/{root}_{mg_path}_{nested}` | **CONDUCTOR-INHERITED** | Justified historically by conductor's lack of an authoritative event log: branch topology *encoded* recursive plan state because there was no other durable substrate. Requiem has INV-EVENT-LOG-AUTHORITATIVE; the topology no longer needs to encode state. |
+| Stable planner-declared MG ids (`^[a-z][a-z0-9-]{0,30}$`) | **LOAD-BEARING IF P7 is in scope; OPTIMISATION otherwise** | Solves P7 (replan stability). v0 may not have replan-mid-flight as a use case. |
+| Topology hash in run manifest | **LOAD-BEARING for resume across replan; CONDUCTOR-INHERITED for the rest** | Solves "did the topology change since last run?" In Requiem the equivalent question is answered by the event log + manifest sidecar pair already in `root_dispatch.py`. |
+| Default-nest trigger (decomposable AND implementable → nested MG) | **CONDUCTOR-INHERITED** | A *rule* that derives topology from plan facets. Required only because nested MGs exist; if you don't nest, you don't need a trigger. |
+| Three-delimiter discipline (`/`, `-`, `_`) | **BUG-COMPATIBLE** | Forced by git's ref namespace + polyphony's choice to encode hierarchy *in the ref name*. We need the discipline only if we adopt nested `mg/` paths. |
+| Driver-enforced merge gates per layer | **LOAD-BEARING** | Solves P10. Real even without `mg/` layer: parent (feature) PR must wait on children (leaves). |
+| Cross-MG code-dep rebase with materialisation gate | **OPTIMISATION (advanced)** | Solves P3 *across MG boundaries*. If there are no MG boundaries (option D below) the problem reduces to standard intra-trunk stacking. |
+| Parent-plan-generation serialisation for renegotiation | **OPTIMISATION (advanced)** | Solves a multi-driver replan race condition. The v0 audience is one operator, one root, one driver (north-star §5 — "single power-user audience"); this race is hypothetical. |
+| Same-root run lock | **LOAD-BEARING** | Solves P8 even in v0. Cheap to add. |
+| Per-item worktrees | **OPTIMISATION** | Solves P9 (parallelism). Worth it eventually, but **agent-throughput is the bottleneck before git is** in the single-operator audience; sequential execution is acceptable for v0. (Mahler-3 §9 row #5 lists this as a separate non-negotiable; treating it as orthogonal to MG topology is intentional — see "Out of scope" below.) |
+| `evidence/{root}-{item}` branches | **DEFERRED** | Polyphony's actionable-facet machinery. Requiem does not have the actionable facet today ([Mahler-3 §2.2 — actionable.yaml "❌ missing"](../references/v0-parity-readiness.md)). Out of scope for this ADR. |
+
+### One more observation — why polyphony needed `mg/` and Requiem may not
+
+The single most architecturally important reason polyphony has nested
+`mg/` branches is that **conductor's checkpoint state is ephemeral**
+([parity inventory §3](../references/polyphony-parity-inventory.md)
+— "*Conductor checkpointing is explicitly **not** durable cross-run
+state*"). The branch topology had to carry recursive plan state because
+there was nowhere else durable to put it. The driver inspecting
+`mg/1234_data-layer_item-4567` *is* reading workflow state from git.
+
+Requiem has **INV-EVENT-LOG-AUTHORITATIVE** (north-star §2) and
+**INV-SUBWORKFLOW-LOG-ISOLATION** (north-star §2, [ADR-0005](0005-subworkflow-invocation-primitive.md)).
+The event log carries the state. Recursion lives in
+`{sub_run_id}.events.jsonl` sidecars. Branch topology no longer has to
+*encode* plan structure — it only has to *serve* git's needs (one ref
+per concurrent diff under review).
+
+**This is the load-bearing argument for a simpler topology than
+polyphony's.** When you remove the "branches as state substrate"
+requirement, the case for `mg/{root}_{parent}_{nested}` weakens
+substantially.
+
+---
+
+## Options considered
+
+### A. Polyphony-compatible MG (port the full Rev 4 model)
+
+**Elevator pitch:** Implement everything in the polyphony-branch-model
+skill. Recursive `plan/`, `mg/`, `impl/`, `evidence/` branches.
+Driver-enforced promotion gates. Stable planner-declared MG ids.
+Topology hash. Same-root lock. Cross-sibling rebase. Per-item worktree.
+Total feature parity.
+
+**Branch sketch:** identical to the polyphony skill diagram, above.
+
+**New invariants required:**
+- INV-MG-ID-IMMUTABLE — once a branch exists under an `mg_id`, the id
+  cannot change for the life of the run.
+- INV-TOPOLOGY-HASH-IS-RESUME-KEY — same-root resume keys off topology
+  hash; mismatched hash → human gate, never silent rename.
+- INV-DRIVER-GATES-MERGE — git ancestry is observed, never enforced;
+  PR-state + requirement-disposition is the canonical signal.
+- INV-NO-DIRECT-MG-COMMITS — impl PRs are the only way commits reach
+  an MG branch.
+
+**Solves:** P1, P2, P3, P4, P5, P6, P7, P8, P9, P10. The full set.
+
+**Cost:**
+- Net-new code: branch-management module (~1500 LOC by my eye-on-skill
+  estimate), driver gate state machine, topology-hash computation,
+  manifest schema bump, lock service, renegotiation handler, cross-MG
+  rebase orchestrator, worktree allocator.
+- Net-new YAMLs in Requiem terms: a tree of sub-workflows
+  (`impl-merge-group`, `feature-pr`, plan-PR machinery) per the
+  parity inventory §2.
+- Net-new operator surface: depth gates, topology gates, MG id naming
+  rules to teach.
+- Risk: **importing complexity that v0 doesn't need.** The CONDUCTOR-INHERITED
+  pieces in the wheat-vs-chaff table are not free; each one shows up
+  as routing edges, error kinds, gate variants, and operator-facing
+  prompts.
+
+**Trade-offs vs. status quo:**
+- Pro: full §9 parity. Path to multi-tenant later if v0 grows up.
+- Con: Requiem stops being "the simpler thing that replaces polyphony"
+  and starts being "polyphony reimplemented in Python". The
+  architectural win (INV-SINGLE-PROCESS, INV-EVENT-LOG-AUTHORITATIVE,
+  ADR-0005) gets buried under topology machinery.
+
+---
+
+### B. Flat children (no integration surface)
+
+**Elevator pitch:** Every implementable leaf is its own
+`feature/<item_id>` branch (as today). Each leaf opens its own PR
+direct to `main`. Atomicity, if needed, happens by *aggregation at
+root level* — the root workflow tracks "all children merged?" via the
+event log, not via branch topology.
+
+**Branch sketch:**
+
+```
+main
+ ├── feature/100                ← leaf 1 PR → main
+ ├── feature/101                ← leaf 2 PR → main
+ └── feature/102                ← leaf 3 PR → main
+```
+
+**New invariants required:**
+- INV-LEAF-MERGES-INDEPENDENT — every implementable item merges to
+  `main` on its own. There is no co-merge guarantee at the branch
+  level.
+
+**Solves:** P1 (per-item review trivially), P4 (test containment is
+just normal PR-level CI), P9 (parallel work — leaves are independent
+branches on `main`).
+
+**Does not solve:**
+- **P2** — no atomic co-merge. If leaf B fails to merge after leaf A
+  succeeded, A is in `main` orphaned.
+- **P3** — cross-sibling code-dep is impossible without surgery. B's
+  branch off `main` cannot see A's unmerged code.
+- **P5** — for a 20-leaf feature the operator gets 20 independent PRs
+  with no aggregator.
+- **P6** — no plan PR. The plan exists as a JSON sidecar; the operator
+  cannot review it in the GitHub UI before code lands.
+- **P10** — there is no parent merge to gate.
+
+**Trade-offs:**
+- Pro: zero net-new code (`implementation.py` is already this).
+  Easiest path to "the demo handles fan-out".
+- Pro: cleanest INV-RESTART story (each leaf is its own independent
+  sub-workflow run; the existing crash-point matrix already covers
+  it).
+- Con: this is **not actually a fan-out story** — it's a "fan-out of
+  unrelated items". The whole point of MGs is to handle *related*
+  items, and B drops the relatedness.
+- Con: the "what if a leaf fails after siblings merged?" question has
+  no good answer.
+
+**Verdict:** acceptable for the **re-scoped v0** Mahler-3 named (single
+power-user, single root, treats all leaves as independent). Not
+acceptable for the full §9 v0 because non-negotiable #7 explicitly
+requires "merge-group implementation … with idempotent re-entry" —
+flat-children does not produce merge groups at all.
+
+---
+
+### C. Single merge-train per root
+
+**Elevator pitch:** One `train/<root>` branch onto which every child
+rebases and lands sequentially in topological order. When all children
+have landed on the train, root opens `train/<root>` → `main` as one
+PR. Each child still gets its own *review* PR (squashed onto the
+train).
+
+**Branch sketch:**
+
+```
+main
+ └── train/{root_id}            ← integration trunk
+      ← impl-1 rebased + squashed on
+      ← impl-2 rebased + squashed on
+      ← impl-3 rebased + squashed on
+```
+
+**New invariants required:**
+- INV-TRAIN-IS-LINEAR — the train branch's commit history is linear
+  (each child lands as one squash commit). No merge commits on the
+  train.
+- INV-CHILD-PR-REBASES-ON-TRAIN-HEAD — every child PR's HEAD is
+  `git merge-base train/<root>` ancestry at merge time.
+
+**Solves:** P1 (per-item review via child PRs), P2 (atomic co-merge —
+train → main is one merge), P3 (children rebase on train head, so a
+child can see prior children's code), P5 (the train PR is the aggregator),
+P6 (could be added: train opens *first* as a plan PR), P10 (driver
+gates train→main merge on "all children landed").
+
+**Does not solve:**
+- **P9** — the train is a serial integration surface; children land
+  one at a time. Parallel agent work is possible (multiple agents
+  produce branches concurrently), but the *land step* is serial.
+- **P7** — no nested MG concept; replan that adds children mid-flight
+  just appends to the train, which is fine, but replan that *removes*
+  a landed child requires `git revert` on the train (auditable but
+  awkward).
+
+**Trade-offs:**
+- Pro: simpler than option A. Half the new code (no nested-MG
+  recursion, no topology hash, no cross-MG rebase machinery — just
+  rebase-on-head).
+- Pro: matches how humans naturally stage related work ("queue up the
+  diffs, ship as one feature").
+- Con: serialisation of the land step. For 20 leaves that's 20
+  sequential rebases.
+- Con: rebase-on-head means every child branch's history rewrites as
+  earlier children land. Reviewer comments on old SHAs go stale.
+- Con: still doesn't address P6 (plan PR) without adding a separate
+  `plan/<root>` branch on top.
+
+**Verdict:** clean and shippable, but the rebase-rewriting-SHAs problem
+is real and operator-visible. Option D below avoids it.
+
+---
+
+### D. Plan-PR-as-aggregator (RECOMMENDED — see below)
+
+**Elevator pitch:** One `feature/<root>` integration trunk per run.
+Every implementable leaf is an `impl/<root>-<item>` branch off the
+trunk; leaf merges to the trunk via individual PR (squash or merge,
+operator's choice). The plan itself is a `plan/<root>` branch with its
+own PR (against the trunk, opened before any impl branch is cut). The
+trunk merges to `main` as one feature PR. **No nested `mg/` layer.**
+For large fan-outs that benefit from a middle aggregation level
+("data layer" vs "UI layer"), the planner declares a stable
+**review group label** — purely a UI/dashboard grouping concept, **not
+a branch**. This is the polyphony Rev 4 model with the recursive
+`mg/{root}_{path}_…` layer collapsed.
+
+**Branch sketch:**
+
+```
+main
+ └── feature/{root_id}                          ← integration trunk (run scope)
+      ├── plan/{root_id}                        ← plan PR → feature trunk
+      ├── impl/{root_id}-{item_id_A}            ← leaf A PR → feature trunk
+      ├── impl/{root_id}-{item_id_B}            ← leaf B PR → feature trunk
+      └── impl/{root_id}-{item_id_C}            ← leaf C PR → feature trunk
+```
+
+Three branch prefixes: `feature/`, `plan/`, `impl/`. Two delimiters:
+`/` for ref-class, `-` for `{root}-{item}` payload. **No `_`. No
+recursive `mg_path`.**
+
+**New invariants required:**
+- INV-FEATURE-TRUNK-PER-RUN — every root run owns exactly one
+  `feature/<root>` branch; it is the only thing that ever merges to
+  `main` for that run.
+- INV-IMPL-BRANCH-PER-LEAF — every implementable leaf gets exactly one
+  `impl/<root>-<item>` branch off the trunk.
+- INV-PLAN-PR-PRECEDES-IMPL — the plan PR opens before any impl
+  branch is cut; impl branches branch from the trunk *after* the plan
+  PR merges (or from a `--skip-plan-pr` operator override).
+- INV-DRIVER-GATES-FEATURE-MERGE — the feature → main merge waits on
+  *all* leaf-impl PRs to land on the trunk and *all* in-scope items'
+  requirement dispositions to be satisfied.
+- INV-NO-DIRECT-TRUNK-COMMITS — the feature trunk receives commits
+  only via merged impl PRs and the merged plan PR.
+
+**Solves:**
+- **P1** — one impl PR per leaf, full review attribution.
+- **P2** — atomic co-merge: nothing reaches `main` until the feature
+  PR merges; if a leaf fails partway, the trunk is just abandoned (or
+  resumed) without polluting `main`.
+- **P3** — cross-sibling code-dep: B branches from the trunk, which
+  already contains A's merged code. Standard intra-trunk stacking, no
+  cross-MG rebase machinery.
+- **P4** — test containment: trunk-level CI runs on every impl PR's
+  merge into the trunk; failing tests on one impl PR block that PR
+  only.
+- **P5** — partially. The feature trunk is the natural aggregator.
+  For large fan-outs, planner-declared review-group labels (a UI
+  grouping, *not* a branch) cluster impl PRs in the dashboard.
+- **P6** — plan PR is a real `plan/<root>` branch with a real PR
+  reviewable in the GitHub UI before any impl branch exists.
+- **P8** — same-root run lock + manifest sidecar as today
+  (`root_dispatch.write_manifest`), extended with a feature-branch
+  refusal: cannot start a fresh run if `feature/<root>` exists with
+  open impl PRs.
+- **P10** — driver gates trunk → main on leaf-impl-PR aggregate state.
+
+**Partially solves:**
+- **P9** — parallel work is *possible* (agents produce branches
+  concurrently) but the *trunk-merge step* serialises. For v0 (single
+  operator, agent-throughput is the bottleneck) this is acceptable.
+
+**Does not solve:**
+- **P7** — replan-mid-flight with stable ids. v0 question: do we have
+  this use case? The audit doesn't list it. Defer until we do.
+
+**Trade-offs vs. polyphony status quo:**
+- Drop: nested `mg/{root}_{path}` recursion, topology hash, default-nest
+  trigger, `_` vs `-` delimiter discipline (we have only `/` and `-`),
+  cross-MG code-dep rebase machinery, parent-plan-generation
+  serialisation, depth-3 warning / depth-5 hard stop.
+- Keep: per-item review (P1), atomic integration (P2), plan-PR
+  separation (P6), driver gates (P10), same-root lock (P8).
+- Move from "branch encodes state" to "event log encodes state, branch
+  encodes diff under review" — aligns with INV-EVENT-LOG-AUTHORITATIVE
+  by construction.
+
+**Trade-offs vs. each other option:**
+- vs. **A (polyphony-compat):** loses nested-MG aggregation for
+  20+-leaf features; gains a ~5-10× smaller surface area. v0 audience
+  is one operator on one root — 20-leaf features are post-v0.
+- vs. **B (flat children):** gains P2, P3, P6, P10. Trades 1 extra
+  branch type (`feature/`) and 1 extra PR per run (the feature PR).
+- vs. **C (merge-train):** wins on SHA stability for in-flight impl
+  PRs (no rewriting earlier children's history). Loses linear-history
+  property on the trunk (merge commits in the trunk are fine — they're
+  the integration record), which is a feature for some teams and a
+  cost for others.
+
+---
+
+### E. Hybrid — option D as v0, optional MG nesting in v1
+
+**Elevator pitch:** Ship option D for v0. Add a `--nest-mg=<id>`
+planner override in v1 that lights up *one level* of nested `mg/`
+branches *only for subtrees the planner explicitly groups*. No
+default-nest trigger; nesting is opt-in.
+
+**This is not really a separate topology — it's option D plus a
+forward-compatibility note.** Listed here only to make explicit that
+"recommend D for v0" does not foreclose porting the nested-MG layer
+later if real workload demands it.
+
+---
+
+## Recommendation
+
+**Adopt option D (plan-PR-as-aggregator) for v0.**
+
+Rationale:
+
+1. **It solves all the load-bearing problems** (P1, P2, P3, P4, P5
+   trunk-level, P6, P8, P10) and defers the
+   CONDUCTOR-INHERITED / OPTIMISATION ones (P7, P9, P5 multi-MG-level).
+
+2. **It is the smallest topology consistent with non-negotiable #7.**
+   The audit's verbatim requirement is "Merge-group implementation
+   (`mg/`, `impl/`) with idempotent re-entry". Strict reading requires
+   the `mg/` prefix; the load-bearing reading requires "a per-PR
+   review surface plus an integration surface". Option D satisfies the
+   load-bearing reading. **This ADR is the place to either renegotiate
+   the strict reading or commit to A — Daniel's call (open question
+   1).**
+
+3. **It maps to Requiem's existing primitives without ceremony.**
+   - `feature/<root>` replaces `feature/<item_id>` in
+     `implementation.py:385` — one-line change conceptually, larger
+     ripple in idempotency keys.
+   - `impl/<root>-<item>` is a renaming of the existing per-leaf
+     `feature/<item_id>` model.
+   - The plan PR is a new workflow node in `planning.py` that opens a
+     PR on the plan sidecar artefact already written.
+   - Each leaf-impl runs as a sub-workflow per ADR-0005; INV-RESTART,
+     INV-SUBWORKFLOW-LOG-ISOLATION already covered.
+   - The driver gate on feature→main is the existing `close_out`
+     workflow plus an aggregate-children check.
+
+4. **It honours the architectural bet of Requiem.** The reason Requiem
+   exists at all (per ADR-0001 and the north-star §2 invariants) is to
+   *replace* polyphony's complexity, not to reimplement it. Adopting
+   option A would buy parity at the cost of the architectural payoff.
+   Adopting D buys 80% of the parity for 30% of the complexity and
+   leaves the door open for nested-MG opt-in (option E) when a real
+   workload demands it.
+
+5. **It does not foreclose option A.** The migration from D to A is
+   additive — a new `mg/` ref-class plus a default-nest trigger. The
+   migration from A to anything simpler is not — branches are one-way
+   doors (polyphony skill, line 628).
+
+### What it costs to build (rough)
+
+| Component | Estimated effort |
+|-----------|------------------|
+| Rename `feature/<item_id>` → `feature/<root>` + `impl/<root>-<item>` in `implementation.py`, with idempotency-key migration and a per-leaf sub-workflow shim. | 1-2 days |
+| New `plan_pr` verb in `planning.py` (opens `plan/<root>` PR against the trunk on plan-write). | 1 day |
+| Same-root lock — extend `root_dispatch.write_manifest` to refuse if `feature/<root>` exists with open impl PRs and the operator did not pass `--resume`. | 0.5 day |
+| Feature-PR workflow (`feature_pr.py`) — opens trunk → main PR when all children's impl PRs are merged; gates on requirement disposition. | 2 days |
+| Fan-out executor (the missing "Berlioz-Phase-D" piece) — given a recursive `PlanResult` tree, dispatch each implementable leaf as a sub-workflow via existing ADR-0005 primitive. Aggregate via the existing crash-point-13/14 patterns. | 2-3 days |
+| Tests: per-leaf INV-RESTART, atomic-co-merge happy path, atomic-co-merge mid-flight failure (one leaf fails, no merge to main), plan-PR-precedes-impl invariant, same-root lock, fan-out resume after worker death. | 2 days |
+| Operator-facing render hints + verdict cards for the new flow. | 1 day |
+| **Total** | **~10 working days** for a single seat, comparable to one Phase-C-class workflow. |
+
+Option A's analogous estimate is, eyeballing the polyphony skill,
+3-4× larger plus operator-doc work.
+
+---
+
+## Consequences
+
+### Positive
+- Closes non-negotiable #7 with a load-bearing answer, not a strict-prefix
+  cargo-cult.
+- Unlocks fan-out for `full_sdlc.py` (the Berlioz-Phase-D work the
+  current demo punts on).
+- Plan-PR-vs-impl-PR separation (P6) is operator-visible value that
+  polyphony's dogfood loved.
+- Keeps the topology vocabulary small (three prefixes, two delimiters)
+  — easy to teach, easy to render in the UI, hard to corrupt.
+- Aligns branch-as-diff with INV-EVENT-LOG-AUTHORITATIVE — branches
+  carry diffs, the log carries state.
+
+### Negative / load-bearing follow-ups
+- **Drop:** nested `mg/` aggregation, default-nest trigger, topology
+  hash, cross-MG rebase machinery, parent-plan-generation
+  serialisation, depth gates, `evidence/` branches (the actionable
+  facet does not exist in Requiem today; see [Mahler-3 §2.2 row
+  "actionable.yaml"](../references/v0-parity-readiness.md)).
+- **Defer:** P9 (parallel item execution). v0 fan-out is serial;
+  per-item worktrees are a separate non-negotiable (#5) and a separate
+  ADR. Sequential execution on a single workspace is acceptable for
+  the single-operator audience (north-star §5).
+- **Risk: option D does not satisfy a literal reading of non-negotiable
+  #7.** The audit text says "`mg/`, `impl/`". Option D has `impl/` but
+  no `mg/`. Either the audit's reading relaxes to "per-leaf review +
+  integration surface" (which option D satisfies) or option A is the
+  only acceptable answer. **This is open question 1.**
+- **Idempotency-key migration:** today `feature/<item_id>` is the
+  resume key for an implementation sub-workflow. Under option D, the
+  key becomes `(root_id, item_id)` and the impl branch becomes
+  `impl/<root>-<item>`. INV-RESTART requires every state-mutating
+  verb to be idempotent under the new key — needs a careful pass.
+- **Test surface:** every implementation-workflow test has to handle
+  the `feature/` → `impl/` rename. ~29 tests in
+  `test_implementation_workflow.py` plus ~12 in `test_full_sdlc.py`.
+- **Operator mental model shift:** "where did my code land?" answer
+  changes from "the `feature/12345` branch and PR" to "the
+  `impl/100-12345` branch, then the `feature/100` trunk PR, then
+  `main`". The dashboard / verdict cards must explain this clearly or
+  the operator will be confused.
+
+### Out of scope for this ADR (filed as separate concerns)
+- **Per-item worktree isolation (Mahler-3 §9 #5).** Orthogonal to
+  topology. A future ADR (`0007-worktree-isolation.md`?) decides
+  whether worktrees are per-leaf or per-MG or none.
+- **ADO PR lifecycle (Mahler-3 §9 #10).** Orthogonal — both options
+  apply equally to GitHub and ADO PRs.
+- **Reset / reconcile verbs.** Orthogonal — recovery surfaces work the
+  same for any topology.
+- **Web dashboard (Mahler-3 §9 #8).** The dashboard renders the
+  topology, but the topology choice does not depend on the dashboard.
+
+---
+
+## Open questions for Daniel
+
+These are genuine open questions; this ADR cannot close them without
+input.
+
+1. **Does the literal reading of non-negotiable #7 stand?** The audit
+   text says "Merge-group implementation (`mg/`, `impl/`) …". Option D
+   ships `impl/` but no `mg/`. Either (a) the reading is "load-bearing,
+   not literal — option D satisfies it" or (b) you want option A's
+   `mg/` prefix regardless of cost. This is the call that gates
+   recommendation acceptance.
+
+2. **Plan-PR realisation: real PR or virtual artefact?** Option D
+   assumes the plan PR is a real `plan/<root>` branch with a real
+   GitHub PR (operator-reviewable in the browser). Polyphony does
+   this. The alternative is "plan is markdown rendered into the
+   feature-PR description". Real-PR is more work but is the load-bearing
+   delight in polyphony's dogfood. Confirm preference?
+
+3. **Atomic co-merge guarantee — how strict?** Option D's promise is
+   "either the feature trunk merges to main or nothing does", but
+   *individual leaf-impl PRs* still land on the trunk one at a time.
+   If leaf B fails to merge to the trunk after leaf A succeeded, the
+   trunk has A's code and no path to main. Two recovery models:
+   (a) **Abandon the trunk** — operator deletes branch, re-runs root,
+   gets a fresh trunk. (b) **Roll forward** — `needs_human` gate
+   lets the operator retry leaf B or skip-with-justification. Which?
+
+4. **Replan mid-flight: in scope for v0?** If yes, we need P7 (stable
+   MG ids) even without nested `mg/` branches — the planner declares
+   stable item ids and the executor refuses to rename impl branches.
+   If no, defer. Option D currently assumes no.
+
+5. **Should the planner declare review-group labels?** Even without
+   nested `mg/` branches, the planner could emit a
+   `review_group: "data-layer"` field per leaf. The dashboard groups
+   impl PRs by label; nothing changes in git. Cheap, useful for big
+   fan-outs, doesn't commit us to topology. Yes / no?
+
+6. **Same-root run lock semantics.** Option D's INV-FEATURE-TRUNK-PER-RUN
+   says one trunk per run. What's the right operator UX when they
+   start a fresh run on a root that already has an open trunk?
+   Polyphony's answer: refuse-or-attach (line ~494 of the skill). Is
+   that the right behaviour for the single-operator audience or
+   overkill?
+
+7. **(Minor) Should `feature/<item_id>` survive for the single-leaf
+   case?** When the root *is* a leaf (no children), option D's
+   topology degenerates to `feature/<root>` + `impl/<root>-<root>` +
+   one trunk PR — two branches and two PRs for what was one. Worth a
+   special case ("if leaf-only, use today's `feature/<item_id>`
+   shape") or worth the consistency tax?
+
+---
+
+## References
+
+### North-star invariants (in priority order for this decision)
+- **INV-EVENT-LOG-AUTHORITATIVE** — [north-star §2](../north-star.md).
+  The single most important reason option D is viable: branches no
+  longer need to encode workflow state.
+- **INV-SUBWORKFLOW-LOG-ISOLATION** — [north-star §2](../north-star.md),
+  ratified by [ADR-0005](0005-subworkflow-invocation-primitive.md). Each
+  per-leaf impl runs as a sub-workflow with its own log; recursive
+  fan-out is a solved problem at the kernel layer.
+- **INV-RESTART** — [north-star §2](../north-star.md). Constrains the
+  branch-rename migration — every new verb must be idempotent under
+  the new `(root_id, item_id)` key.
+- **INV-NO-CORRUPT-FORWARD** — [north-star §2](../north-star.md). The
+  feature → main merge gate is a hard "refuse to proceed if any leaf's
+  requirements unsatisfied" check, not a "best-effort" merge.
+- **INV-SINGLE-PROCESS** — [north-star §2](../north-star.md), ratified
+  by [ADR-0001](0001-single-process-architecture.md). The reason
+  Requiem exists. Option A would erode the payoff; option D preserves
+  it.
+
+### Polyphony prior art
+- [`polyphony-branch-model` skill (Rev 4)](file:///C:/Users/dangreen/projects/polyphony-squad-spike/.github/skills/polyphony-branch-model/SKILL.md)
+  — the source of truth for option A. 628 lines.
+- [`polyphony-sdlc` skill](file:///C:/Users/dangreen/projects/polyphony-squad-spike/.github/skills/polyphony-sdlc/SKILL.md)
+  — SDLC vocabulary.
+- [`polyphony-workflow-author` skill](file:///C:/Users/dangreen/projects/polyphony-squad-spike/.github/skills/polyphony-workflow-author/SKILL.md)
+  — the workflow-YAML idioms option A would have to port.
+
+### Requiem prior art
+- [`docs/references/v0-parity-readiness.md`](../references/v0-parity-readiness.md)
+  — Mahler-3 audit. §2.2 workflow catalogue (rows for
+  `polyphony.yaml`, `plan-level.yaml`, `implement-merge-group.yaml`,
+  `feature-pr.yaml`), §2.3 state model (branch-model row), §9 #7
+  non-negotiable.
+- [`docs/references/polyphony-parity-inventory.md`](../references/polyphony-parity-inventory.md)
+  §3 state model (run manifest, branch model, worktree layout,
+  authoritative-source ranking), §9 #7 non-negotiable.
+- [`docs/decisions/0005-subworkflow-invocation-primitive.md`](0005-subworkflow-invocation-primitive.md)
+  — the primitive every per-leaf impl will use.
+
+### Current Requiem code
+- [`src/requiem/workflows/implementation.py:385`](../../src/requiem/workflows/implementation.py)
+  — `branch_name = f"feature/{inputs.item_id}"`. The thing this ADR
+  changes.
+- [`src/requiem/workflows/implementation.py:312-326`](../../src/requiem/workflows/implementation.py)
+  — `ImplementationInputs`. Will need a `root_id` field under option D.
+- [`src/requiem/workflows/planning.py:160-176`](../../src/requiem/workflows/planning.py)
+  — `PlanResult` recursive tree. The tree-of-plan-output that an
+  option-D executor consumes.
+- [`src/requiem/workflows/planning.py:181-198`](../../src/requiem/workflows/planning.py)
+  — `ChildPlan` / `PlannerOutput`. Adding a `review_group` field
+  (open question 5) lands here.
+- [`src/requiem/workflows/full_sdlc.py:55-59`](../../src/requiem/workflows/full_sdlc.py)
+  — the docstring's "Multi-leaf plans: … the demo collapses them to
+  one leaf … Real fan-out is Berlioz-Phase-D's job." Option D's
+  executor *is* that work.
+- [`src/requiem/workflows/full_sdlc.py:419-481`](../../src/requiem/workflows/full_sdlc.py)
+  — the five-stage linear pipeline. Adding a fan-out node between
+  `plan` and `implement` is the structural change.
+- [`src/requiem/workflows/root_dispatch.py:1-44`](../../src/requiem/workflows/root_dispatch.py)
+  — `validate_root`, `compute_run_id`, `write_manifest`. Same-root
+  lock (open question 6) extends this.
+
+### Daniel's framing for this rethink
+> "I'm open to rethinking the merge-group topology design by the way.
+> Not convinced we had it right before."
+
+Stravinsky, Wave 6.
