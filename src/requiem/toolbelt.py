@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from requiem.clients.gh import GhClient
+
 
 # ---- files -----------------------------------------------------------
 
@@ -117,7 +119,15 @@ class Toolbelt:
 
     git: GitClient
     files: FileClient
+    # `gh` is optional so other Phase B seats whose tests construct a
+    # Toolbelt without it (e.g. pure-file workflows) keep working. Verbs
+    # that need it should require it explicitly at the call site.
+    gh: GhClient | None = None
 
     @classmethod
     def real(cls) -> "Toolbelt":
-        return cls(git=RealGitClient(), files=RealFileClient())
+        return cls(
+            git=RealGitClient(),
+            files=RealFileClient(),
+            gh=GhClient(),
+        )
