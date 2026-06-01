@@ -29,6 +29,9 @@ test = [
 [project.scripts]
 requiem = "requiem.cli:main"
 
+[project.entry-points.pytest11]
+requiem-harness = "requiem.harness.pytest_plugin"
+
 [project.urls]
 Homepage = "https://github.com/PolyphonyRequiem/requiem"
 Issues = "https://github.com/PolyphonyRequiem/requiem/issues"
