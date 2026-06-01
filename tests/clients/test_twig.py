@@ -381,6 +381,14 @@ class TestRunnerFailureModes:
             asyncio.run(TwigClient().show_async(1))
         assert fake.captured["kwargs"]["cwd"] is None
 
+    def test_stdin_is_devnull(self):
+        """Schumann's caveat: on Py3.14 + Windows + pytest, captured stdin
+        is not inheritable. Every subprocess call MUST pin stdin=DEVNULL."""
+        fake = _scripted(_ITEM_JSON, returncode=0)
+        with patch(_PATCH_TARGET, fake):
+            asyncio.run(TwigClient().show_async(1))
+        assert fake.captured["kwargs"]["stdin"] == asyncio.subprocess.DEVNULL
+
 
 # ---- sync sugar --------------------------------------------------------
 
@@ -408,6 +416,7 @@ def test_real_twig_version_smoke():
 
     r = subprocess.run(
         ["twig", "--version"],
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         timeout=10,

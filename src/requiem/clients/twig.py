@@ -33,6 +33,11 @@ from `TwigClient(cwd=...)` and passed straight through; bad `cwd` raises
 are caught at the runner and re-raised as `TwigClientError("invalid
 cwd...")`.
 
+stdin is explicitly set to `DEVNULL`. Per Schumann's filesystem-seat
+debrief: on Python 3.14 + Windows + pytest, an inherited (captured)
+stdin handle is not inheritable and the spawn fails opaquely. DEVNULL
+is the cheap belt-and-brace; twig never reads stdin anyway.
+
 stdout/stderr are read as bytes and decoded UTF-8 with `errors="replace"`
 so a stray non-UTF-8 byte never crashes the classifier.
 
@@ -261,6 +266,7 @@ class TwigClient:
                 self._executable,
                 *argv,
                 cwd=str(self._cwd) if self._cwd is not None else None,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
