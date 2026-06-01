@@ -569,7 +569,11 @@ under "Decision log" below as they close.
    agent-evaluated × user-policy and lives in ADR-0008. See
    "Decision log → Q2" below.
 
-3. **Atomic co-merge guarantee — how strict?** — OPEN. Tracked as Q5.
+3. **Atomic co-merge guarantee — how strict?** — **CLOSED 2026-06-01.**
+   Resolution: curator-decided recovery (per-slice, agent-evaluated ×
+   user-policy), with human-gate roll-forward a *required* option in the
+   policy menu. Abandon-trunk becomes one selectable (terminal) recovery
+   action, not the default. See "Decision log → Q5" below.
 
 4. **Replan mid-flight: in scope for v0?** — OPEN. Tracked as Q6.
 
@@ -711,7 +715,63 @@ curator policy doesn't need to be settled today.
 
 ---
 
-## References
+### Q5 (closed 2026-06-01) — atomic co-merge recovery when a leaf fails mid-trunk
+
+**The problem (grounding scenario):** under Option D a decomposable root
+opens a `feature/<root>` trunk and lands impl leaves on it one at a time.
+If leaf B fails to integrate *after* sibling leaf A already merged to the
+trunk, the trunk holds A's real, reviewed code but has no path to `main`
+(the trunk→main step only fires once the whole root is satisfied). Five
+failure modes produce this state: (1) trunk merge conflict between
+siblings, (2) post-integration test failure surfaced by a later leaf,
+(3) coder agent gives up / operator skips a leaf, (4) reviewer demands a
+replan, (5) drift from `main` during a long-lived trunk.
+
+**Decision:** Recovery is **curator-decided** — the same agent that
+selects a leaf's review surface (Q1) and the plan's cut/gate/persist
+(Q2) also selects the recovery action when a leaf fails to integrate.
+The selection is per-slice, agent-evaluated × user-policy. **Human-gate
+roll-forward is a required member of the recovery-action menu** — the
+policy must always be able to halt at a `needs_human` gate and let the
+operator roll forward (retry the leaf, patch it manually, skip with
+justification, or abort). Abandon-trunk is retained as the terminal
+selectable action, **not** the default.
+
+**Daniel's framing:** *"curator decides is generally right, but policy
+should allow for human gate roll forward."*
+
+**Recovery-action menu (curator selects per failure):**
+
+| Action | Typical trigger | Effect |
+|---|---|---|
+| **auto-retry** | mechanical failure (modes 1–2) | re-run the failing leaf's coder once with the conflict / failure context. |
+| **rebase + retry** | drift from main (mode 5) | rebase the trunk onto `main`, re-run the failing leaf. |
+| **human-gate roll-forward** *(required)* | semantic failure / ambiguity (modes 3–4) | halt at `needs_human`. Operator: retry, patch, skip-with-justification, or abort. Already-merged leaves preserved. |
+| **abandon-trunk** *(terminal)* | unrecoverable / operator-elected | delete trunk + impl branches, escalate, re-run root from scratch. Already-merged work is lost. |
+
+**Why not abandon-trunk-by-default (the polyphony posture):** it produces
+the worst single-operator UX — "four impl PRs merged, the fifth failed,
+now we throw all four away." Worse, with the Q1 reframe it makes
+`auto_merge` slices *less* durable than `pr_review` slices (an
+auto-merged leaf already on the trunk gets discarded when a sibling
+fails), which inverts the curator's intent. Roll-forward preserves all
+already-merged work regardless of which review surface produced it.
+
+**Invariant note:** the atomic-co-merge promise is scoped to the
+**trunk→main** step (either the whole root lands on `main` or `main`
+never sees it). It is *not* a promise that intermediate trunk
+integrations are atomic — those are recoverable per the menu above.
+
+**Forward dependency on Q9 (drift-rebase verb):** the rebase+retry
+action and long-lived trunks mean Q9 must handle "rebase a trunk that
+holds partially-completed work" cleanly. Carried into Q9.
+
+**ADR-0008 home:** the recovery-policy menu is part of the curator's
+remit and is specified in ADR-0008 alongside review-surface and
+plan-artifact policy. Same pattern: agent evaluates → deterministic
+action against policy, with human-gate as a guaranteed fallback.
+
+---
 
 ### North-star invariants (in priority order for this decision)
 - **INV-EVENT-LOG-AUTHORITATIVE** — [north-star §2](../north-star.md).
