@@ -81,6 +81,7 @@ src/
     ├── dsl.py                 # Fluent workflow builder + pydantic model
     ├── agent.py               # Protocol AgentProvider + FakeProvider
     ├── toolbelt.py            # Per-tool external-process clients
+    ├── clients/               # Per-tool typed clients (gh, twig, ...)
     ├── teams.py               # parallel_fork sugar
     ├── cli.py                 # `requiem` entry point
     └── workflows/             # Stdlib / example workflows
@@ -88,6 +89,23 @@ src/
 
 tests/                         # Unit tests per module + one integration suite
 ```
+
+## Running against PolyphonyRequiem (`gh` auth caveat)
+
+The `GhClient` in `requiem.clients.gh` wraps the `gh` CLI but does **not**
+manage authentication — `gh auth` is `gh`'s job. The development box has
+two `gh` accounts configured:
+
+| Account              | Access to `PolyphonyRequiem/*` |
+|----------------------|--------------------------------|
+| `dangreen_microsoft` (EMU) | locked OUT                |
+| `PolyphonyRequiem`         | active                    |
+
+When running verbs that touch this org, the `PolyphonyRequiem` account
+must be the active one (`gh auth status` to confirm; `gh auth switch` to
+change). If the wrong account is active, the client raises
+`GhAuthError`, which verbs map to `NeedsHuman` — by design, we surface
+to an operator rather than silently retry.
 
 ## Naming
 
