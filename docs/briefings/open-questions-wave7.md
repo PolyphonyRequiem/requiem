@@ -378,23 +378,23 @@ which scenario the new `AdoClient` unblocks.
 > **Daniel's framing:** *"OIDC is the scenario I need to support,
 > PAT is not supported in my org."*
 >
-> **Implementation hook:** wrap the credential source in a
-> `CredentialProvider`-shaped seam inside `AdoClient` so PAT support
-> remains an additive option (for non-OIDC-enabled tenants or local
-> dev outside the locked-down org) without re-plumbing the client.
-> Default = OIDC; PAT = additive fallback only.
+> **Implementation hook:** use `azure-identity`'s `AzureCliCredential`
+> as the v0 default. The user authenticates once via `az login`
+> (whatever federated/OIDC flow their org requires runs upstream and
+> is invisible to `AdoClient`). Wrap the credential source in a
+> `CredentialProvider`-shaped seam so a richer `DefaultAzureCredential`
+> chain (managed identity / workload identity for CI) or a PAT
+> fallback (locked-down runners) drop in additively. Default =
+> `AzureCliCredential`; richer chains and PAT = additive only.
 >
-> **Parking-lot follow-up (NOT closed here):** if the work-item-side
-> surface (`twig.comment_async` et al.) authenticates to ADO via PAT,
-> the Q1/Q3 orthogonality story has a parity gap of its own. Three
-> possibilities, listed for resolution before v0 ships:
->
-> 1. `twig` already has an OIDC path Bruckner / Mahler didn't capture.
-> 2. Daniel doesn't run `twig` against this org.
-> 3. The work-item-side credential story needs its own fix (twig-side
->    OIDC support, or a new ADR).
->
-> Tracked here until Daniel confirms which is true.
+> **Daniel's clarification on twig:** *"twig uses tokens from az cli,
+> that's basically the same right?"* — Yes. Both paths produce an
+> AAD-issued bearer token for the ADO resource; the upstream auth
+> flow happened during `az login`. The earlier parking-lot
+> follow-up about twig's credential source largely dissolves: if
+> twig pulls tokens from `az`, it's already on the same AAD-bearer
+> path `AdoClient` will use. Residual minor check: confirm twig's
+> credential chain matches ours (or document the divergence).
 >
 > See [ADR-0007 → Q-A closure](../decisions/0007-pr-lifecycle-architecture.md)
 > for the canonical record.
