@@ -16,14 +16,17 @@
 | [`03-ui-pattern-catalogue.md`](03-ui-pattern-catalogue.md) | Every concrete UI pattern from the platespinner survey and the 10-system viz research, scored against the rough edge it would address. |
 | [`04-sdlc-open-questions.md`](04-sdlc-open-questions.md) | Decisions the engine seats are about to make whose downstream SDLC ergonomics need to be on Daniel's radar. |
 | [`05-forward-looking-deferred.md`](05-forward-looking-deferred.md) | UI/SDLC patterns I think we'll want eventually but should explicitly defer past v0, with rationale. |
-| [`06-perspectives-on-seams.md`](06-perspectives-on-seams.md) | Per-seam UX implications, populated as engine PRs land. Currently a scaffold. |
+| [`06-perspectives-on-seams.md`](06-perspectives-on-seams.md) | Per-seam UX implications, populated as engine PRs land. Updated after Walking Skeleton α (PR #11). |
+| [`07-demo-contract.md`](07-demo-contract.md) | **Hard contract** every Phase B+ demo to Daniel must pass. Triggered by Walking Skeleton α's *"I don't get what I'm looking at"* signal. Includes CLI rendering recommendations for Verdi-2. |
 
 ---
 
 ## How to read this
 
 - If you only have 5 minutes: read [`01-feel-of-the-loop.md`](01-feel-of-the-loop.md) and the **§ "Strongest signals"** block at the bottom of [`03-ui-pattern-catalogue.md`](03-ui-pattern-catalogue.md).
+- If you're about to ship a demo to Daniel: read [`07-demo-contract.md`](07-demo-contract.md) § 3 (the checklist) — this is the new hard gate.
 - If you're an engine seat about to make a seam decision: skim [`04-sdlc-open-questions.md`](04-sdlc-open-questions.md) for the section that maps to your seam.
+- If you're Verdi-2 building the CLI: [`07-demo-contract.md`](07-demo-contract.md) § 4 has the rendering recommendations.
 - If you're Daniel triaging: the open questions in `04` are the ones I want pushback on.
 
 ## Source provenance
