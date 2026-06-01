@@ -125,8 +125,17 @@ class _AwaitingRoute:
 
 @dataclass(frozen=True, slots=True)
 class _AwaitingGate:
-    """`NeedsHuman` was emitted; the kernel needs a handler choice."""
+    """`NeedsHuman` was emitted; the kernel needs a handler choice.
+
+    Carries ``prompt`` + ``options`` so a script-returned ``NeedsHuman``
+    (where the gate metadata only exists on the outcome, not on the
+    ``HumanGateNode`` it would for a static gate node) can drive the
+    handler / surface ``Suspended`` identically to a static gate.
+    Reconstructed across a kill+resume from the ``gate_opened`` event.
+    """
     node_id: str
+    prompt: str = ""
+    options: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,15 +304,17 @@ class Engine:
                         return nxt.result
                     cursor = nxt
 
-                case _AwaitingGate(node_id=nid):
+                case _AwaitingGate(node_id=nid, prompt=stored_prompt, options=stored_opts):
                     gate_node = nm[nid]
+                    # Static `human_gate` nodes carry prompt/options on the
+                    # node; script-returned `NeedsHuman` carries them on the
+                    # cursor (populated when the outcome routed). Use the
+                    # node attrs when available; fall back to the cursor.
+                    prompt = getattr(gate_node, "prompt", None) or stored_prompt
+                    options = tuple(getattr(gate_node, "options", ()) or stored_opts)
                     if self.gate_handler is None:
-                        return Suspended(
-                            run_id, nid, gate_node.prompt, tuple(gate_node.options)
-                        )
-                    choice = self.gate_handler(
-                        nid, gate_node.prompt, tuple(gate_node.options)
-                    )
+                        return Suspended(run_id, nid, prompt, options)
+                    choice = self.gate_handler(nid, prompt, options)
                     auto = bool(getattr(self.gate_handler, "__requiem_auto__", False))
                     emitter.emit_gate_resolved(nid, choice, auto=auto)
                     cursor = _RouteAfterGate(nid, choice)
@@ -446,7 +457,7 @@ class Engine:
             case NeedsHuman(prompt=p, options=opts, context=ctx):
                 auto = bool(getattr(self.gate_handler, "__requiem_auto__", False))
                 emitter.emit_gate_opened(node_id, p, list(opts), context=ctx, auto=auto)
-                return _AwaitingGate(node_id)
+                return _AwaitingGate(node_id, prompt=p, options=tuple(opts))
 
             case Success():
                 if isinstance(node, TerminateNode):
@@ -511,7 +522,11 @@ def _reconstruct(
                 last_attempt = 1
                 cursor = _AtNode(payload["to_node"], 1)
             case "gate_opened":
-                cursor = _AwaitingGate(node)
+                cursor = _AwaitingGate(
+                    node,
+                    prompt=payload.get("prompt", ""),
+                    options=tuple(payload.get("options", ())),
+                )
             case "gate_resolved":
                 cursor = _RouteAfterGate(node, payload["choice"])
             case "run_completed":

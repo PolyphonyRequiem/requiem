@@ -15,7 +15,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from requiem.clients.fs import FilesystemClient
 from requiem.clients.gh import GhClient
+from requiem.clients.twig import TwigClient
 
 
 # ---- files -----------------------------------------------------------
@@ -119,10 +121,13 @@ class Toolbelt:
 
     git: GitClient
     files: FileClient
-    # `gh` is optional so other Phase B seats whose tests construct a
-    # Toolbelt without it (e.g. pure-file workflows) keep working. Verbs
-    # that need it should require it explicitly at the call site.
+    # The Phase B clients (`gh`, `twig`, `fs`) are optional so workflows
+    # and tests that don't touch them can construct a smaller Toolbelt.
+    # Verbs that need a specific client should fail loud (KeyError /
+    # AttributeError) rather than silently no-op.
     gh: GhClient | None = None
+    twig: TwigClient | None = None
+    fs: FilesystemClient | None = None
 
     @classmethod
     def real(cls) -> "Toolbelt":
@@ -130,4 +135,6 @@ class Toolbelt:
             git=RealGitClient(),
             files=RealFileClient(),
             gh=GhClient(),
+            twig=TwigClient(),
+            fs=None,  # FilesystemClient requires a repo_root; callers bind one.
         )
