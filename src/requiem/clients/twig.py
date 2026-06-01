@@ -242,6 +242,18 @@ class TwigClient:
         # subprocess overhead dominates, and asyncio.gather amortises it.
         return list(await asyncio.gather(*(self.show_async(cid) for cid in child_ids)))
 
+    async def comment_async(self, item_id: int, message: str) -> None:
+        """Post ``message`` as a discussion comment on ``item_id``.
+
+        Added for Bizet — the implementation workflow uses this to link
+        the freshly-opened PR URL back to the leaf work item so the human
+        reviewer can navigate between the two surfaces. We deliberately
+        do not parse the output: twig prints a confirmation line on
+        success and we trust exit 0. Failure paths flow through the
+        normal ``_classify_failure`` table.
+        """
+        await self._run(["comment", "--id", str(item_id), "--message", message])
+
     # -- sync surface (sugar for the common case) ------------------------
 
     def show(self, item_id: int) -> TwigItem:
@@ -252,6 +264,9 @@ class TwigClient:
 
     def list_children(self, parent_id: int) -> list[TwigItem]:
         return asyncio.run(self.list_children_async(parent_id))
+
+    def comment(self, item_id: int, message: str) -> None:
+        return asyncio.run(self.comment_async(item_id, message))
 
     # -- runner ----------------------------------------------------------
 

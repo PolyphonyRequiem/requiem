@@ -146,6 +146,24 @@ class GhUnknownError(GhClientError):
 # ---- private classification helpers -----------------------------------
 
 
+# `gh pr create` prints the new PR URL on the last non-empty stdout line.
+# Format observed across `gh` versions: `https://github.com/<owner>/<repo>/pull/<n>`.
+_PR_URL_NUM_RE = re.compile(r"/pull/(\d+)\b")
+
+
+def _extract_pr_number(stdout: str) -> int | None:
+    """Pull the PR number out of `gh pr create`'s stdout, if present.
+
+    Scans every line bottom-up so a noisy "creating draft..." preamble
+    doesn't trip us up; the URL is always the last meaningful token.
+    """
+    for line in reversed(stdout.splitlines()):
+        m = _PR_URL_NUM_RE.search(line)
+        if m:
+            return int(m.group(1))
+    return None
+
+
 # `gh api` typically prints HTTP errors as `HTTP 404: Not Found (https://...)`
 # or `gh: <body> (HTTP 404)`. We match either shape.
 _HTTP_STATUS_RE = re.compile(r"HTTP\s+(\d{3})", re.IGNORECASE)
@@ -391,6 +409,55 @@ class GhClient:
                 exit_code=0, stderr=stdout[:512], argv=argv,
             )
         return payload
+
+    # ---- mutation: PR create (added for Bizet — implementation workflow) ----
+    #
+    # `gh pr create` does not honour --json; it prints the new PR URL on
+    # the last non-empty stdout line. We parse the number out of the URL
+    # and then re-fetch via `pr_view` so callers receive a fully-typed
+    # GhPullRequest. The two-call shape keeps the contract honest at the
+    # cost of one extra subprocess — negligible vs the network create.
+    #
+    # The L-1 caveat still applies: an unclassified `gh exit 1` is
+    # NeedsHuman, not a retry. Verbs translate accordingly.
+
+    async def pr_create(
+        self,
+        repo: str,
+        *,
+        title: str,
+        body: str,
+        head: str,
+        base: str,
+    ) -> GhPullRequest:
+        """Open a PR via ``gh pr create``. Returns the freshly-viewed PR.
+
+        ``head`` is the branch the PR is from; ``base`` is what it merges
+        into. Both are bare branch names (no ``owner:`` prefix needed
+        because ``--repo`` is set explicitly).
+
+        ``body`` is passed via ``--body-file -`` over stdin so titles
+        and bodies with shell-special characters survive intact across
+        platforms.
+        """
+        argv: tuple[str, ...] = (
+            self._binary, "pr", "create",
+            "--repo", repo,
+            "--title", title,
+            "--head", head,
+            "--base", base,
+            "--body-file", "-",
+        )
+        stdout = await self._run_json_text(argv, stdin=body.encode("utf-8"))
+        number = _extract_pr_number(stdout)
+        if number is None:
+            raise GhUnknownError(
+                f"gh pr create succeeded but no PR URL found in stdout: {stdout[:512]!r}",
+                exit_code=0, stderr=stdout[:512], argv=argv,
+            )
+        # Re-fetch so callers get the canonical typed shape (state, base,
+        # head, url all populated from gh's own JSON).
+        return await self.pr_view(repo, number)
 
     # ---- subprocess seam ----
 
