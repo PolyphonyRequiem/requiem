@@ -239,6 +239,14 @@ def _r_gate_resolved(ev: dict[str, Any], cx: RenderContext) -> RenderResult:
     return [f"  → {choice}"]
 
 
+@_register("cancel_requested")
+def _r_cancel_requested(ev: dict[str, Any], cx: RenderContext) -> RenderResult:
+    p = ev["payload"]
+    reason = p.get("reason", "operator")
+    who = p.get("requested_by", "cli")
+    return [f"{GLYPH_END} Cancel requested by {who} — {reason}"]
+
+
 @_register("run_completed")
 def _r_run_completed(ev: dict[str, Any], cx: RenderContext) -> RenderResult:
     p = ev["payload"]

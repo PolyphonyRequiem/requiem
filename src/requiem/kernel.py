@@ -142,7 +142,44 @@ class _Terminated:
     final_node: str
 
 
-_Cursor = Union[_AtNode, _AwaitingRoute, _AwaitingGate, _RouteAfterGate, _Terminated]
+@dataclass(frozen=True, slots=True)
+class _CancelledByOperator:
+    """A `cancel_requested` event was seen in the log before resume."""
+    final_node: str
+    reason: str
+
+
+_Cursor = Union[
+    _AtNode, _AwaitingRoute, _AwaitingGate, _RouteAfterGate,
+    _Terminated, _CancelledByOperator,
+]
+
+
+def _cursor_node(cursor: _Cursor) -> str | None:
+    """Best-effort: which node would the engine be touching right now?"""
+    if isinstance(cursor, (_AtNode, _AwaitingRoute, _AwaitingGate, _RouteAfterGate)):
+        return cursor.node_id
+    if isinstance(cursor, _Terminated):
+        return cursor.final_node
+    if isinstance(cursor, _CancelledByOperator):
+        return cursor.final_node
+    return None
+
+
+def _pending_cancel(log_path: Path) -> str | None:
+    """Return the cancel reason if a `cancel_requested` event is in the log.
+
+    Re-reads the log tail every call (cheap for v0 demo-scale logs). Returns
+    ``None`` if no cancel is pending. The engine consults this at the top of
+    each loop iteration to honour INV-CANCEL-SHORT-CIRCUITS-RETRY for
+    externally-injected cancels.
+    """
+    if not log_path.exists():
+        return None
+    for ev in replay(log_path):
+        if ev.get("kind") == "cancel_requested":
+            return ev.get("payload", {}).get("reason", "operator")
+    return None
 
 
 # ---- engine ----------------------------------------------------------
@@ -196,13 +233,36 @@ class Engine:
 
         replayed = list(replay(self.log_path(run_id)))
         if not replayed:
-            emitter.emit_run_started(wf.name)
+            emitter.emit_run_started(
+                wf.name,
+                workflow_module=wf.module,
+                workflow_version=wf.version,
+            )
             cursor: _Cursor = _AtNode(wf.entry, 1)
             completed: dict[str, dict[str, Any]] = {}
         else:
             cursor, completed = _reconstruct(replayed, wf.entry)
 
+        # External-cancel check: a `cancel_requested` event in the log (written
+        # by `requiem cancel <run_id>` or a peer process) short-circuits the
+        # run per INV-CANCEL-SHORT-CIRCUITS-RETRY.
+        if isinstance(cursor, _CancelledByOperator):
+            final = cursor.final_node
+            emitter.emit_run_completed("cancelled", final)
+            return Failed(run_id, final, "cancelled", f"operator cancel: {cursor.reason}")
+
         while True:
+            # Re-check the log tail for a cancel_requested that arrived after
+            # we started looping (in-process cancel). Cheap: O(N) on log size,
+            # called once per cursor step; the demo run is ~30 events.
+            cancel = _pending_cancel(self.log_path(run_id))
+            if cancel is not None:
+                node_for_cancel = _cursor_node(cursor) or "—"
+                emitter.emit_run_completed("cancelled", node_for_cancel)
+                return Failed(
+                    run_id, node_for_cancel, "cancelled",
+                    f"operator cancel: {cancel}",
+                )
             match cursor:
                 case _Terminated(terminal=t, final_node=f):
                     return Completed(
@@ -459,6 +519,12 @@ def _reconstruct(
                     payload.get("terminal", "completed"),
                     payload.get("final_node") or node or "?",
                 )
+            case "cancel_requested":
+                # Whatever the cursor *was*, an external cancel makes it
+                # this. The engine will emit `run_completed("cancelled")`
+                # and exit immediately.
+                prev = _cursor_node(cursor) or "—"
+                cursor = _CancelledByOperator(prev, payload.get("reason", "operator"))
             # run_started / verb_invoked / team_dispatched /
             # team_branch_completed are observable but do not change the
             # resume position — node_entered/verb_completed already do.

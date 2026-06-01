@@ -232,7 +232,11 @@ def build_agent_registry() -> AgentRegistry:
 
 def build_workflow() -> Workflow:
     return (
-        WorkflowBuilder("code-review")
+        WorkflowBuilder(
+            "code-review",
+            module="requiem.workflows.code_review_demo",
+            version="0.1",
+        )
             .entry("start")
             .script("start", verb="start_run")
                 .edge("start", on="success", to="read_snippet")

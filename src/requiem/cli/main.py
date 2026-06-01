@@ -36,14 +36,17 @@ from types import ModuleType
 from typing import Any
 
 from requiem.cli.render import (
+    EXIT_CODE_CANCELLED,
     EXIT_CODE_FAILED,
+    EXIT_CODE_OK,
     RenderContext,
     exit_code_for,
     render_event,
     style_for_line,
 )
+from requiem.events import EventEmitter
 from requiem.kernel import Completed, Engine, Failed, Suspended
-from requiem.persistence import replay
+from requiem.persistence import EventStore, replay
 
 
 DEFAULT_LOG_DIR = Path(".runs")
@@ -144,6 +147,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     mod = _import_module(args.workflow_module)
     engine = _load_engine(args.workflow_module, log_dir)
     cx = _render_context_for(mod, engine.workflow.name, engine.workflow.humanize)
+    if getattr(args, "interactive", False):
+        engine.gate_handler = _make_interactive_gate_handler(cx)
 
     _say(f"requiem run — {args.workflow_module}  (run_id={run_id})", style="bold")
     _say(f"log: {engine.log_path(run_id)}", style="dim")
@@ -171,6 +176,8 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if not log_path.exists():
         raise SystemExit(f"requiem: no event log at {log_path}")
     cx = _render_context_for(mod, engine.workflow.name, engine.workflow.humanize)
+    if getattr(args, "interactive", False):
+        engine.gate_handler = _make_interactive_gate_handler(cx)
 
     _say(f"requiem resume — {args.workflow_module}  (run_id={args.run_id})", style="bold")
     _say(f"log: {log_path}", style="dim")
@@ -235,23 +242,318 @@ def cmd_events(args: argparse.Namespace) -> int:
         raise SystemExit(f"requiem: no event log at {log_path}")
 
     if args.raw:
+        if args.follow:
+            _tail_raw(log_path)
+            return 0
         for ev in replay(log_path):
             print(json.dumps(ev, separators=(",", ":")))
         return 0
 
+    # Resolve the workflow module: explicit `--workflow` wins; otherwise
+    # auto-load from the `run_started` event's `workflow_module` field
+    # (Gap 1 — workflow identity in run_started).
+    workflow_dotted = args.workflow or _workflow_module_from_log(log_path)
     mod: ModuleType | None = None
     humanize: dict[str, str] = {}
     workflow_name = ""
-    if args.workflow:
-        mod = _import_module(args.workflow)
-        wf = _load_workflow(args.workflow)
-        humanize = dict(wf.humanize)
-        workflow_name = wf.name
+    if workflow_dotted:
+        try:
+            mod = _import_module(workflow_dotted)
+            wf = _load_workflow(workflow_dotted)
+            humanize = dict(wf.humanize)
+            workflow_name = wf.name
+        except SystemExit as e:
+            _say(f"(could not auto-load workflow {workflow_dotted!r}: {e}); "
+                 f"falling back to raw node ids", style="yellow")
     cx = _render_context_for(mod, workflow_name, humanize)
+
+    if args.follow:
+        _tail_rendered(log_path, cx)
+        return 0
 
     for ev in replay(log_path):
         _emit_lines(render_event(ev, cx))
     return 0
+
+
+def cmd_list_runs(args: argparse.Namespace) -> int:
+    log_dir = Path(args.log_dir).resolve()
+    if not log_dir.exists():
+        _say(f"(no runs — log dir {log_dir} does not exist)", style="dim")
+        return 0
+
+    rows: list[dict[str, Any]] = []
+    for path in sorted(log_dir.glob("*.events.jsonl")):
+        run_id = path.name[: -len(".events.jsonl")]
+        info = _summarize_run(path)
+        rows.append({"run_id": run_id, **info})
+
+    if not rows:
+        _say(f"(no runs in {log_dir})", style="dim")
+        return 0
+
+    rows.sort(key=lambda r: r.get("started") or "")
+    if _HAS_RICH:
+        from rich.table import Table
+        table = Table(show_header=True, header_style="bold", expand=False)
+        table.add_column("RUN_ID", overflow="fold")
+        table.add_column("WORKFLOW")
+        table.add_column("STARTED (UTC)")
+        table.add_column("STATUS")
+        table.add_column("DURATION", justify="right")
+        table.add_column("EVENTS", justify="right")
+        for r in rows:
+            table.add_row(
+                r["run_id"],
+                r.get("workflow") or "—",
+                _short_ts(r.get("started")),
+                _style_status(r.get("status") or "?"),
+                r.get("duration") or "—",
+                str(r.get("events") or 0),
+            )
+        _CONSOLE.print(table)
+    else:
+        _say(
+            f"{'RUN_ID':24s} {'WORKFLOW':18s} {'STARTED':22s} {'STATUS':12s} "
+            f"{'DURATION':>10s} {'EVENTS':>7s}"
+        )
+        for r in rows:
+            _say(
+                f"{r['run_id']:24s} {(r.get('workflow') or '—'):18s} "
+                f"{_short_ts(r.get('started')):22s} "
+                f"{(r.get('status') or '?'):12s} "
+                f"{(r.get('duration') or '—'):>10s} "
+                f"{str(r.get('events') or 0):>7s}"
+            )
+    return 0
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    log_dir = Path(args.log_dir).resolve()
+    log_path = log_dir / f"{args.run_id}.events.jsonl"
+    if not log_path.exists():
+        raise SystemExit(f"requiem: no event log at {log_path}")
+
+    # Has the run already terminated? Then cancel is a no-op (and we say so).
+    info = _summarize_run(log_path)
+    status = info.get("status")
+    if status in ("Completed", "Failed", "Cancelled"):
+        _say(
+            f"run {args.run_id!r} already {status.lower()} — cancel is a no-op",
+            style="yellow",
+        )
+        return 0
+
+    store = EventStore(log_path)
+    emitter = EventEmitter(args.run_id, store.append)
+    reason = args.reason or "operator"
+    emitter.emit_cancel_requested(reason=reason, requested_by="cli")
+    _say(
+        f"✕ cancel_requested written to {log_path}",
+        style="bright_black",
+    )
+    _say(
+        "The run will short-circuit on its next loop tick (in-process), or on "
+        "the next `requiem resume <run_id>` (out-of-process). "
+        "INV-CANCEL-SHORT-CIRCUITS-RETRY: no further retries will be attempted.",
+        style="dim",
+    )
+    return EXIT_CODE_OK
+
+
+# ---- follow / tail loop (Gap 2) ------------------------------------
+
+
+_TAIL_POLL_INTERVAL = 0.2  # seconds; conservative for v0
+
+
+def _tail_rendered(log_path: Path, cx: RenderContext) -> None:
+    """Render the file then tail for new events; stops on run_completed or Ctrl-C."""
+    seen = 0
+    terminal = False
+    try:
+        while not terminal:
+            new_events = _read_events_after(log_path, seen)
+            for ev in new_events:
+                _emit_lines(render_event(ev, cx))
+                if ev.get("kind") == "run_completed":
+                    terminal = True
+            seen += len(new_events)
+            if not terminal:
+                time.sleep(_TAIL_POLL_INTERVAL)
+    except KeyboardInterrupt:
+        _say("(stopped tailing)", style="dim")
+
+
+def _tail_raw(log_path: Path) -> None:
+    seen = 0
+    terminal = False
+    try:
+        while not terminal:
+            new_events = _read_events_after(log_path, seen)
+            for ev in new_events:
+                print(json.dumps(ev, separators=(",", ":")), flush=True)
+                if ev.get("kind") == "run_completed":
+                    terminal = True
+            seen += len(new_events)
+            if not terminal:
+                time.sleep(_TAIL_POLL_INTERVAL)
+    except KeyboardInterrupt:
+        pass
+
+
+def _read_events_after(log_path: Path, already_seen: int) -> list[dict[str, Any]]:
+    """Return events past index `already_seen`. Cheap re-read (v0 demo-scale)."""
+    if not log_path.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    for idx, ev in enumerate(replay(log_path)):
+        if idx >= already_seen:
+            out.append(ev)
+    return out
+
+
+# ---- list-runs helpers (Gap 4) -------------------------------------
+
+
+def _summarize_run(log_path: Path) -> dict[str, Any]:
+    """Parse a run's log into a one-row summary for `list-runs`."""
+    workflow = ""
+    started: str | None = None
+    last_ts: str | None = None
+    status = "Running"
+    events = 0
+    final_node = ""
+    for ev in replay(log_path):
+        events += 1
+        kind = ev.get("kind", "")
+        ts = ev.get("ts")
+        if started is None and ts:
+            started = ts
+        if ts:
+            last_ts = ts
+        if kind == "run_started":
+            workflow = ev["payload"].get("workflow", "")
+        elif kind == "gate_opened":
+            status = "Suspended"
+        elif kind == "gate_resolved":
+            status = "Running"
+        elif kind == "cancel_requested":
+            status = "Cancelled"
+        elif kind == "run_completed":
+            terminal = ev["payload"].get("terminal", "")
+            final_node = ev["payload"].get("final_node", "")
+            if terminal == "cancelled":
+                status = "Cancelled"
+            elif terminal == "failed":
+                status = "Failed"
+            else:
+                status = "Completed"
+    duration = _format_duration(started, last_ts) if started and last_ts else None
+    return {
+        "workflow": workflow,
+        "started": started,
+        "status": status,
+        "duration": duration,
+        "events": events,
+        "final_node": final_node,
+    }
+
+
+def _short_ts(ts: str | None) -> str:
+    if not ts:
+        return "—"
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(ts).strftime("%Y-%m-%d %H:%MZ")
+    except ValueError:
+        return ts[:19]
+
+
+def _format_duration(start: str, end: str) -> str:
+    try:
+        from datetime import datetime
+        d0 = datetime.fromisoformat(start)
+        d1 = datetime.fromisoformat(end)
+        delta_ms = (d1 - d0).total_seconds() * 1000
+        if delta_ms < 1000:
+            return f"{delta_ms:.0f} ms"
+        if delta_ms < 60_000:
+            return f"{delta_ms / 1000:.1f} s"
+        return f"{delta_ms / 60_000:.1f} min"
+    except ValueError:
+        return "—"
+
+
+def _style_status(status: str) -> str:
+    if not _HAS_RICH:
+        return status
+    colour = {
+        "Completed": "green",
+        "Suspended": "cyan",
+        "Cancelled": "bright_black",
+        "Failed":    "red",
+        "Running":   "yellow",
+    }.get(status, "white")
+    return f"[{colour}]{status}[/{colour}]"
+
+
+def _workflow_module_from_log(log_path: Path) -> str | None:
+    """Recover the workflow's importable module path from the run_started event.
+
+    Returns ``None`` if the log has no ``run_started`` or it predates the
+    workflow-identity field (Gap 1).
+    """
+    for ev in replay(log_path):
+        if ev.get("kind") == "run_started":
+            return ev.get("payload", {}).get("workflow_module")
+        break
+    return None
+
+
+# ---- interactive gate handler (Gap 3) ------------------------------
+
+
+def _make_interactive_gate_handler(cx: RenderContext):
+    """Build a gate handler that prompts the operator at each NeedsHuman.
+
+    The `gate_opened` event has already been emitted (and rendered) when the
+    kernel reaches the handler — the operator sees the gate prompt + the
+    workflow's gate-context line above this prompt. The handler asks for a
+    choice from the offered options and returns it.
+
+    Uses `rich.prompt.Prompt` when available; falls back to plain `input()`.
+    """
+    if _HAS_RICH:
+        try:
+            from rich.prompt import Prompt
+        except ImportError:
+            Prompt = None  # type: ignore[assignment]
+    else:
+        Prompt = None  # type: ignore[assignment]
+
+    def _handler(node_id: str, prompt: str, options: tuple[str, ...]) -> str:
+        opts = list(options)
+        default = opts[0]
+        if Prompt is not None:
+            choice = Prompt.ask(
+                f"[bold cyan]?[/bold cyan] {prompt}",
+                choices=opts,
+                default=default,
+                show_choices=True,
+                show_default=True,
+            )
+        else:
+            choice = ""
+            while choice not in opts:
+                raw = input(f"? {prompt} {opts} [{default}]: ").strip()
+                choice = raw or default
+        return choice
+
+    # Not auto: this is a real human decision, so the renderer should NOT
+    # append "(auto-approved for demo)".
+    _handler.__requiem_auto__ = False  # type: ignore[attr-defined]
+    return _handler
 
 
 # ---- post-run helpers ----------------------------------------------
@@ -306,32 +608,57 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("workflow_module")
     run.add_argument("--run-id", default=None)
     run.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR))
+    run.add_argument(
+        "--interactive", "-i", action="store_true",
+        help="prompt the operator at each human gate (default: auto-resolve per workflow)",
+    )
     run.set_defaults(func=cmd_run)
 
     res = sub.add_parser("resume", help="resume a partially-finished run")
     res.add_argument("workflow_module")
     res.add_argument("run_id")
     res.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR))
+    res.add_argument(
+        "--interactive", "-i", action="store_true",
+        help="prompt the operator at each human gate",
+    )
     res.set_defaults(func=cmd_resume)
 
     desc = sub.add_parser("describe", help="print a workflow's topology")
     desc.add_argument("workflow_module")
     desc.set_defaults(func=cmd_describe)
 
-    ev = sub.add_parser("events", help="print a run's event log")
+    ev = sub.add_parser("events", help="print a run's event log (live English by default)")
     ev.add_argument("run_id")
     ev.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR))
     ev.add_argument(
         "--workflow",
         default=None,
-        help="workflow module (for humanize map and verdict card on stored logs)",
+        help="workflow module override (default: auto-load from run_started event)",
     )
     ev.add_argument(
         "--raw",
         action="store_true",
         help="emit raw JSONL instead of human English (CI consumers)",
     )
+    ev.add_argument(
+        "--follow", "-f", action="store_true",
+        help="tail the log; render new events as they arrive (stops on run_completed or Ctrl-C)",
+    )
     ev.set_defaults(func=cmd_events)
+
+    ls = sub.add_parser("list-runs", help="list runs found under --log-dir")
+    ls.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR))
+    ls.set_defaults(func=cmd_list_runs)
+
+    cn = sub.add_parser("cancel", help="cancel a running or suspended run")
+    cn.add_argument("run_id")
+    cn.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR))
+    cn.add_argument(
+        "--reason", default=None,
+        help="free-text reason recorded in the cancel_requested event payload",
+    )
+    cn.set_defaults(func=cmd_cancel)
 
     return p
 

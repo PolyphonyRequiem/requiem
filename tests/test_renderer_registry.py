@@ -69,6 +69,9 @@ def test_each_renderer_returns_list_of_strings():
         "gate_resolved":         _envelope(
             "gate_resolved", _node="g", choice="yes", auto=True,
         ),
+        "cancel_requested":      _envelope(
+            "cancel_requested", reason="operator", requested_by="cli",
+        ),
         "run_completed":         _envelope(
             "run_completed", terminal="completed", final_node="end",
         ),

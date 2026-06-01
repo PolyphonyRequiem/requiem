@@ -88,6 +88,20 @@ class Workflow(BaseModel):
     (e.g. `"read_snippet"` → `"Read sample_snippet.py"`). Default empty:
     the renderer falls back to the raw `node_id`.
     """
+    module: str | None = None
+    """Importable module path that produced this workflow.
+
+    Recorded in the ``run_started`` event so post-hoc tools (``requiem
+    events``, ``requiem list-runs``) can re-import the workflow and recover
+    its humanize map / render hints without an explicit ``--workflow`` flag.
+    Optional; ``None`` is permitted for ad-hoc workflows built in tests.
+    """
+    version: str = "0"
+    """Workflow version per ADR 0004 §4.7.
+
+    Recorded in ``run_started`` so replay against a changed workflow shape
+    can be detected (and refused unless ``--force-replay`` is passed).
+    """
 
     def validate_topology(self) -> list[str]:
         errs: list[str] = []
@@ -113,12 +127,14 @@ class Workflow(BaseModel):
 class WorkflowBuilder:
     """Fluent. Every method returns self. `.build()` runs topology checks."""
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, *, module: str | None = None, version: str = "0") -> None:
         self._name = name
         self._entry: str | None = None
         self._nodes: list[NodeModel] = []
         self._edges: list[Edge] = []
         self._humanize: dict[str, str] = {}
+        self._module = module
+        self._version = version
 
     def entry(self, node_id: str) -> "WorkflowBuilder":
         self._entry = node_id
@@ -201,6 +217,25 @@ class WorkflowBuilder:
         self._humanize.update(mapping)
         return self
 
+    def module(self, dotted: str) -> "WorkflowBuilder":
+        """Record the importable module path that produced this workflow.
+
+        Lets ``requiem events`` and ``requiem list-runs`` recover the
+        humanize map and render hints from a stored log without an
+        explicit ``--workflow`` flag.
+        """
+        self._module = dotted
+        return self
+
+    def version(self, ver: str) -> "WorkflowBuilder":
+        """Pin a workflow version (per ADR 0004 §4.7).
+
+        Recorded in ``run_started`` so replay against a mismatched shape
+        can be detected.
+        """
+        self._version = ver
+        return self
+
     def build(self) -> Workflow:
         if self._entry is None:
             raise ValueError(f"workflow {self._name!r} has no entry")
@@ -210,6 +245,8 @@ class WorkflowBuilder:
             nodes=self._nodes,
             edges=self._edges,
             humanize=self._humanize,
+            module=self._module,
+            version=self._version,
         )
         errs = wf.validate_topology()
         if errs:

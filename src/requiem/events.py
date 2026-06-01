@@ -29,6 +29,7 @@ EVENT_KINDS: frozenset[str] = frozenset({
     "team_branch_completed",
     "gate_opened",
     "gate_resolved",
+    "cancel_requested",
     "run_completed",
 })
 """Sealed catalogue of kinds the kernel emits.
@@ -88,8 +89,28 @@ class EventEmitter:
         }
         return self._append(envelope)
 
-    def emit_run_started(self, workflow: str) -> None:
-        self._emit("run_started", workflow=workflow)
+    def emit_run_started(
+        self,
+        workflow: str,
+        *,
+        workflow_module: str | None = None,
+        workflow_version: str = "0",
+    ) -> None:
+        """Emit ``run_started`` with workflow identity.
+
+        ``workflow`` is the workflow's display name (``Workflow.name``).
+        ``workflow_module`` is the importable module path that produced the
+        workflow (e.g. ``requiem.workflows.code_review_demo``) — recorded so
+        post-hoc tools like ``requiem events <run_id>`` can re-import the
+        module and recover its humanize map without an explicit flag.
+        ``workflow_version`` honours ADR 0004 §4.7 (version-pinned replay).
+        """
+        self._emit(
+            "run_started",
+            workflow=workflow,
+            workflow_module=workflow_module,
+            workflow_version=workflow_version,
+        )
 
     def emit_node_entered(self, node_id: str, attempt: int = 1) -> None:
         self._emit("node_entered", node_id=node_id, attempt=attempt)
@@ -156,6 +177,25 @@ class EventEmitter:
 
     def emit_run_completed(self, terminal: str, final_node: str) -> None:
         self._emit("run_completed", terminal=terminal, final_node=final_node)
+
+    def emit_cancel_requested(
+        self, *, reason: str = "operator", requested_by: str = "cli"
+    ) -> None:
+        """External cancel signal written into the log.
+
+        Per INV-CANCEL-SHORT-CIRCUITS-RETRY this event causes the engine to
+        terminate the run at the next safe yield point without consulting
+        ``retry_max``. The CLI's ``requiem cancel <run_id>`` writes this
+        event; the next time the run is resumed (or on the next loop tick
+        of an in-process run) the engine emits ``run_completed("cancelled")``
+        and exits.
+        """
+        self._emit(
+            "cancel_requested",
+            node_id=None,
+            reason=reason,
+            requested_by=requested_by,
+        )
 
 
 def parse_envelope(raw: dict[str, Any]) -> Event:
