@@ -518,9 +518,33 @@ class Engine:
                 message=f"module {module_path!r} has no build_engine(log_dir)",
             )
 
+        # ADR 0005 addendum (Fauré seat 2): the kernel reads the recorded
+        # `subworkflow_started.inputs_summary` from the parent's log and
+        # forwards values to `build_engine` as kwargs, filtered by
+        # `inspect.signature` so factories that don't accept them are
+        # unaffected. Reading from the log (not from cursor state) means
+        # resume after a crash recovers the same inputs the original
+        # invocation used — the log is authoritative
+        # (INV-EVENT-LOG-AUTHORITATIVE).
+        recorded_inputs: dict[str, Any] = {}
+        parent_log = self.log_path(parent_run_id)
+        for ev in replay(parent_log):
+            if (
+                ev.get("kind") == "subworkflow_started"
+                and (ev.get("payload") or {}).get("sub_run_id") == sub_run_id
+            ):
+                recorded_inputs = dict(
+                    (ev.get("payload") or {}).get("inputs_summary") or {}
+                )
+                # Keep the last in case of duplicate (defensive — first-write
+                # wins is the contract, but resume re-emit guards prevent
+                # duplicates anyway).
+
         try:
             sig = inspect.signature(factory)
-            kwargs: dict[str, Any] = {}
+            kwargs: dict[str, Any] = {
+                k: v for k, v in recorded_inputs.items() if k in sig.parameters
+            }
             # The kernel hands the child the *same* log_dir; child's run_id
             # (sub_run_id) makes the filename distinct.
             if "log_dir" in sig.parameters:

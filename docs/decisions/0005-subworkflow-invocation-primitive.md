@@ -174,12 +174,18 @@ files in the same directory.
 
 ### Negative / load-bearing follow-ups
 
-* **Inputs handling is best-effort for v0.** `inputs_verb` returns a
+* **Inputs handling is best-effort for v0.** ~~`inputs_verb` returns a
   dict that is recorded in the event payload, but the child's
   `build_engine` is invoked with the standard `(log_dir, …)` signature.
   Authors who need parameterised child workflows are responsible for
-  threading inputs via the toolbelt or filesystem. A future ADR could
-  formalise an `inputs` kwarg on `build_engine`.
+  threading inputs via the toolbelt or filesystem.~~ **Resolved
+  2026-06-XX (Fauré seat 2):** the kernel now reads
+  `subworkflow_started.inputs_summary` from the parent's log and
+  forwards values to the child's `build_engine` as kwargs, filtered by
+  `inspect.signature` so factories that don't accept them are
+  unaffected. Reading from the log (not from in-memory cursor state)
+  means resume after a crash recovers the same inputs the original
+  invocation used — INV-EVENT-LOG-AUTHORITATIVE applies.
 * **Mid-flight cancel is honoured between loop iterations, not inside
   `await child_engine.run()`.** If a cancel arrives while the parent
   is awaiting the child, the parent waits for the child to finish
