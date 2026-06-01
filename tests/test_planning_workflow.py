@@ -164,14 +164,47 @@ async def test_happy_path_leaf(log_dir: Path):
 
 
 async def test_decomposable_three_children(log_dir: Path):
-    """Planner returns decomposable=True with 3 children; reviewer approves."""
+    """Planner returns decomposable=True with 3 leaf children → recursion fires.
+
+    After Fauré seat 2 the workflow spawns one sub-workflow per proposed
+    child. Each child's own planning run returns a leaf, so the
+    aggregated plan has 3 leaf PlanResult children. The flat sidecar
+    JSON now carries the recursive tree (each child rendered as a
+    serialised PlanResult, not a raw planner proposal).
+    """
     provider = FakeProvider(
         scripts={
-            "planner": [_decomposable_planner_output()],
-            "plan_reviewer": [{"verdict": "approve", "feedback": "Good cuts."}],
+            # Root planner + 3 child planners.
+            "planner": [
+                _decomposable_planner_output(),
+                _leaf_planner_output(),
+                _leaf_planner_output(),
+                _leaf_planner_output(),
+            ],
+            # Root reviewer + 3 child reviewers.
+            "plan_reviewer": [
+                {"verdict": "approve", "feedback": "Good cuts."},
+                {"verdict": "approve", "feedback": "ok."},
+                {"verdict": "approve", "feedback": "ok."},
+                {"verdict": "approve", "feedback": "ok."},
+            ],
         }
     )
-    engine = build_engine(log_dir, item_id=ITEM_ID, twig=_twig(), provider=provider)
+    # Pre-register synthesised child item ids in the fake twig so each
+    # child's fetch_item succeeds. Synthesised id is parent*100 + (i+1).
+    twig = _twig()
+    for slot in (1, 2, 3):
+        child_id = ITEM_ID * 100 + slot
+        twig.items[child_id] = TwigItem(
+            id=child_id,
+            title=f"Child slot {slot}",
+            state="New",
+            area_path="Polyphony\\Engine",
+            work_item_type="Task",
+            parent_id=ITEM_ID,
+            raw={},
+        )
+    engine = build_engine(log_dir, item_id=ITEM_ID, twig=twig, provider=provider)
     result = await engine.run("decomp")
     assert isinstance(result, Completed), result
 
@@ -180,25 +213,37 @@ async def test_decomposable_three_children(log_dir: Path):
     assert plan is not None
     assert plan.decomposable is True
     assert plan.review_iterations == 1
+    assert len(plan.children) == 3
+    assert all(c.decomposable is False for c in plan.children)
+    expected_ids = {ITEM_ID * 100 + 1, ITEM_ID * 100 + 2, ITEM_ID * 100 + 3}
+    assert {c.item_id for c in plan.children} == expected_ids
 
     tree = log_dir / "decomp.plan.tree.json"
     assert tree.exists(), f"plan.tree.json missing; dir={list(log_dir.iterdir())}"
     payload = json.loads(tree.read_text(encoding="utf-8"))
     assert payload["item_id"] == ITEM_ID
     assert payload["decomposable"] is True
+    # `children` is now the recursive PlanResult tree; `proposals` keeps
+    # the raw planner output.
     assert len(payload["children"]) == 3
-    assert {c["title"] for c in payload["children"]} == {
+    assert len(payload["proposals"]) == 3
+    assert {c["title"] for c in payload["proposals"]} == {
         "Define ErrorKind enum",
         "Migrate verbs to ErrorKind",
         "Update tests",
     }
 
-    # No sub-runs were spawned (v0: flat planning only).
-    other_logs = [p for p in log_dir.glob("*.events.jsonl") if p.name != "decomp.events.jsonl"]
-    assert other_logs == [], (
-        "decomposable path must not spawn sub-runs in v0; found: "
-        f"{[p.name for p in other_logs]}"
+    # Three child sub-run logs exist (INV-SUBWORKFLOW-LOG-ISOLATION
+    # gives each its own file).
+    child_logs = sorted(
+        p.name
+        for p in log_dir.glob("decomp__child_*.events.jsonl")
     )
+    assert child_logs == [
+        "decomp__child_1.events.jsonl",
+        "decomp__child_2.events.jsonl",
+        "decomp__child_3.events.jsonl",
+    ]
 
 
 # ---- revise loop -------------------------------------------------------
@@ -404,7 +449,12 @@ async def test_max_depth_exceeded_routes_to_human(log_dir: Path):
 
 
 async def test_inv_restart_resume_to_same_terminal(log_dir: Path):
-    """Kill mid-plan; resume to identical terminal state and artifacts.
+    """Kill mid-plan (leaf scenario); resume to identical terminal state.
+
+    Uses a leaf planner output so this seat-1 test focuses on the
+    planner→reviewer→record iteration-cap restart contract. Multi-level
+    recursion's INV-RESTART is covered in
+    ``tests/test_planning_recursion.py``.
 
     Strategy mirrors the code-review demo's restart test: run once, truncate
     the log to just after `reviewer_1.verb_completed`, then resume with a
@@ -415,10 +465,10 @@ async def test_inv_restart_resume_to_same_terminal(log_dir: Path):
     """
     run_id = "restart"
 
-    # ---- first run: full happy path
+    # ---- first run: full happy path (leaf, no recursion)
     provider1 = FakeProvider(
         scripts={
-            "planner": [_decomposable_planner_output()],
+            "planner": [_leaf_planner_output()],
             "plan_reviewer": [{"verdict": "approve", "feedback": "ok"}],
         }
     )
@@ -478,9 +528,9 @@ async def test_inv_restart_resume_to_same_terminal(log_dir: Path):
     plan2 = project_plan_result(completed2)
     assert plan2 == plan1, (plan1, plan2)
 
-    # Sidecar artefact reappeared.
-    tree = log_dir / f"{run_id}.plan.tree.json"
-    assert tree.exists()
+    # Sidecar artefact reappeared (leaf scenario → markdown).
+    md = log_dir / f"{run_id}.plan.md"
+    assert md.exists()
 
 
 # ---- workflow topology smoke ------------------------------------------

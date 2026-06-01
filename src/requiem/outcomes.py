@@ -18,6 +18,11 @@ Six variants:
                          handler.
 * `Cancelled`          — operator/deadline/supersession cancel. Honoured
                          immediately (`INV-CANCEL-SHORT-CIRCUITS-RETRY`).
+
+Every variant carries a peer ``receipts: tuple[Receipt, ...]`` field per
+ADR 0004 §4.4 — failure forensics matter as much as success ones.
+``Receipt`` is a loose ``dict[str, Any]`` at v0; a typed protocol is
+deferred to a Phase D ADR.
 """
 from __future__ import annotations
 
@@ -25,10 +30,23 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, TypeAlias
 
 
+Receipt: TypeAlias = dict[str, Any]
+"""Forensic record attached to an outcome (ADR 0004 §4.4).
+
+Loose dict at v0 — a typed `Receipt` protocol is deferred to a Phase D
+ADR. The shape today (set by `requiem.providers._common.make_receipt`):
+``{"kind": str, "model": str, "input_tokens": int, "output_tokens": int,
+"latency_ms": int, "request_id": str, "error": str}``. Verbs are free to
+emit other receipt shapes (e.g. git/filesystem) as long as ``kind`` is
+present.
+"""
+
+
 @dataclass(frozen=True, slots=True)
 class Success:
     value: dict[str, Any] = field(default_factory=dict)
     inspected_artifacts: tuple[str, ...] = ()
+    receipts: tuple[Receipt, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +55,14 @@ class RetryableFailure:
     error_kind: str
     message: str
     attempt: int = 1
+    after: float | None = None
+    """Seconds to wait before the next attempt. Populated from provider
+    ``Retry-After`` headers (or a sensible default per error class).
+    ``None`` means "no provider hint"; the kernel retries immediately.
+    The kernel bounds the actual sleep at 60s (a runaway ``999999``
+    retry-after would otherwise hang the run); larger values are
+    surfaced via a NeedsHuman gate instead (ADR 0004 §4.2)."""
+    receipts: tuple[Receipt, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +70,7 @@ class PermanentFailure:
     error_kind: str
     message: str
     details: dict[str, Any] = field(default_factory=dict)
+    receipts: tuple[Receipt, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +85,7 @@ class BadOutput:
     error_kind: str
     validation_errors: tuple[str, ...]
     raw_output: str = ""
+    receipts: tuple[Receipt, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,12 +94,14 @@ class NeedsHuman:
     prompt: str
     options: tuple[str, ...]
     context: dict[str, Any] = field(default_factory=dict)
+    receipts: tuple[Receipt, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class Cancelled:
     cause: Literal["operator", "deadline", "superseded", "parent_cancelled"]
     at_step: str
+    receipts: tuple[Receipt, ...] = ()
 
 
 Outcome: TypeAlias = (
@@ -108,7 +138,9 @@ def outcome_from_dict(d: dict[str, Any]) -> Outcome:
     if cls is None:
         raise ValueError(f"unknown outcome kind {kind!r}")
     # tuples got serialized to lists; restore where the dataclass expects them.
-    tuple_fields = {"inspected_artifacts", "options", "validation_errors"}
+    tuple_fields = {
+        "inspected_artifacts", "options", "validation_errors", "receipts",
+    }
     for k, v in list(data.items()):
         if isinstance(v, list) and k in tuple_fields:
             data[k] = tuple(v)

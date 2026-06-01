@@ -472,36 +472,36 @@ async def test_m4_cancel_mid_flight_short_circuits(
     assert len(completers) == 1, post
     assert completers[0]["payload"]["terminal"] == "cancelled"
 
-    # Re-resume after cancel must be terminal-stable in *disposition*.
-    #
-    # ANOMALY (documented in docs/resume-fidelity-report.md, candidate
-    # invariant INV-CANCEL-RESUME-IDEMPOTENT): each resume of a cancelled
-    # run currently *re-emits* `run_completed("cancelled")`, because
-    # `_pending_cancel()` scans for any `cancel_requested` in the log
-    # without regard for whether it has already been honoured. So the log
-    # grows by one `run_completed` per resume. Disposition stays "cancelled"
-    # (the invariant the operator cares about), but the log is not byte-
-    # idempotent. We pin disposition here and flag the log growth as a
-    # bug-shaped regression hook.
+    # Re-resume after cancel must be terminal-stable in *disposition*
+    # AND now byte-idempotent: INV-CANCEL-RESUME-IDEMPOTENT was
+    # promoted from a §7 candidate to enforced behaviour (Saint-Saëns
+    # Phase B cleanup). Resuming a run whose log already ends in
+    # `run_completed("cancelled")` short-circuits at the top of the
+    # engine loop without re-emitting; the log does not grow.
     third = _engine(d)
     third_result = await third.run("m4run")
+    # Disposition stays "cancelled" — Completed-with-disposition is the
+    # new shape (the engine no longer re-routes through the cancel
+    # short-circuit on resume), but a hypothetical regression to the old
+    # Failed-with-cancelled is also accepted to keep this test focused
+    # on the byte-idempotency assertion below.
     third_disposition = (
         third_result.disposition if isinstance(third_result, Completed)
-        else "cancelled"  # Failed always carries error_kind == cancelled here
+        else "cancelled"
     )
     if isinstance(third_result, Failed):
         assert third_result.error_kind == "cancelled"
     assert third_disposition == "cancelled"
 
     events_after_third = list(replay(log_path))
-    # Pin the current (buggy) shape: exactly one extra run_completed.
+    # The fix: zero extra events on re-resume of a cancelled run. If this
+    # ever regresses to ``extra > 0`` the kernel has started re-emitting
+    # run_completed on resume again (INV-CANCEL-RESUME-IDEMPOTENT broken).
     extra = len(events_after_third) - len(events_after)
-    assert extra == 1, (
-        "expected the documented +1 run_completed quirk on re-resume; "
-        f"got {extra} extra events"
+    assert extra == 0, (
+        "INV-CANCEL-RESUME-IDEMPOTENT: resuming a cancelled run must "
+        f"not append events; got {extra} extra"
     )
-    new_events = events_after_third[len(events_after):]
-    assert all(e["kind"] == "run_completed" for e in new_events), new_events
 
 
 async def test_m4_cancel_before_any_run_terminates_at_cancelled(

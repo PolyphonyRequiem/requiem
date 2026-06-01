@@ -30,7 +30,7 @@ from requiem.agent import FakeProvider
 from requiem.clients.fs import FilesystemClient
 from requiem.clients.gh import GhPullRequest
 from requiem.clients.twig import TwigItem
-from requiem.kernel import Completed
+from requiem.kernel import Completed, Suspended
 from requiem.outcomes import BadOutput
 from requiem.persistence import replay
 from requiem.toolbelt import FakeFileClient, RealGitClient, Toolbelt
@@ -503,16 +503,75 @@ async def test_existing_branch_routes_to_handoff(repo_path: Path, tmp_path: Path
         repo_path, tmp_path / "logs",
         provider=provider, twig=twig, gh=gh, test_runner=_passing_runner,
     )
+    # Disable the demo's auto gate handler so we observe the suspend
+    # state directly instead of auto-routing to end_handoff. In real
+    # operation either a human resolves the gate or the workflow author
+    # supplies a domain-specific handler.
+    engine.gate_handler = None
 
     result = await engine.run("foreign_branch")
-    # branch.exists_foreign → permanent_failure routed to end_handoff
-    # (human takes over from the gate). The verdict is "completed"
-    # because end_handoff is a completed terminate; no PR was opened.
-    assert isinstance(result, Completed)
-    assert result.final_node == "end_handoff"
+    # ``create_branch`` now returns ``NeedsHuman`` directly (Saint-Saëns
+    # Phase B cleanup, Item E): the kernel suspends at the gate and the
+    # operator decides how to proceed. The prompt carries the branch
+    # name + current HEAD so they have what they need to choose.
+    assert isinstance(result, Suspended)
+    assert result.node_id == "create_branch"
+    assert "feature/12345" in result.prompt
+    assert "main" in result.prompt
+    assert "abort" in result.options
     # No PR, no commits to main, no marker file from the demo coder.
     assert gh.created_calls == []
     assert not (repo_path / "NEVER.md").exists()
+    # The kernel must have logged a real ``gate_opened`` event keyed to
+    # ``create_branch`` — this is the Sibelius PR #23 + Saint-Saëns Item
+    # E contract: a ``ScriptNode`` returning ``NeedsHuman`` opens a
+    # first-class gate, not a synthetic permanent_failure.
+    log_path = tmp_path / "logs" / "foreign_branch.events.jsonl"
+    events = list(replay(log_path))
+    gates = [e for e in events if e["kind"] == "gate_opened"
+             and e.get("node_id") == "create_branch"]
+    assert len(gates) == 1
+    assert gates[0]["payload"]["prompt"] == result.prompt
+    assert tuple(gates[0]["payload"]["options"]) == result.options
+
+
+async def test_existing_branch_with_auto_gate_handler_routes_to_handoff(
+    repo_path: Path, tmp_path: Path,
+) -> None:
+    """The default demo gate_handler picks ``abort``; the workflow's
+    ``needs_human`` edge then routes ``create_branch`` to
+    ``end_handoff`` so the run terminates cleanly. Regression for
+    Saint-Saëns Item E: prior code emitted a synthetic
+    ``branch.exists_foreign`` permanent_failure to achieve this
+    end-state; the new path goes through a real gate."""
+    _git(repo_path, "checkout", "-q", "-b", "feature/12345")
+    (repo_path / "FOREIGN.md").write_text("foreign\n", encoding="utf-8")
+    _git(repo_path, "add", "-A")
+    _git(repo_path, "commit", "-q", "-m", "foreign commit")
+    _git(repo_path, "checkout", "-q", "main")
+
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh()
+    provider = FakeProvider(scripts={
+        "coder": [_coder_creates("NEVER.md")],
+        "coder_revision": [],
+    })
+    engine = _make_engine(
+        repo_path, tmp_path / "logs",
+        provider=provider, twig=twig, gh=gh, test_runner=_passing_runner,
+    )
+
+    result = await engine.run("foreign_branch_auto")
+    assert isinstance(result, Completed)
+    assert result.final_node == "end_handoff"
+    assert gh.created_calls == []
+    # Auto handler picked ``abort`` — the route key must be present.
+    events = list(replay(tmp_path / "logs" / "foreign_branch_auto.events.jsonl"))
+    resolved = [e for e in events if e["kind"] == "gate_resolved"
+                and e.get("node_id") == "create_branch"]
+    assert len(resolved) == 1
+    assert resolved[0]["payload"]["choice"] == "abort"
+    assert resolved[0]["payload"].get("auto") is True
 
 
 # ---- existing branch we are already on (resume happy case) ----
