@@ -30,6 +30,9 @@ EVENT_KINDS: frozenset[str] = frozenset({
     "gate_opened",
     "gate_resolved",
     "cancel_requested",
+    "subworkflow_started",
+    "subworkflow_completed",
+    "subworkflow_cancelled",
     "run_completed",
 })
 """Sealed catalogue of kinds the kernel emits.
@@ -177,6 +180,75 @@ class EventEmitter:
 
     def emit_run_completed(self, terminal: str, final_node: str) -> None:
         self._emit("run_completed", terminal=terminal, final_node=final_node)
+
+    def emit_subworkflow_started(
+        self,
+        node_id: str,
+        *,
+        sub_run_id: str,
+        sub_workflow_module: str,
+        inputs_summary: dict[str, Any] | None = None,
+    ) -> None:
+        """Parent-side marker that a child workflow is being invoked.
+
+        The child writes its own ``{sub_run_id}.events.jsonl`` (Bach A
+        purity); this event lives in the parent's log only.
+        ``inputs_summary`` is the dict returned by the optional
+        ``inputs_verb`` — recorded verbatim for observability.
+        """
+        self._emit(
+            "subworkflow_started",
+            node_id=node_id,
+            sub_run_id=sub_run_id,
+            sub_workflow_module=sub_workflow_module,
+            inputs_summary=inputs_summary or {},
+        )
+
+    def emit_subworkflow_completed(
+        self,
+        node_id: str,
+        *,
+        sub_run_id: str,
+        disposition: str,
+        outcome: dict[str, Any],
+        outcome_summary: dict[str, Any] | None = None,
+    ) -> None:
+        """Parent-side marker that a child workflow finished.
+
+        ``disposition`` is the human-readable status (``completed``,
+        ``failed``, ``cancelled``, ``needs_human``). ``outcome`` is the
+        full verb-outcome dict the parent's router will consume — stored
+        so a crash between this event and the parent's ``verb_completed``
+        can be resumed without re-invoking the (now-finished) child.
+        """
+        self._emit(
+            "subworkflow_completed",
+            node_id=node_id,
+            sub_run_id=sub_run_id,
+            disposition=disposition,
+            outcome=outcome,
+            outcome_summary=outcome_summary or {},
+        )
+
+    def emit_subworkflow_cancelled(
+        self,
+        node_id: str,
+        *,
+        sub_run_id: str,
+        reason: str = "parent_cancelled",
+    ) -> None:
+        """Parent-side marker that a child was cancelled (e.g. parent cancel propagated).
+
+        Distinct from ``subworkflow_completed`` because the child may never
+        have produced an outcome — propagation can write directly into the
+        child's log before any of its loop iterations run.
+        """
+        self._emit(
+            "subworkflow_cancelled",
+            node_id=node_id,
+            sub_run_id=sub_run_id,
+            reason=reason,
+        )
 
     def emit_cancel_requested(
         self, *, reason: str = "operator", requested_by: str = "cli"

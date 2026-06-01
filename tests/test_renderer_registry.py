@@ -72,6 +72,22 @@ def test_each_renderer_returns_list_of_strings():
         "cancel_requested":      _envelope(
             "cancel_requested", reason="operator", requested_by="cli",
         ),
+        "subworkflow_started":   _envelope(
+            "subworkflow_started", _node="sub",
+            sub_run_id="r__sub",
+            sub_workflow_module="requiem.workflows.code_review_demo",
+            inputs_summary={},
+        ),
+        "subworkflow_completed": _envelope(
+            "subworkflow_completed", _node="sub",
+            sub_run_id="r__sub", disposition="completed",
+            outcome={"kind": "success", "value": {}},
+            outcome_summary={"kind": "success"},
+        ),
+        "subworkflow_cancelled": _envelope(
+            "subworkflow_cancelled", _node="sub",
+            sub_run_id="r__sub", reason="parent_cancelled",
+        ),
         "run_completed":         _envelope(
             "run_completed", terminal="completed", final_node="end",
         ),

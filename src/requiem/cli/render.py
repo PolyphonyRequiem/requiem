@@ -247,6 +247,42 @@ def _r_cancel_requested(ev: dict[str, Any], cx: RenderContext) -> RenderResult:
     return [f"{GLYPH_END} Cancel requested by {who} — {reason}"]
 
 
+@_register("subworkflow_started")
+def _r_subworkflow_started(ev: dict[str, Any], cx: RenderContext) -> RenderResult:
+    p = ev["payload"]
+    module = p.get("sub_workflow_module") or "?"
+    sub_run_id = p.get("sub_run_id") or "?"
+    return [
+        f"{GLYPH_ACTION} Spawning child workflow: {module} (sub-run: {sub_run_id})"
+    ]
+
+
+@_register("subworkflow_completed")
+def _r_subworkflow_completed(ev: dict[str, Any], cx: RenderContext) -> RenderResult:
+    p = ev["payload"]
+    node = ev.get("node_id") or ""
+    disposition = p.get("disposition", "?")
+    outcome = p.get("outcome") or {}
+    cx.completed[node] = outcome
+    label = cx.label(node)
+    if disposition == "completed":
+        return [f"{GLYPH_OK} Child workflow returned: {disposition} ({label})"]
+    if disposition == "needs_human":
+        # The parent's `gate_opened` event (queued right after) tells the
+        # operator-facing story; suppress the duplicate line here.
+        return []
+    if disposition == "cancelled":
+        return [f"{GLYPH_END} Child workflow returned: cancelled ({label})"]
+    return [f"{GLYPH_FAIL} Child workflow returned: {disposition} ({label})"]
+
+
+@_register("subworkflow_cancelled")
+def _r_subworkflow_cancelled(ev: dict[str, Any], cx: RenderContext) -> RenderResult:
+    p = ev["payload"]
+    sub_run_id = p.get("sub_run_id") or "?"
+    return [f"{GLYPH_END} Child workflow cancelled ({sub_run_id})"]
+
+
 @_register("run_completed")
 def _r_run_completed(ev: dict[str, Any], cx: RenderContext) -> RenderResult:
     p = ev["payload"]
