@@ -12,6 +12,44 @@
 
 ```powershell
 pip install -e .[cli]
+<<<<<<< HEAD
+
+# Pick a run id (any short string), then run the bundled demo:
+requiem run requiem.workflows.code_review_demo --run-id demo1
+```
+
+You should see ~10 lines of customer-English narration ending in a verdict
+card — the demo runs end-to-end (script verbs, flaky-lint retry, parallel-fork
+reviewer team, structured-output synthesizer, human gate, archive) in under
+100 ms with zero API keys.
+
+```powershell
+# Replay the run from its event log (humanized — the log records workflow
+# identity, so no --workflow flag needed):
+requiem events demo1
+
+# Tail a live run in another terminal:
+requiem events demo1 --follow
+
+# CI consumers: get the raw JSONL stream
+requiem events demo1 --raw
+
+# Discover recent runs under .runs/
+requiem list-runs
+
+# Stop a stuck or suspended run (writes cancel_requested to the log; the
+# next resume short-circuits per INV-CANCEL-SHORT-CIRCUITS-RETRY):
+requiem cancel demo1 --reason "operator changed their mind"
+
+# Drive the human gate yourself instead of auto-resolving:
+requiem run requiem.workflows.code_review_demo --interactive
+
+# Inspect the workflow's topology:
+requiem describe requiem.workflows.code_review_demo
+```
+
+### CLI reference
+=======
 requiem run requiem.workflows.code_review_demo
 ```
 
@@ -152,14 +190,22 @@ For the architecture, invariants, and decision provenance:
 - `src/requiem/` — the engine itself. Eight modules, ~2 KLOC.
 
 ## CLI reference
+>>>>>>> origin/main
 
 | Command | What it does |
 |---|---|
-| `requiem run <module>` | Run a workflow by importable module path. |
+| `requiem run <module>` | Run a workflow by importable module path. `--interactive` prompts at each human gate; default auto-resolves per the workflow. |
 | `requiem resume <module> <run_id>` | Resume a partially-finished run from its event log. |
-| `requiem describe <module>` | Print nodes, edges, registered agents. |
-| `requiem events <run_id> [--workflow MOD] [--raw]` | Print a run's event log; default is rendered English, `--raw` is JSONL. |
-| `requiem cancel <run_id>` | *(coming — see [issue](https://github.com/PolyphonyRequiem/requiem/issues) tracker for Dvorak's PR)* |
+| `requiem events <run_id>` | Render the run's event log as customer English. `--follow`/`-f` tails; `--raw` emits JSONL for CI; `--workflow MOD` overrides the auto-loaded module. |
+| `requiem list-runs` | List runs under `--log-dir` with workflow / start time / status / duration / event count. |
+| `requiem cancel <run_id>` | Write a `cancel_requested` event into the log; the engine short-circuits at the next loop tick or on the next resume. |
+| `requiem describe <module>` | Print nodes, edges, registered agents, retry budgets, humanize map. |
+
+The `module` argument is any importable Python module exposing
+`build_engine(log_dir) -> Engine` or `build_workflow() -> Workflow`. See
+`src/requiem/workflows/code_review_demo.py` for the canonical shape; the
+workflow itself records its own module path (Wagner builder `.module(...)`)
+so post-hoc commands re-import without an explicit flag.
 
 Exit codes:
 

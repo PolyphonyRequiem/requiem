@@ -114,6 +114,20 @@ we stop rather than guess.
 
 **Affected:** Beethoven Q-K8.
 
+> **Implementation note (Phase B / Dvorak):** the actual event kind shipped
+> as `run_started` (not `workflow_started` — naming pick by Verdi-2 during
+> promote). The payload carries both `workflow_version: str` (this decision)
+> and `workflow_module: str | None` (the importable module path that
+> produced the workflow). The second field is the same idea applied to
+> *identity* rather than *shape* — it lets post-hoc CLI tools (`requiem
+> events <run_id>`, `requiem list-runs`) re-import the workflow module and
+> recover its humanize map / render hints without an explicit `--workflow`
+> flag. Both are populated by `WorkflowBuilder.module(...)` and
+> `WorkflowBuilder.version(...)`; both default safely (`None` and `"0"`)
+> for ad-hoc workflows built in tests. The `workflow_version_mismatch`
+> event and `--force-replay` flag are deferred to the first multi-version
+> replay scenario.
+
 ## Consequences
 
 ### Positive
