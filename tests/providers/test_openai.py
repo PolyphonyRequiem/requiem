@@ -92,6 +92,9 @@ async def test_happy_path_with_schema_returns_success():
     assert receipt["output_tokens"] == 9
     assert receipt["request_id"] == "chatcmpl_test_01"
 
+    # ADR 0004 §4.4: peer receipts field on the outcome envelope.
+    assert out.receipts == (receipt,)
+
     # Verify the request used json_schema strict mode.
     assert len(seen) == 1
     body = json.loads(seen[0].content.decode("utf-8"))
@@ -171,6 +174,9 @@ async def test_rate_limit_returns_retryable_with_retry_after():
     assert isinstance(out, RetryableFailure)
     assert out.error_kind == "rate_limited"
     assert "retry_after=33s" in out.message
+    # ADR 0004 §4.2: typed ``after`` + peer ``receipts`` per §4.4.
+    assert out.after == 33.0
+    assert out.receipts and out.receipts[0]["kind"] == "llm_call"
 
 
 async def test_5xx_returns_retryable_provider_unavailable():

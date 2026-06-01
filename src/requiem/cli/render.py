@@ -179,6 +179,12 @@ def _r_retry_attempted(ev: dict[str, Any], cx: RenderContext) -> RenderResult:
     label = cx.label(ev.get("node_id"))
     reason = p.get("reason", "")
     nxt = p.get("next_attempt", "?")
+    after = p.get("after")
+    if after is not None and after > 0:
+        return [
+            f"{GLYPH_RETRY} {label} failed: {reason} — "
+            f"retrying (attempt {nxt}, after {after:.1f}s)"
+        ]
     return [f"{GLYPH_RETRY} {label} failed: {reason} — retrying (attempt {nxt})"]
 
 

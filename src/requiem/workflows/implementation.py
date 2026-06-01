@@ -86,6 +86,7 @@ from requiem.clients.twig import (
 from requiem.dsl import AgentRegistry, VerbRegistry, Workflow, WorkflowBuilder
 from requiem.kernel import Engine
 from requiem.outcomes import (
+    NeedsHuman,
     Outcome,
     PermanentFailure,
     Success,
@@ -206,7 +207,6 @@ ERROR_KINDS: frozenset[str] = frozenset({
     "workspace.dirty",
     "workspace.unreadable",
     "branch.create_failed",
-    "branch.exists_foreign",
     "branch.probe_failed",
     "coder.no_changes",
     "coder.invalid_path",
@@ -226,15 +226,14 @@ module level so the test suite can exhaustively cover them and the UI
 has a finite vocabulary to render. Adding a new kind here is a
 deliberate act (per ADR 0004 §4.2: amend the enum + ADR).
 
-Note on ``NeedsHuman``: the brief calls for ``NeedsHuman`` from several
-verbs (branch-already-exists, fetch-plan-unknown, etc.). The kernel
-shipped at this seat has a known limitation: it reads ``.prompt`` /
-``.options`` off the *node* in ``_AwaitingGate`` rather than off the
-emitted ``gate_opened`` event, so a ``ScriptNode`` returning
-``NeedsHuman`` crashes the engine. Until that is fixed (out of scope
-for the implementation seat), we emit ``PermanentFailure`` with a
-descriptive error_kind and route to ``end_handoff``. Operationally
-identical: the workflow halts and a human owns the next step."""
+Note on ``NeedsHuman``: a verb may return ``NeedsHuman`` directly from
+a ``ScriptNode`` — the kernel handles it the same way it handles a gate
+emitted by an agent node (Sibelius PR #23 + Saint-Saëns Phase B
+cleanup). ``create_branch`` uses this when it discovers a foreign
+branch left over from a prior run: instead of inventing a
+pseudo-permanent-failure error_kind, it opens a real gate with the
+branch name + current HEAD in the prompt so the operator can decide
+whether to delete-and-recreate or resume the prior attempt."""
 
 
 # ---- path-safety: the wall between the agent and the filesystem -------
@@ -532,15 +531,22 @@ def build_verb_registry(
         # An existing branch we are not on means a prior run (or a
         # human) left state behind. We refuse to auto-checkout to
         # protect INV-NO-CORRUPT-FORWARD — the human decides whether
-        # to delete-and-recreate or resume the prior attempt.
+        # to delete-and-recreate or resume the prior attempt. We
+        # surface this as a real ``NeedsHuman`` gate (Sibelius PR #23
+        # made ScriptNode→NeedsHuman a first-class path) so the
+        # operator sees the branch name, current HEAD, and the
+        # available options instead of a synthetic error_kind.
         if exists:
-            return PermanentFailure(
-                error_kind="branch.exists_foreign",
-                message=(
-                    f"branch {branch_name!r} already exists locally but "
-                    f"HEAD is on {current!r}. Resolve manually before retry."
+            return NeedsHuman(
+                gate="branch_exists_foreign",
+                prompt=(
+                    f"Branch {branch_name!r} already exists locally but "
+                    f"HEAD is on {current!r}. A prior run (or a human) "
+                    f"left state behind. Decide how to proceed before "
+                    f"this run can continue."
                 ),
-                details={"branch": branch_name, "current": current},
+                options=("abort", "delete_and_recreate", "resume_on_branch"),
+                context={"branch": branch_name, "current": current},
             )
         try:
             await fs.git_create_branch(branch_name, inputs.base_branch)
@@ -990,7 +996,13 @@ def build_workflow() -> Workflow:
                 .edge("assert_clean_workspace", on="permanent_failure", to="end_failed")
             .script("create_branch", verb="create_branch")
                 .edge("create_branch", on="success", to="invoke_coder")
-                .edge("create_branch", on="permanent_failure:branch.exists_foreign", to="end_handoff")
+                # ``branch.exists_foreign`` no longer exists as a
+                # permanent_failure; the verb now returns ``NeedsHuman``
+                # and the kernel suspends at the gate. The fallback
+                # ``needs_human`` edge routes to ``end_handoff`` so that
+                # demos (and any auto gate handler) terminate cleanly
+                # instead of dead-ending with ``route.missing``.
+                .edge("create_branch", on="needs_human", to="end_handoff")
                 .edge("create_branch", on="permanent_failure:branch.probe_failed", to="end_handoff")
                 .edge("create_branch", on="permanent_failure", to="end_failed")
             .agent("invoke_coder", agent="coder", prompt_verb="coder_prompt")
