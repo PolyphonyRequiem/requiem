@@ -1,11 +1,13 @@
-# ADR 0006 (DRAFT) — Merge-Group Topology for Implementation
+# ADR 0006 — Merge-Group Topology for Implementation
 
-**Status:** DRAFT — proposed for review by Daniel during Wave 6 (Stravinsky seat).
-**Date:** 2026-06 (Wave 6)
-**Author:** Stravinsky (design-research seat)
+**Status:** ACCEPTED (2026-06-01 — Q1 resolved during Wave 7 Bruckner walkthrough).
+**Date:** 2026-06 (Wave 6; Q1 closed Wave 7).
+**Author:** Stravinsky (design-research seat).
 **Supersedes:** none (first MG-topology decision; replaces the implicit
 "single `feature/<item_id>` branch" baked into `implementation.py`).
 **Superseded by:** —
+**Cross-cuts:** ADR-0008 (review-surface curation) — separates
+"branch topology" from "reviewable-set policy". See "Decision log" below.
 
 ---
 
@@ -553,56 +555,92 @@ Option A's analogous estimate is, eyeballing the polyphony skill,
 
 ## Open questions for Daniel
 
-These are genuine open questions; this ADR cannot close them without
-input.
+These were genuine open questions when the ADR shipped; resolutions land
+under "Decision log" below as they close.
 
-1. **Does the literal reading of non-negotiable #7 stand?** The audit
-   text says "Merge-group implementation (`mg/`, `impl/`) …". Option D
-   ships `impl/` but no `mg/`. Either (a) the reading is "load-bearing,
-   not literal — option D satisfies it" or (b) you want option A's
-   `mg/` prefix regardless of cost. This is the call that gates
-   recommendation acceptance.
+1. **Does the literal reading of non-negotiable #7 stand?** — **CLOSED 2026-06-01.**
+   Resolution: load-bearing reading. Daniel amends the audit row's wording
+   from `"mg/, impl/"` to **"per-item review + integration surface"**.
+   Option D is accepted. See "Decision log → Q1" below.
 
-2. **Plan-PR realisation: real PR or virtual artefact?** Option D
-   assumes the plan PR is a real `plan/<root>` branch with a real
-   GitHub PR (operator-reviewable in the browser). Polyphony does
-   this. The alternative is "plan is markdown rendered into the
-   feature-PR description". Real-PR is more work but is the load-bearing
-   delight in polyphony's dogfood. Confirm preference?
+2. **Plan-PR realisation: real PR or virtual artefact?** — OPEN. Tracked
+   as Q2 in `docs/briefings/open-questions-wave7.md`.
 
-3. **Atomic co-merge guarantee — how strict?** Option D's promise is
-   "either the feature trunk merges to main or nothing does", but
-   *individual leaf-impl PRs* still land on the trunk one at a time.
-   If leaf B fails to merge to the trunk after leaf A succeeded, the
-   trunk has A's code and no path to main. Two recovery models:
-   (a) **Abandon the trunk** — operator deletes branch, re-runs root,
-   gets a fresh trunk. (b) **Roll forward** — `needs_human` gate
-   lets the operator retry leaf B or skip-with-justification. Which?
+3. **Atomic co-merge guarantee — how strict?** — OPEN. Tracked as Q5.
 
-4. **Replan mid-flight: in scope for v0?** If yes, we need P7 (stable
-   MG ids) even without nested `mg/` branches — the planner declares
-   stable item ids and the executor refuses to rename impl branches.
-   If no, defer. Option D currently assumes no.
+4. **Replan mid-flight: in scope for v0?** — OPEN. Tracked as Q6.
 
-5. **Should the planner declare review-group labels?** Even without
-   nested `mg/` branches, the planner could emit a
-   `review_group: "data-layer"` field per leaf. The dashboard groups
-   impl PRs by label; nothing changes in git. Cheap, useful for big
-   fan-outs, doesn't commit us to topology. Yes / no?
+5. **Should the planner declare review-group labels?** — OPEN; **scope
+   shifted** by the Q1 reframe. The reviewable-set decision is no longer
+   purely a "labels in YAML" question — it is the seed of an agent-driven
+   curation policy. Tracked as Q7; the deeper concept lives in **ADR-0008
+   (review-surface curation)**.
 
-6. **Same-root run lock semantics.** Option D's INV-FEATURE-TRUNK-PER-RUN
-   says one trunk per run. What's the right operator UX when they
-   start a fresh run on a root that already has an open trunk?
-   Polyphony's answer: refuse-or-attach (line ~494 of the skill). Is
-   that the right behaviour for the single-operator audience or
-   overkill?
+6. **Same-root run lock semantics.** — OPEN. Tracked as Q8.
 
-7. **(Minor) Should `feature/<item_id>` survive for the single-leaf
-   case?** When the root *is* a leaf (no children), option D's
-   topology degenerates to `feature/<root>` + `impl/<root>-<root>` +
-   one trunk PR — two branches and two PRs for what was one. Worth a
-   special case ("if leaf-only, use today's `feature/<item_id>`
-   shape") or worth the consistency tax?
+7. **Should `feature/<item_id>` survive for the single-leaf case?** —
+   OPEN. Tracked as Q10.
+
+---
+
+## Decision log
+
+### Q1 (closed 2026-06-01) — non-negotiable #7 reading
+
+**Decision:** Load-bearing reading. Option D is adopted. The audit row
+wording is amended from `"Merge-group implementation (mg/, impl/) with
+idempotent re-entry"` to `"Per-item review + integration surface with
+idempotent re-entry"` — this ADR is the canonical place that amendment
+lives; a follow-up edit will flow into `docs/references/v0-parity-readiness.md`
+when the audit row's status is updated.
+
+**Reframe captured during the decision (Daniel's framing):**
+
+> "MGs were really about reviewable sets. That was the logical value.
+> Users may not want to review every PR, especially small ones we can
+> auto-merge. We should probably not even create a PR if the user doesn't
+> want to review it. The north star really is about *surfacing reviews to
+> the user that they're likely to want to care about, at a size that is
+> reasonable*. Might want that to be a tunable decision made by agents
+> rather than purely deterministic."
+
+This separates two concerns that polyphony's MG model conflated:
+
+- **Branch topology** (this ADR) — how branches encode an in-flight
+  implementation on disk. Option D: `feature/<root>` + `plan/<root>` +
+  `impl/<root>-<item>`. Three prefixes, two delimiters, no nesting.
+
+- **Reviewable-set policy** (forthcoming ADR-0008) — per-slice, which
+  diffs we surface for human review, at what size, via what surface
+  (GH PR, in-process / "local" review, auto-merge). The decision is
+  **agent-tunable** (a curator role decides per-slice based on diff
+  shape, risk score, item type, operator preference), not a static
+  config knob.
+
+The branch topology decided here is the chassis; ADR-0008 will decide
+how many reviewable slices ride on the chassis and how each one is
+surfaced. The two ADRs compose: a slice marked `auto_merge` by the
+curator does not need an `impl/` PR at all; a slice marked `pr_review`
+gets the full Option-D `impl/<root>-<item>` PR; a slice marked
+`local_review` is reviewed in-process and either auto-merges to the
+trunk or escalates to a PR if the local reviewer flags concerns.
+
+**Cascade effects on other Q's** (now reflected in the briefing):
+
+| Q | How Q1's resolution reshapes it |
+|---|---|
+| Q5 | Auto-merged slices that already landed in `main` change the abandon-trunk option's blast radius. |
+| Q7 | Promoted from "UI grouping labels" to a first-class concept — the planner emits *review intent* per slice, not just labels. Folds into ADR-0008. |
+| Q10 | If the curator says "tiny + safe + auto-merge" for a leaf-only root, the `feature/<root>` trunk may not be needed at all. |
+| Q2 | The plan-PR itself is subject to the same curator decision — sometimes a real `plan/<root>` PR, sometimes a markdown summary, occasionally auto-confirmed for trivial roots. |
+
+**Follow-up actions:**
+
+1. **Dispatch ADR-0008 (review-surface curation)** as a Wave 7 design
+   seat after the remaining Q's are resolved (Q7 is the natural touch
+   point).
+2. **Update Mahler-3's parity audit row #7** wording when ADR-0008's
+   shape is settled (do it in one pass to avoid two amendments).
 
 ---
 

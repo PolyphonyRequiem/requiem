@@ -18,7 +18,7 @@
 
 | # | Slug | Source | Decision needed (one line) |
 |---|------|--------|---------------------------|
-| Q1 | [non-negotiable-7 reading](#q1-non-negotiable-7-reading-strict-mg-prefix-vs-load-bearing) | ADR-0006 OQ1 | Does Mahler-3's non-negotiable #7 require the literal `mg/` prefix (Option A) or a load-bearing read that Option D satisfies? |
+| Q1 | [non-negotiable-7 reading](#q1-non-negotiable-7-reading-strict-mg-prefix-vs-load-bearing) | ADR-0006 OQ1 | **CLOSED 2026-06-01: Option D (load-bearing reading). See "Q1 — closed" below.** |
 | Q2 | [plan-PR realisation](#q2-plan-pr-real-branchpr-vs-markdown-in-the-feature-pr) | ADR-0006 OQ2 | Real `plan/<root>` branch + PR, or markdown in the feature-PR description? |
 | Q3 | [platform meaning for git](#q3-what-does-the-platform-mean-for-git-operations) | ADR-0007 Q-C | Is "platform" the PR-host only (GitHub) with twig-side work-item integration, or a richer cross-platform composite? |
 | Q4 | [ADO auth: PAT vs OIDC](#q4-pat-vs-oidc-for-the-adoclient) | ADR-0007 Q-A | Ship the ADO client with PAT (env var) for v0, or block on OIDC? |
@@ -57,7 +57,35 @@ and can sit at the end.
 
 ## Q1: Non-negotiable #7 reading — strict `mg/` vs load-bearing
 
-### § Decision needed
+> **STATUS: CLOSED 2026-06-01 during Bruckner walkthrough.**
+>
+> **Resolution: Option D (load-bearing reading).** The audit row's wording
+> is amended from `"Merge-group implementation (mg/, impl/) with
+> idempotent re-entry"` to `"Per-item review + integration surface with
+> idempotent re-entry"`.
+>
+> **Reframe captured (Daniel's framing):** MGs were really about
+> *reviewable sets*. Some PRs are small enough to auto-merge without
+> human review; some should not even open a PR at all. The north star is
+> "surface reviews to the user that they're likely to want to care
+> about, at a size that is reasonable" — and that decision should be
+> **agent-tunable**, not a static config knob.
+>
+> **Cascade:** This separates two concerns. ADR-0006 (this file) owns
+> **branch topology** (the chassis). A new **ADR-0008 (review-surface
+> curation)** will own the **reviewable-set policy** (which diffs we
+> surface for review, how, at what size). Q5, Q7, Q10, and Q2 below all
+> have their framing shifted by the reframe; the inline notes in those
+> sections capture how. ADR-0008 will be dispatched as a Wave 7 design
+> seat after the remaining Q's are resolved (Q7 is the natural touch
+> point).
+>
+> See [ADR-0006 → Decision log → Q1](../decisions/0006-merge-group-topology.md)
+> for the canonical record.
+
+---
+
+### § Decision needed (historical)
 Does Mahler-3's non-negotiable #7 ("Merge-group implementation (`mg/`,
 `impl/`) with idempotent re-entry") require the literal `mg/` branch
 prefix — committing us to ADR-0006 Option A — or a load-bearing reading
