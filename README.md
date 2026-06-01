@@ -178,6 +178,63 @@ workflow runs end-to-end with no external dependencies; agents are
 scripted via `FakeProvider` so the demo is reproducible and key-free.
 Real LLM providers ship in Phase B.
 
+Eight test modules; the heaviest is `test_integration_code_review.py`, which promotes the four walking-skeleton scenarios and adds an end-to-end INV-RESTART assertion (truncate the log mid-workflow, prove resume picks up exactly where the engine left off without re-executing committed nodes).
+
+## Design inputs
+
+Requiem inherits its design vocabulary from three pieces of prior work:
+
+1. **[Error-handling deep dive](docs/references/error-handling-deep-dive.md)** — eight Opus-4.7-high analyses + cross-reviewer grilling that codified the invariants Requiem must hold from line one (`INV-RESTART`, `INV-NO-CORRUPT-FORWARD`, the 20-signal domain enum, the discriminated-outcome verb contract, the receipts-as-anti-hallucination pattern, etc.).
+2. **[Polyphony parity inventory](docs/references/polyphony-parity-inventory.md)** — exhaustive catalogue of what polyphony+conductor does today, defining what "no meaningful regression" means in v0.
+3. **[Workflow visualization research](docs/references/workflow-viz-research.md)** + **[platespinner survey](docs/references/platespinner-survey.md)** — state-of-the-art UI design references for the live-traversal view.
+
+## Repo layout
+
+```text
+docs/
+├── north-star.md              # Invariants, terminology, contracts
+├── decisions/                 # ADRs (numbered, dated, immutable once accepted)
+└── references/                # Inherited design inputs from polyphony era
+
+src/
+└── requiem/                   # The engine package (v0.0.1)
+    ├── outcomes.py            # Discriminated outcome union (6 variants)
+    ├── events.py              # Execution-event envelope + emitter
+    ├── persistence.py         # Append-only event log
+    ├── kernel.py              # Data-driven interpreter + resume cursor
+    ├── dsl.py                 # Fluent workflow builder + pydantic model
+    ├── agent.py               # Protocol AgentProvider + FakeProvider
+    ├── toolbelt.py            # Per-tool external-process clients
+    ├── clients/               # Per-tool typed clients (gh, twig, ...)
+    ├── teams.py               # parallel_fork sugar
+    ├── cli.py                 # `requiem` entry point
+    └── workflows/             # Stdlib / example workflows
+        └── code_review_demo.py
+
+tests/                         # Unit tests per module + one integration suite
+```
+
+## Running against PolyphonyRequiem (`gh` auth caveat)
+
+The `GhClient` in `requiem.clients.gh` wraps the `gh` CLI but does **not**
+manage authentication — `gh auth` is `gh`'s job. The development box has
+two `gh` accounts configured:
+
+| Account              | Access to `PolyphonyRequiem/*` |
+|----------------------|--------------------------------|
+| `dangreen_microsoft` (EMU) | locked OUT                |
+| `PolyphonyRequiem`         | active                    |
+
+When running verbs that touch this org, the `PolyphonyRequiem` account
+must be the active one (`gh auth status` to confirm; `gh auth switch` to
+change). If the wrong account is active, the client raises
+`GhAuthError`, which verbs map to `NeedsHuman` — by design, we surface
+to an operator rather than silently retry.
+
+## Naming
+
+**Requiem.** The org [`PolyphonyRequiem`](https://github.com/PolyphonyRequiem) was named in anticipation of this project; the requiem was always coming. Continues the musical-form tradition of polyphony and conductor — and Mozart, Brahms, Verdi, and Fauré (all seats in the squad that designed Requiem's invariants) each wrote a Requiem of their own.
+
 ## License
 
 TBD. Likely MIT, matching polyphony, conductor, and platespinner.
