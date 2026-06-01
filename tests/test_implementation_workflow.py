@@ -57,12 +57,12 @@ class FakeTwig:
     raise_on_comment: Exception | None = None
     comments: list[tuple[int, str]] = field(default_factory=list)
 
-    def show(self, item_id: int) -> TwigItem:
+    async def show_async(self, item_id: int) -> TwigItem:
         if self.raise_on_show is not None:
             raise self.raise_on_show
         return self.item
 
-    def comment(self, item_id: int, message: str) -> None:
+    async def comment_async(self, item_id: int, message: str) -> None:
         if self.raise_on_comment is not None:
             raise self.raise_on_comment
         self.comments.append((item_id, message))
