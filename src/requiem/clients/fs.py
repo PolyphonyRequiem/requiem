@@ -263,6 +263,92 @@ class FilesystemClient:
         sha = await self._git("rev-parse", "HEAD")
         return sha.strip()
 
+    # ---- branch / push helpers (added for Bizet — implementation workflow) ---
+    #
+    # These are deliberately thin wrappers around plumbing commands. The
+    # implementation verbs need to (a) check whether a feature branch
+    # already exists (idempotency on resume), (b) cut a fresh branch from
+    # a base ref, (c) switch onto an existing branch, (d) push with
+    # upstream, and (e) enumerate changed paths for the verdict card.
+    # Each method preserves the L-1 caveat: any non-zero git exit raises
+    # ``FsGitError`` for the verb to translate into NeedsHuman.
+
+    async def git_branch_exists(self, name: str) -> bool:
+        """True iff a local branch named ``name`` exists.
+
+        Uses ``git show-ref --verify --quiet refs/heads/<name>``; exit 0
+        means the ref exists, exit 1 means it doesn't. We swallow exit 1
+        as "no" rather than raising — branch absence is the common case
+        on a fresh run, not an error.
+        """
+        try:
+            await self._git("show-ref", "--verify", "--quiet", f"refs/heads/{name}")
+        except FsGitError as e:
+            if e.returncode == 1:
+                return False
+            raise
+        return True
+
+    async def git_create_branch(self, name: str, from_ref: str) -> None:
+        """Create branch ``name`` from ``from_ref`` and check it out.
+
+        Equivalent to ``git checkout -b <name> <from_ref>``. Fails loud
+        if the branch already exists (use ``git_branch_exists`` first;
+        idempotency is the verb's responsibility).
+        """
+        await self._git("checkout", "-b", name, from_ref)
+
+    async def git_checkout(self, name: str) -> None:
+        """Switch HEAD to existing branch ``name``."""
+        await self._git("checkout", name)
+
+    async def git_push(
+        self, remote: str, branch: str, *, set_upstream: bool = True
+    ) -> None:
+        """Push ``branch`` to ``remote``. ``set_upstream`` adds ``-u``."""
+        argv = ["push"]
+        if set_upstream:
+            argv.append("-u")
+        argv.extend([remote, branch])
+        await self._git(*argv)
+
+    async def git_diff_name_only(self, against: str) -> list[Path]:
+        """Paths changed between ``against`` and HEAD (committed changes only).
+
+        Useful after the commit step to enumerate what the run touched.
+        Empty list means no commits ahead of ``against``.
+        """
+        out = await self._git("diff", "--name-only", f"{against}..HEAD")
+        return [Path(line) for line in out.splitlines() if line.strip()]
+
+    async def git_diff_numstat(
+        self, against: str
+    ) -> list[tuple[Path, int, int]]:
+        """(path, additions, deletions) per file between ``against`` and HEAD.
+
+        Binary files show up as additions=deletions=0 in git's numstat
+        (it emits ``-\t-\tpath``); we coerce both to 0 for those.
+        """
+        out = await self._git("diff", "--numstat", f"{against}..HEAD")
+        rows: list[tuple[Path, int, int]] = []
+        for raw in out.splitlines():
+            if not raw.strip():
+                continue
+            parts = raw.split("\t", 2)
+            if len(parts) != 3:
+                continue
+            adds_s, dels_s, path = parts
+            try:
+                adds = int(adds_s)
+            except ValueError:
+                adds = 0
+            try:
+                dels = int(dels_s)
+            except ValueError:
+                dels = 0
+            rows.append((Path(path), adds, dels))
+        return rows
+
     # ---- internals --------------------------------------------------
 
     def _is_git_tree(self) -> bool:

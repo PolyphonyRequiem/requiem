@@ -121,13 +121,14 @@ class Toolbelt:
 
     git: GitClient
     files: FileClient
-    # The Phase B clients (`gh`, `twig`, `fs`) are optional so workflows
-    # and tests that don't touch them can construct a smaller Toolbelt.
-    # Verbs that need a specific client should fail loud (KeyError /
-    # AttributeError) rather than silently no-op.
+    # The remaining clients are optional so verbs and tests that don't
+    # need them don't have to fabricate one. Verbs that *do* need a
+    # given client should require it explicitly at the call site (a
+    # ``None`` should raise a typed ``PermanentFailure(error_kind=
+    # "toolbelt.missing_client")`` rather than ``AttributeError``).
     gh: GhClient | None = None
-    twig: TwigClient | None = None
     fs: FilesystemClient | None = None
+    twig: TwigClient | None = None
 
     @classmethod
     def real(cls) -> "Toolbelt":
@@ -135,6 +136,6 @@ class Toolbelt:
             git=RealGitClient(),
             files=RealFileClient(),
             gh=GhClient(),
+            fs=FilesystemClient(),
             twig=TwigClient(),
-            fs=None,  # FilesystemClient requires a repo_root; callers bind one.
         )
