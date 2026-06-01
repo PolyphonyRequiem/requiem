@@ -781,6 +781,25 @@ sibling, mg-rethink worktree).
 
 #### Q-C. What does "the platform" mean for git operations?
 
+> **CLOSED 2026-06-01 during Bruckner walkthrough.** Resolution:
+> Option (i) — single `PrPlatform` Protocol selects the PR host (ADO
+> primary, GitHub supported). PR host and work-item tracker are
+> orthogonal concerns; v0 models the PR host with a Protocol and the
+> work-item tracker implicitly (always via `twig`). The "GH PR + ADO
+> work item" topology falls out for free as `platform="github"` with
+> the operator's `twig` config pointed at ADO. If a non-`twig`
+> work-item tracker ever appears (or we want multiple in one run),
+> that's the trigger to introduce a second Protocol
+> (`WorkItemPlatform`). Daniel's framing: "I think it's somewhat
+> orthogonal, yeah" — orthogonality is real and documented, but does
+> not earn a second Protocol today.
+>
+> **Vocabulary clarification for §3:** the audit row's phrase "ADO
+> PR lifecycle" means *PRs hosted in Azure Repos*. The
+> "GH-PR-with-ADO-work-item" topology — Daniel's secondary scenario —
+> is `platform="github"` with twig-side reporting, not a distinct
+> platform value. ADO-end-to-end is the primary v0 target.
+
 `PrPlatform.git_push` today is a method on the Protocol because GitHub's
 PR is on a branch the local repo can push to. For ADO, the same model
 works for repos hosted in Azure Repos (push to
