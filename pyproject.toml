@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "requiem"
+version = "0.0.1"
+description = "Single-process SDLC orchestration engine — successor to polyphony + conductor."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "PolyphonyRequiem" }]
+license = { text = "MIT" }
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "pydantic>=2.5,<3",
+]
+
+[project.optional-dependencies]
+cli = ["rich>=13.0"]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+requiem = "requiem.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/PolyphonyRequiem/requiem"
+Issues = "https://github.com/PolyphonyRequiem/requiem/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

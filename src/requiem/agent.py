@@ -1,0 +1,115 @@
+"""Agent boundary — Mahler A (Protocol `AgentProvider` + `FakeProvider`).
+
+The seam is one method:
+
+    async def invoke(self, call: AgentCall) -> Outcome
+
+There is no ABC, no inheritance requirement. `FakeProvider` satisfies the
+Protocol structurally.
+
+Validation failures produce `BadOutput` (not `PermanentFailure`) so the
+kernel can route them to a remediation branch without triggering a
+network retry.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+from dataclasses import dataclass, field
+from typing import Any, Callable, Protocol, runtime_checkable
+
+from pydantic import BaseModel, ValidationError
+
+from requiem.outcomes import (
+    BadOutput,
+    Cancelled,
+    Outcome,
+    PermanentFailure,
+    RetryableFailure,
+    Success,
+)
+
+
+@dataclass(frozen=True)
+class AgentSpec:
+    name: str
+    charter: str
+    response_model: type[BaseModel]
+    model: str = "fake"
+
+
+@dataclass(frozen=True)
+class AgentCall:
+    spec: AgentSpec
+    user_message: str
+    retry_key: str = ""
+    cancel: asyncio.Event | None = None
+    event_callback: Callable[[str, dict[str, Any]], None] | None = None
+
+
+@runtime_checkable
+class AgentProvider(Protocol):
+    async def invoke(self, call: AgentCall) -> Outcome: ...
+
+
+@dataclass
+class FakeProvider:
+    """Scripted by agent name.
+
+    Each entry in `scripts[agent_name]` is one of:
+
+    * ``dict``    — happy path; validated into ``response_model`` →
+                    ``Success``. Validation failure → ``BadOutput``.
+    * ``Outcome`` — pre-baked outcome returned as-is.
+    """
+
+    scripts: dict[str, list[Any]] = field(default_factory=dict)
+    _cursor: dict[str, int] = field(default_factory=dict, init=False, repr=False)
+    calls: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
+
+    async def invoke(self, call: AgentCall) -> Outcome:
+        if call.cancel is not None and call.cancel.is_set():
+            return Cancelled(cause="operator", at_step=call.spec.name)
+        await asyncio.sleep(0)  # let the cancel test race us
+
+        entries = self.scripts.get(call.spec.name)
+        if not entries:
+            return PermanentFailure(
+                error_kind="fake.unscripted",
+                message=f"no scripts[{call.spec.name!r}]",
+            )
+
+        idx = self._cursor.get(call.spec.name, 0)
+        if idx >= len(entries):
+            return PermanentFailure(
+                error_kind="fake.exhausted",
+                message=(
+                    f"{call.spec.name!r} called {idx + 1}x "
+                    f"but only {len(entries)} scripted"
+                ),
+            )
+        self._cursor[call.spec.name] = idx + 1
+        self.calls.append({"agent": call.spec.name, "retry_key": call.retry_key})
+
+        entry = entries[idx]
+        if call.event_callback:
+            call.event_callback("prompt", {"agent": call.spec.name})
+
+        if isinstance(
+            entry,
+            (Success, RetryableFailure, PermanentFailure, BadOutput, Cancelled),
+        ):
+            return entry
+        if isinstance(entry, dict):
+            try:
+                value = call.spec.response_model.model_validate(entry)
+            except ValidationError as ve:
+                return BadOutput(
+                    error_kind="schema_mismatch",
+                    validation_errors=tuple(str(e) for e in ve.errors()),
+                    raw_output=json.dumps(entry),
+                )
+            return Success(value={"agent": call.spec.name, "parsed": value.model_dump()})
+        raise TypeError(
+            f"FakeProvider got unknown entry shape: {type(entry).__name__}"
+        )

@@ -21,13 +21,40 @@ Requiem is the next-generation SDLC orchestration engine for AI-agent-driven sof
 
 This consolidation dissolves the seam responsible for ~half of the error-handling complexity in polyphony+conductor today — including the three-vocabulary problem, the exit-code contract negotiation, cross-process retry semantics, and the observability gap between engine events and verb outcomes.
 
-## Status: pre-v0 — design phase
+## Status: v0.0.1 — engine promoted, Phase B begins
 
-Requiem is in its **seam-shaping phase** (Phase A of [the v0 roadmap](docs/roadmap.md), TBD).
+Phase A is closed. The integrated walking-skeleton engine lives under `src/requiem/` as a real Python package with a CLI entry point. Phase B (real workflows, real verbs, real UI binding) builds on top of this surface.
 
-In this phase the project produces 2-3 runnable prototypes per load-bearing architectural seam, demonstrated hands-on for product-direction decisions before any production code is written.
+### Quick start
 
-There is no shipping artifact yet. Do not depend on this project.
+```powershell
+pip install -e .[cli]
+requiem describe requiem.workflows.code_review_demo
+requiem run     requiem.workflows.code_review_demo
+requiem events  <run_id_printed_above>
+```
+
+The walking-skeleton's `code-review` workflow ships as a runnable example under `requiem.workflows.code_review_demo`. It exercises every Phase A seam — script verbs, retry-then-succeed, parallel-fork team, structured-output agent, human gate, and event-log resume — in ~90 ms with zero API keys.
+
+### CLI
+
+| Command | What it does |
+|---|---|
+| `requiem run <module>` | Run a workflow by importable module path. |
+| `requiem resume <module> <run_id>` | Resume a partially-finished run from its event log. |
+| `requiem describe <module>` | Print nodes, edges, registered agents. |
+| `requiem events <run_id>` | Print the run's event log with colour hints. `--json` for raw JSONL. |
+
+The `module` argument is any importable Python module that exposes either `build_engine(log_dir) -> Engine` or `build_workflow() -> Workflow`. See `src/requiem/workflows/code_review_demo.py` for the canonical shape.
+
+### Test it
+
+```powershell
+pip install -e .[test]
+pytest
+```
+
+Eight test modules; the heaviest is `test_integration_code_review.py`, which promotes the four walking-skeleton scenarios and adds an end-to-end INV-RESTART assertion (truncate the log mid-workflow, prove resume picks up exactly where the engine left off without re-executing committed nodes).
 
 ## Design inputs
 
@@ -37,19 +64,29 @@ Requiem inherits its design vocabulary from three pieces of prior work:
 2. **[Polyphony parity inventory](docs/references/polyphony-parity-inventory.md)** — exhaustive catalogue of what polyphony+conductor does today, defining what "no meaningful regression" means in v0.
 3. **[Workflow visualization research](docs/references/workflow-viz-research.md)** + **[platespinner survey](docs/references/platespinner-survey.md)** — state-of-the-art UI design references for the live-traversal view.
 
-## Repo layout (provisional — will be reshaped during Phase A)
+## Repo layout
 
 ```text
 docs/
-├── north-star.md              # Invariants, terminology, contracts that survive across decisions
-├── roadmap.md                 # Phase A → D sequencing
+├── north-star.md              # Invariants, terminology, contracts
 ├── decisions/                 # ADRs (numbered, dated, immutable once accepted)
 └── references/                # Inherited design inputs from polyphony era
 
-prototypes/                    # Phase A artifacts — throwaway by design
-└── <seam>/<variant>/          # Runnable demos for hands-on review
+src/
+└── requiem/                   # The engine package (v0.0.1)
+    ├── outcomes.py            # Discriminated outcome union (6 variants)
+    ├── events.py              # Execution-event envelope + emitter
+    ├── persistence.py         # Append-only event log
+    ├── kernel.py              # Data-driven interpreter + resume cursor
+    ├── dsl.py                 # Fluent workflow builder + pydantic model
+    ├── agent.py               # Protocol AgentProvider + FakeProvider
+    ├── toolbelt.py            # Per-tool external-process clients
+    ├── teams.py               # parallel_fork sugar
+    ├── cli.py                 # `requiem` entry point
+    └── workflows/             # Stdlib / example workflows
+        └── code_review_demo.py
 
-# (Phase B+ structure TBD — engine, ui, verbs, harness, etc.)
+tests/                         # Unit tests per module + one integration suite
 ```
 
 ## Naming
