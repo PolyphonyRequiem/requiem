@@ -215,6 +215,11 @@ class FakeTwigClient:
             raise TwigItemNotFoundError(f"fake: item {item_id} not found")
         return self.items[item_id]
 
+    async def show_async(self, item_id: int) -> TwigItem:
+        # Planning's TwigClientProto requires the async surface (per Tchaikovsky's
+        # bug-bash fix in PR #32). Mirror sync for in-memory fakes.
+        return self.show(item_id)
+
 
 # ---- manifest helpers --------------------------------------------------
 
