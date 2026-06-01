@@ -80,6 +80,22 @@ class FakeTwigClient:
             raise entry
         return entry
 
+    def show(self, item_id: int) -> TwigItem:
+        """Sync mirror of ``show_async`` for sync verbs.
+
+        Added so this fake also satisfies
+        ``requiem.workflows.root_dispatch.TwigClientProto``, whose
+        ``fetch_item`` verb calls ``twig.show(item_id)`` synchronously
+        (see Wave 5 / Schoenberg drift sentinel).
+        """
+        self.show_calls.append(item_id)
+        entry = self.items.get(item_id)
+        if entry is None:
+            raise TwigItemNotFoundError(f"no fake item for id={item_id}")
+        if isinstance(entry, BaseException):
+            raise entry
+        return entry
+
     async def set_state_async(self, item_id: int, new_state: str) -> TwigItem:
         entry = self.items.get(item_id)
         if entry is None or isinstance(entry, BaseException):
