@@ -191,13 +191,15 @@ def _register_dispatch_shim() -> None:
     def build_engine(log_dir: Path) -> Engine:
         from requiem.workflows import root_dispatch
         inputs = _current_inputs()
-        di = root_dispatch.DispatchInputs(
+        di = root_dispatch.RootDispatchInputs(
             item_id=inputs.item_id,
             repo=inputs.repo,
             auto_plan=False,
-            today=inputs.today,
+            dry_run=inputs.dry_run,
         )
-        return _install_observer(root_dispatch.build_engine(log_dir, inputs=di))
+        return _install_observer(
+            root_dispatch.build_engine(log_dir, inputs=di, today=inputs.today)
+        )
 
     mod.build_engine = build_engine  # type: ignore[attr-defined]
     sys.modules[SHIM_DISPATCH] = mod
