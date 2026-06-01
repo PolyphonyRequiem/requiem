@@ -67,6 +67,7 @@ Thumbs.db
 
 # --- Local runtime state ---
 .requiem/
+.runs/
 *.events.jsonl
 *.notifications.jsonl
 *.log
@@ -77,3 +78,6 @@ Thumbs.db
 .env.*.local
 *.pem
 *.key
+
+# Local run artifacts (alongside *.events.jsonl)
+.runs/

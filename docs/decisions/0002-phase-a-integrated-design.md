@@ -140,7 +140,10 @@ future challenge. Detail in the PR READMEs.
 
 ### Open invariant candidates (surfaced during Phase A; pending ADR)
 
-- "Sub-workflows must filter `last_completed_node()` by `run_id`" (Brahms-harness PR #6)
+- ~~"Sub-workflows must filter `last_completed_node()` by `run_id`" (Brahms-harness PR #6)~~
+  **Resolved** by ADR 0005 (Berlioz Phase B). Now codified as
+  `INV-SUBWORKFLOW-LOG-ISOLATION` in [`docs/north-star.md`](../north-star.md);
+  pinned by `tests/test_subworkflow.py::test_reconstruct_filters_foreign_run_id_events`.
 - "Gate resume reads the *resolved choice*, not the recorded outcome key" (Beethoven PR #7)
 
 These become candidates for north-star §2 amendment in a follow-up ADR.

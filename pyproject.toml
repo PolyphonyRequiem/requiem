@@ -21,13 +21,22 @@ dependencies = [
 
 [project.optional-dependencies]
 cli = ["rich>=13.0"]
+anthropic = ["anthropic>=0.30"]
+openai = ["openai>=1.40"]
+llm = ["anthropic>=0.30", "openai>=1.40"]
 test = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "anthropic>=0.30",
+    "openai>=1.40",
+    "httpx>=0.27",
 ]
 
 [project.scripts]
 requiem = "requiem.cli:main"
+
+[project.entry-points.pytest11]
+requiem-harness = "requiem.harness.pytest_plugin"
 
 [project.urls]
 Homepage = "https://github.com/PolyphonyRequiem/requiem"

@@ -51,6 +51,11 @@ The engine does not initiate abandonment. Retry exhaustion routes to *surrender*
 
 > *Why load-bearing:* this closes the "what is abandonment" question definitively. The engine refuses to make irreversible decisions on the operator's behalf.
 
+### INV-SUBWORKFLOW-LOG-ISOLATION
+A sub-workflow's events live in its own `{sub_run_id}.events.jsonl` file. The parent's event log records only `subworkflow_started` / `subworkflow_completed` / `subworkflow_cancelled` markers — never the child's per-step events. `_reconstruct` filters by envelope `run_id`, so even if a child's events somehow bled into the parent's log they cannot advance the parent's cursor. Each engine owns one log file.
+
+> *Why load-bearing:* without this, recursive workflows (planning that calls planning) cross-contaminate cursors on resume, and INV-RESTART becomes unprovable across nesting layers. Brahms-harness PR #6 surfaced this as a candidate during Phase A; ADR 0005 (sub-workflow invocation primitive) made it law.
+
 ---
 
 ## §3 Vocabulary
@@ -104,3 +109,48 @@ The invariants in §2 are derived from prior analyses captured in [`docs/referen
 - **workflow-viz-research.md** — state-of-the-art reference for the UI's visual primitives and layout.
 
 When in doubt, the deep-dive reviews (Boulez + Ravel) define the bar for adding to or changing §2.
+
+---
+
+## §7 Invariant candidates from Rachmaninov
+
+> Surfaced by the Phase B / Rachmaninov resume-fidelity matrix (`tests/test_resume_fidelity.py`, `tests/test_resume_fidelity_matrix.py`, `tests/test_resume_pathological.py`). Each candidate is either (a) a documented gap where the kernel's *actual* behaviour deserves to be promoted to an absolute invariant after a Boulez/Ravel-grade review, or (b) a tension between the brief's speculated invariant and what INV-NO-CORRUPT-FORWARD actually implies. Each carries a regression-pin test today so any future change is intentional.
+
+### INV-PARTIAL-LINE-DROP *(candidate; strict-stop adopted instead)*
+A partial JSON line at the end of the event log is **not** silently dropped — the kernel raises `CorruptLogError`. This is the strict-stop reading of `INV-NO-CORRUPT-FORWARD`: silently eliding bytes risks dropping a `verb_completed` whose absence would cause re-execution of an already-mutating verb, violating `INV-RESTART` idempotency. The brief's "drop and resume" framing is rejected in favour of strict-stop until a stronger argument lands.
+
+*Pinned by:* `tests/test_resume_pathological.py::test_truncated_mid_line_refuses_to_resume` and `tests/test_resume_fidelity.py::test_m1_truncate_mid_line_refuses_to_resume`.
+
+### INV-FIRST-EVENT-WINS *(candidate; current behaviour is last-wins)*
+Two envelopes with the same `event_id` are processed by `_reconstruct` as a positional fold — the *later* envelope's state overwrites the earlier. The brief proposed first-wins as the desired invariant. Neither is enforced today; promotion requires duplicate-detection at the `EventStore.append` layer.
+
+*Pinned by:* `tests/test_resume_pathological.py::test_duplicate_event_ids_documented_behaviour`.
+
+### INV-MONOTONIC-EVENT-ID *(candidate; not enforced today)*
+Out-of-order `event_id` values are not detected; the fold processes the log positionally and ignores `event_id`. Promotion to an absolute invariant requires `_reconstruct` to validate `event_id == previous_event_id + 1` and raise `CorruptLogError` on violation.
+
+*Pinned by:* `tests/test_resume_pathological.py::test_out_of_order_event_ids_documented_behaviour`.
+
+### INV-RUN-ID-FILTER *(candidate; satisfied at the path layer today)*
+Multiple runs in the same `log_dir` write to *separate* `{run_id}.events.jsonl` files. Cross-contamination by `run_id` is impossible at the path layer; the kernel never reads a log file belonging to a different run. Promotion to an absolute invariant would require explicit `run_id` filtering inside `replay` to defend against a future shared-log mode.
+
+*Pinned by:* `tests/test_resume_pathological.py::test_run_id_isolation_at_path_layer`.
+
+### INV-NO-OUTCOME-FROM-INCOMPLETE-NODE *(candidate; satisfied today)*
+A node whose `verb_completed` is missing from the log is treated as not-entered for the purpose of `completed[node_id]`. On resume the cursor lands at `_AtNode(node, attempt)` and the verb re-executes. This is what `_reconstruct` does today — only `verb_completed` populates `completed`, not `node_entered` — and is what makes the truncate-at-every-event matrix possible. Promotion to an absolute invariant signals that no future cursor state may "remember" a verb whose outcome wasn't durably logged.
+
+*Pinned by:* the full `test_truncate_at_every_event_reaches_same_terminal` matrix and the explicit per-class tests in `test_resume_fidelity_matrix.py`.
+
+### INV-EMPTY-LOG-IS-FRESH, INV-MISSING-LOG-IS-FRESH *(candidates; current behaviour)*
+A zero-byte log file or a missing log file is treated as a fresh run. The Rachmaninov brief speculated the missing-log case should raise; the kernel does not, because the same `Engine.run(run_id)` API serves both first-time runs and resumes. A future `Engine.resume(run_id)` API distinct from `Engine.run` could flip the missing-log case to strict-raise without breaking first-time runs.
+
+*Pinned by:* `tests/test_resume_pathological.py::test_empty_log_starts_fresh` and `::test_missing_log_starts_fresh`.
+
+### INV-CANCEL-RESUME-IDEMPOTENT *(candidate; not satisfied today)*
+A run that has reached `terminal=cancelled` re-emits `run_completed("cancelled")` every time it is resumed. The disposition the operator cares about (`cancelled`) is stable, but the log grows by one event per resume — a violation of byte-idempotency for the terminal state. Promotion to an absolute invariant requires `_pending_cancel` to consult whether the cancel has already produced a `run_completed`.
+
+*Pinned by:* `tests/test_resume_fidelity.py::test_m4_cancel_mid_flight_short_circuits` (asserts the documented `+1` quirk explicitly so a fix is visible).
+
+---
+
+## §6 Decision provenance

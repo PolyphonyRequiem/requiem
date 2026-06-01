@@ -274,6 +274,7 @@ _PR_FIELDS: Final[tuple[str, ...]] = (
     "title",
     "state",
     "mergedAt",
+    "mergeCommit",
     "headRefName",
     "baseRefName",
     "url",

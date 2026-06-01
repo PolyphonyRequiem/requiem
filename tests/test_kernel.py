@@ -111,7 +111,7 @@ def test_reconstruct_after_gate_opened_awaits_gate():
             payload={"prompt": "?", "options": ["y", "n"]}),
     ]
     cursor, _ = _reconstruct(events, entry="start")
-    assert cursor == _AwaitingGate("g")
+    assert cursor == _AwaitingGate("g", prompt="?", options=("y", "n"))
 
 
 def test_reconstruct_after_gate_resolved_routes_gate():
