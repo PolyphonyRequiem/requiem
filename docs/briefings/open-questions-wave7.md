@@ -37,7 +37,7 @@
 |---|------|--------|---------------------------|
 | Q1 | [non-negotiable-7 reading](#q1-non-negotiable-7-reading-strict-mg-prefix-vs-load-bearing) | ADR-0006 OQ1 | **CLOSED 2026-06-01: Option D (load-bearing reading). See "Q1 — closed" below.** |
 | Q2 | [plan-PR realisation](#q2-plan-pr-real-branchpr-vs-markdown-in-the-feature-pr) | ADR-0006 OQ2 | **CLOSED 2026-06-01: build the plan-PR capability; cut/gate/persist policy → ADR-0008. See "Q2 — closed" below.** |
-| Q3 | [platform meaning for git](#q3-what-does-the-platform-mean-for-git-operations) | ADR-0007 Q-C | Is "platform" the PR-host only (GitHub) with twig-side work-item integration, or a richer cross-platform composite? |
+| Q3 | [platform meaning for git](#q3-what-does-the-platform-mean-for-git-operations) | ADR-0007 Q-C | **CLOSED 2026-06-01: Option (i) — single `PrPlatform` Protocol; PR host and work-item tracker are orthogonal but only the former gets a Protocol in v0. See "Q3 — closed" below.** |
 | Q4 | [ADO auth: PAT vs OIDC](#q4-pat-vs-oidc-for-the-adoclient) | ADR-0007 Q-A | Ship the ADO client with PAT (env var) for v0, or block on OIDC? |
 | Q5 | [atomic co-merge recovery](#q5-how-strict-is-the-atomic-co-merge-guarantee-when-one-leaf-fails-mid-trunk) | ADR-0006 OQ3 | Abandon-trunk-and-restart, or roll-forward with a human gate, when one leaf fails after siblings landed? |
 | Q6 | [replan mid-flight in scope](#q6-is-replan-mid-flight-in-scope-for-v0) | ADR-0006 OQ4 | Is mid-flight replan in scope for v0 (implies stable planner-declared item ids)? |
@@ -274,7 +274,38 @@ deciding to half-ship non-negotiable #6.
 
 ## Q3: What does "the platform" mean for git operations?
 
-### § Decision needed
+> **STATUS: CLOSED 2026-06-01 during Bruckner walkthrough.**
+>
+> **Resolution: Option (i) — single `PrPlatform` Protocol selects the
+> PR host.** ADO is the primary v0 target; GitHub is supported.
+> `AdoClient` gets built as a net-new component (REST via `httpx` per
+> Britten §5.6). The existing GH-only `pr_lifecycle.py` becomes one
+> of two implementations behind the Protocol.
+>
+> **Orthogonality documented, not coded:** PR host and work-item
+> tracker are orthogonal concerns. v0 models the PR host with a
+> Protocol and the work-item tracker implicitly (always via `twig`,
+> which already abstracts ADO + GitHub work items internally). The
+> "GH PR + ADO work item" topology falls out for free as
+> `platform="github"` with the operator's `twig` config pointed at
+> ADO. Daniel's framing: *"I think it's somewhat orthogonal, yeah"* —
+> orthogonality is real and worth naming, but does not earn a second
+> Protocol today.
+>
+> **Vocabulary clarification for ADR-0007 §3 / audit row:** "ADO PR
+> lifecycle" means *PRs hosted in Azure Repos*. The
+> "GH-PR-with-ADO-work-item" topology is not a distinct platform value.
+>
+> **Future trigger for `WorkItemPlatform` (second Protocol):** a
+> non-`twig` work-item tracker appears, or we want to vary the
+> work-item tracker independently of `twig`. Not in scope for v0.
+>
+> See [ADR-0007 → Q-C closure](../decisions/0007-pr-lifecycle-architecture.md)
+> for the canonical record.
+
+---
+
+### § Decision needed (historical)
 When `PrPlatform` is selected as `"github"` or `"ado"`, does that selection
 refer only to where the PR lives (and the work item is handled separately
 via twig), or does Requiem need a richer composite mode for "GitHub PR
