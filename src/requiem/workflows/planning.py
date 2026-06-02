@@ -190,6 +190,23 @@ class ChildPlan(BaseModel):
     (set a child's ``item_id`` equal to an ancestor's).
     """
 
+    review_group: str | None = None
+    """Optional planner-assigned grouping label for related leaves.
+
+    The planner *may* set this when it perceives a natural grouping among
+    implementable children (e.g. ``"data-layer"`` / ``"ui-layer"``); a
+    review surface can then cluster the corresponding impl PRs by group.
+    Absence is a valid no-op and the planner is never required to assign
+    one. The value is deliberately **not** validated against a closed
+    enum in v0 — it is a free-form curation hint, not a contract.
+
+    This is the lightweight seed of the agent-driven review-surface
+    curation policy (ADR-0006 §Q7); the richer cut / gate / persist /
+    review-surface decisions live in ADR-0008. It has **no**
+    branch-topology impact — it is a planner-output schema field plus a
+    downstream render hint.
+    """
+
 
 class PlannerOutput(BaseModel):
     summary: str
@@ -869,7 +886,11 @@ def _write_plan_sidecar(
         body.append("## Proposed children (v0: proposals only, not yet committed)")
         body.append("")
         for c in planner["children"]:
-            body.append(f"- [{c['work_item_type']}] {c['title']} — {c['description']}")
+            line = f"- [{c['work_item_type']}] {c['title']} — {c['description']}"
+            group = c.get("review_group")
+            if group:
+                line += f"  _(review group: {group})_"
+            body.append(line)
     path.write_text("\n".join(body) + "\n", encoding="utf-8")
     return path
 

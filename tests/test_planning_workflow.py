@@ -246,6 +246,103 @@ async def test_decomposable_three_children(log_dir: Path):
     ]
 
 
+# ---- Q7: optional review_group label (ADR-0006 §Q7) --------------------
+
+
+def test_child_plan_review_group_optional_and_unvalidated():
+    """`review_group` defaults to None, accepts any free-form string (no
+    closed enum), and legacy planner JSON omitting the field still
+    validates — the forward-compatibility the Q7 decision turns on."""
+    from requiem.workflows.planning import ChildPlan, PlannerOutput
+
+    bare = ChildPlan(title="t", description="d", work_item_type="Task")
+    assert bare.review_group is None
+
+    labelled = ChildPlan(
+        title="t",
+        description="d",
+        work_item_type="Task",
+        review_group="data-layer",
+    )
+    assert labelled.review_group == "data-layer"
+
+    # Deliberately not constrained to a closed enum in v0.
+    odd = ChildPlan(
+        title="t",
+        description="d",
+        work_item_type="Task",
+        review_group="anything-goes 123",
+    )
+    assert odd.review_group == "anything-goes 123"
+
+    # Legacy planner output (field absent everywhere) still validates.
+    legacy = PlannerOutput.model_validate(
+        {
+            "summary": "s",
+            "decomposable": True,
+            "children": [
+                {"title": "t", "description": "d", "work_item_type": "Task"}
+            ],
+            "estimated_complexity": "small",
+            "rationale": "r",
+        }
+    )
+    assert legacy.children[0].review_group is None
+
+
+async def test_review_group_round_trips_into_plan_tree(log_dir: Path):
+    """A planner-assigned `review_group` survives into the
+    `.plan.tree.json` proposals; an unlabelled sibling carries None.
+
+    This is the dashboard render hint surfacing end-to-end (ADR-0006 §Q7)
+    with no branch-topology involvement.
+    """
+    planner_output = _decomposable_planner_output()
+    planner_output["children"][0]["review_group"] = "enum-layer"
+    planner_output["children"][1]["review_group"] = "enum-layer"
+    # Third child intentionally left unlabelled to prove optionality.
+
+    provider = FakeProvider(
+        scripts={
+            "planner": [
+                planner_output,
+                _leaf_planner_output(),
+                _leaf_planner_output(),
+                _leaf_planner_output(),
+            ],
+            "plan_reviewer": [
+                {"verdict": "approve", "feedback": "Good cuts."},
+                {"verdict": "approve", "feedback": "ok."},
+                {"verdict": "approve", "feedback": "ok."},
+                {"verdict": "approve", "feedback": "ok."},
+            ],
+        }
+    )
+    twig = _twig()
+    for slot in (1, 2, 3):
+        child_id = ITEM_ID * 100 + slot
+        twig.items[child_id] = TwigItem(
+            id=child_id,
+            title=f"Child slot {slot}",
+            state="New",
+            area_path="Polyphony\\Engine",
+            work_item_type="Task",
+            parent_id=ITEM_ID,
+            raw={},
+        )
+    engine = build_engine(log_dir, item_id=ITEM_ID, twig=twig, provider=provider)
+    result = await engine.run("rg")
+    assert isinstance(result, Completed), result
+
+    tree = log_dir / "rg.plan.tree.json"
+    assert tree.exists(), f"plan.tree.json missing; dir={list(log_dir.iterdir())}"
+    payload = json.loads(tree.read_text(encoding="utf-8"))
+    groups = {p["title"]: p.get("review_group") for p in payload["proposals"]}
+    assert groups["Define ErrorKind enum"] == "enum-layer"
+    assert groups["Migrate verbs to ErrorKind"] == "enum-layer"
+    assert groups["Update tests"] is None
+
+
 # ---- revise loop -------------------------------------------------------
 
 
