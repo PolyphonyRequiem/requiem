@@ -159,16 +159,16 @@ whether those decisions are encoded *somewhere* in Requiem.
 | -- | --- | --- | --- |
 | 1 | Type-agnostic routing from process config | ❌ missing | No `.requiem-config/` / process-config loader exists; ADO type names are referenced inline (`root_dispatch` validates against `Epic`/`Feature` literals) |
 | 2 | Polyphony CLI as deterministic decision layer (JSON stdout) | 🔵 better | Replaced by in-process Python verbs returning discriminated outcomes (INV-DISCRIMINATED-OUTCOMES). The *requirement underneath* — deterministic decisions — is honoured |
-| 3 | `twig` as write-side bridge to ADO | 🟡 partial | `TwigClient` has show/comment/set_state. Missing `create_child_async` (blocks recursive plan seeding) and PR-link surfacing (issue #30) |
+| 3 | `twig` as write-side bridge to ADO | 🟡 partial | `TwigClient` has show/comment/set_state/`create_child_async` (used by `commit_plan` seeding, PR #59). PR-link surfacing still rough (issue #30) |
 | 4 | Root SDLC orchestrator (`polyphony@polyphony`) | 🟡 partial | `full_sdlc.py` is a five-stage linear pipeline; not a tree-walking root with batch dispatch or outer iterate-until-stable loop |
 | 5 | Per-item worktree isolation for parallel dispatch | ❌ missing | No worktree primitive; no parallel dispatch; sub-workflow children run sequentially |
-| 6 | Recursive planning with child seeding and PR lifecycle | 🟡 partial | Recursion ✅. Child seeding into ADO ❌ (no `twig.create_child_async` call). Plan PR open/merge ❌ |
+| 6 | Recursive planning with child seeding and PR lifecycle | ✅ at-parity | Recursion ✅. Child seeding into ADO ✅ (`commit_plan`, PR #59, ADR-0011). Plan PR open + handoff ✅ (`plan_pr`, PR #60, ADR-0012); merge owned by `pr_lifecycle` (GitHub) |
 | 7 | Merge-group implementation (`mg/`, `impl/`) with idempotent re-entry | ❌ missing | `implementation.py` uses a single `feature/<item_id>` branch; no `mg/` or `impl/` topology |
 | 8 | Human gates in both terminal and web dashboard | 🟡 partial | Terminal ✅. Web ❌ |
 | 9 | Durable seed manifest for partial-seed recovery | ✅ at-parity | `root_dispatch.write_manifest` is idempotent read-or-create; INV-RESTART covers re-entry |
 | 10 | Platform-specific PR lifecycles (GitHub and ADO) | 🟡 partial | GitHub ✅ (`pr_lifecycle.py`). ADO ❌ (no `ado_pr` module) |
 
-**Scorecard:** 1 ✅ at-parity, 1 🔵 better, 5 🟡 partial, 3 ❌ missing. **Five of ten** non-negotiables have material work remaining.
+**Scorecard:** 2 ✅ at-parity, 1 🔵 better, 4 🟡 partial, 3 ❌ missing. **Four of ten** non-negotiables have material work remaining. (#6 closed by PRs #59 + #60.)
 
 ---
 
