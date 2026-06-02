@@ -41,7 +41,7 @@
 | Q4 | [ADO auth: PAT vs OIDC](#q4-pat-vs-oidc-for-the-adoclient) | ADR-0007 Q-A | **CLOSED 2026-06-01: OIDC required (PAT not supported in primary v0 org). See "Q4 — closed" below.** |
 | Q5 | [atomic co-merge recovery](#q5-how-strict-is-the-atomic-co-merge-guarantee-when-one-leaf-fails-mid-trunk) | ADR-0006 OQ3 | **CLOSED 2026-06-01: curator-decided recovery; human-gate roll-forward a required menu option; abandon-trunk is terminal, not default. See "Q5 — closed" below.** |
 | Q6 | [replan mid-flight in scope](#q6-is-replan-mid-flight-in-scope-for-v0) | ADR-0006 OQ4 | **CLOSED 2026-06-01: in scope but narrowly gated to CRITICAL-class invalidity (speckit severity ladder); stable item ids now in-scope for v0. See "Q6 — closed" below.** |
-| Q7 | [review-group labels](#q7-should-the-planner-emit-review_group-labels) | ADR-0006 OQ5 | Does the planner emit `review_group: "data-layer"`-style UI labels (no branch impact)? |
+| Q7 | [review-group labels](#q7-should-the-planner-emit-review_group-labels) | ADR-0006 OQ5 | **CLOSED 2026-06-01: optional `review_group: str \| None` on `ChildPlan`; planner may set, dashboard clusters when present, no branch impact; seeds ADR-0008. See "Q7 — closed" below.** |
 | Q8 | [same-root run-lock UX](#q8-same-root-run-lock-ux-refuse-or-attach) | ADR-0006 OQ6 | Refuse-or-attach (polyphony's behaviour) or plain refusal when a fresh run hits an existing trunk? |
 | Q9 | [drift-rebase location](#q9-where-does-the-rebase-featureroot-onto-main-verb-live) | ADR-0007 Q-B | Where does `rebase feature/<root> onto main` live — `implementation.py` exit, a new `merge_group.py`, or `pr_lifecycle.py` entry? |
 | Q10 | [leaf-only degenerate case](#q10-should-featureitem_id-survive-for-the-leaf-only-root) | ADR-0006 OQ7 | When the root *is* a leaf, do we collapse to today's `feature/<item>` shape or pay the consistency tax? |
@@ -654,6 +654,16 @@ ids without a replan use case are pure overhead.
 ---
 
 ## Q7: Should the planner emit `review_group` labels?
+
+> **CLOSED 2026-06-01 — optional label.** Add an optional
+> `review_group: str | None` field to `ChildPlan`. The planner *may* set
+> it when it perceives a grouping; the dashboard clusters impl PRs by
+> group when present; absence is a valid no-op. Not required, not
+> enum-validated in v0. **No branch-topology impact.** Daniel: *"probably
+> a good idea, yes. optional label."* This is the seed of the agent-driven
+> review-surface curation policy (ADR-0008), realising the Q1 reframe; a
+> review group is best modelled as a set of the stable item ids made
+> REQUIRED in Q6. Recorded in ADR-0006 Decision log → Q7.
 
 ### § Decision needed
 Even without nested `mg/` branches, should the planner emit a
