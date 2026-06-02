@@ -575,7 +575,11 @@ under "Decision log" below as they close.
    policy menu. Abandon-trunk becomes one selectable (terminal) recovery
    action, not the default. See "Decision log → Q5" below.
 
-4. **Replan mid-flight: in scope for v0?** — OPEN. Tracked as Q6.
+4. **Replan mid-flight: in scope for v0?** — **CLOSED 2026-06-01.**
+   Resolution: in scope, but **narrowly gated** — replan fires only on a
+   CRITICAL-class invalidity (per speckit's severity ladder) discovered
+   after impl began. Requires stable planner-declared item ids (now
+   in-scope for v0). See "Decision log → Q6" below.
 
 5. **Should the planner declare review-group labels?** — OPEN; **scope
    shifted** by the Q1 reframe. The reviewable-set decision is no longer
@@ -772,6 +776,60 @@ plan-artifact policy. Same pattern: agent evaluates → deterministic
 action against policy, with human-gate as a guaranteed fallback.
 
 ---
+
+### Q6 (closed 2026-06-01) — replan mid-flight, narrowly gated to CRITICAL invalidity
+
+**Decision:** Mid-flight replan **is** in scope for v0, but gated behind a
+CRITICAL-class invalidity trigger. The plan is otherwise frozen once impl
+begins; only a *fundamental* invalidity discovered after impl started
+earns a re-decomposition.
+
+**Daniel's framing:** *"replanning midflight is only in scope if
+something about the plan is found to be fundamentally invalid. We should
+get concrete about what that means."*
+
+**"Fundamentally invalid" defined concretely — adopt speckit's CRITICAL
+severity definition** (from `/speckit.analyze` + `/speckit.plan` gate
+semantics). A plan is fundamentally invalid (→ replan) only when one of
+these holds:
+
+| Trigger | Speckit analogue | Why it's structural, not patchable |
+|---|---|---|
+| Constitution / invariant violation surfaced mid-impl | analyze CRITICAL — MUST violation | the decomposition placed work where it can't legally live; no leaf-level fix is legal. |
+| Foundational assumption falsified | plan ERROR — a resolved `NEEDS CLARIFICATION` proves false | every downstream leaf inherits the false premise; patching one leaf doesn't repair the premise. |
+| Dependency structure proven impossible | analyze CRITICAL — ordering contradiction | a cycle / unsatisfiable ordering in the leaf graph; structural, not a leaf bug. |
+| Baseline-blocking coverage gap | analyze CRITICAL — zero-coverage requirement blocking baseline | a required leaf was omitted entirely; the gap is in the plan shape, not in an existing leaf. |
+
+**Non-triggers (HIGH and below → Q5 roll-forward within the existing
+plan structure, NEVER replan):** buggy leaf code (retry/patch), reviewer
+wants cleaner naming or smaller diffs (patch), sibling merge conflict
+(rebase+retry), "this could be nicer" (defer/patch). Speckit's rule
+holds: CRITICAL blocks; HIGH-and-below may proceed.
+
+**Structural consequences:**
+
+1. **Stable planner-declared item ids are now REQUIRED for v0** (not
+   merely reserved). Narrow-replan means the executor must reconcile a
+   new plan against existing impl branches: keep completed leaf A, retire
+   the invalidated leaf, add replacement leaves (B1/B2). Without stable
+   ids the executor can't tell "same leaf A" from "new leaf." This is
+   polyphony's P7 stable-MG-ids requirement, scoped down to ids-only.
+
+2. **Detection owner: both-layered.**
+   - Adopt speckit's CRITICAL definition as the **contract** for what
+     "fundamentally invalid" means (not vibes — the table above).
+   - Make **replan a Q5 recovery-menu action**, selectable *only* when a
+     CRITICAL-class finding is present, and human-gateable (the operator
+     confirms the replan per Q5's required roll-forward option).
+
+**Cross-references:** depends on Q5 (replan is a recovery-menu action);
+feeds Q7 (stable ids interact with review-group labels); the CRITICAL
+contract is a candidate adoption point for a broader **spec-kit
+alignment** investigation (see ADR-0009, forthcoming).
+
+---
+
+## References
 
 ### North-star invariants (in priority order for this decision)
 - **INV-EVENT-LOG-AUTHORITATIVE** — [north-star §2](../north-star.md).

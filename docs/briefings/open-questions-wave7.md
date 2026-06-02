@@ -40,7 +40,7 @@
 | Q3 | [platform meaning for git](#q3-what-does-the-platform-mean-for-git-operations) | ADR-0007 Q-C | **CLOSED 2026-06-01: Option (i) — single `PrPlatform` Protocol; PR host and work-item tracker are orthogonal but only the former gets a Protocol in v0. See "Q3 — closed" below.** |
 | Q4 | [ADO auth: PAT vs OIDC](#q4-pat-vs-oidc-for-the-adoclient) | ADR-0007 Q-A | **CLOSED 2026-06-01: OIDC required (PAT not supported in primary v0 org). See "Q4 — closed" below.** |
 | Q5 | [atomic co-merge recovery](#q5-how-strict-is-the-atomic-co-merge-guarantee-when-one-leaf-fails-mid-trunk) | ADR-0006 OQ3 | **CLOSED 2026-06-01: curator-decided recovery; human-gate roll-forward a required menu option; abandon-trunk is terminal, not default. See "Q5 — closed" below.** |
-| Q6 | [replan mid-flight in scope](#q6-is-replan-mid-flight-in-scope-for-v0) | ADR-0006 OQ4 | Is mid-flight replan in scope for v0 (implies stable planner-declared item ids)? |
+| Q6 | [replan mid-flight in scope](#q6-is-replan-mid-flight-in-scope-for-v0) | ADR-0006 OQ4 | **CLOSED 2026-06-01: in scope but narrowly gated to CRITICAL-class invalidity (speckit severity ladder); stable item ids now in-scope for v0. See "Q6 — closed" below.** |
 | Q7 | [review-group labels](#q7-should-the-planner-emit-review_group-labels) | ADR-0006 OQ5 | Does the planner emit `review_group: "data-layer"`-style UI labels (no branch impact)? |
 | Q8 | [same-root run-lock UX](#q8-same-root-run-lock-ux-refuse-or-attach) | ADR-0006 OQ6 | Refuse-or-attach (polyphony's behaviour) or plain refusal when a fresh run hits an existing trunk? |
 | Q9 | [drift-rebase location](#q9-where-does-the-rebase-featureroot-onto-main-verb-live) | ADR-0007 Q-B | Where does `rebase feature/<root> onto main` live — `implementation.py` exit, a new `merge_group.py`, or `pr_lifecycle.py` entry? |
@@ -555,7 +555,48 @@ operator can choose abandon at the gate, so deferring (a) costs nothing.
 
 ## Q6: Is replan mid-flight in scope for v0?
 
-### § Decision needed
+> **STATUS: CLOSED 2026-06-01 during Bruckner walkthrough.**
+>
+> **Resolution: in scope, but narrowly gated.** Mid-flight replan fires
+> only on a **CRITICAL-class invalidity** discovered after impl began.
+> The plan is otherwise frozen once impl starts.
+>
+> **Daniel's framing:** *"replanning midflight is only in scope if
+> something about the plan is found to be fundamentally invalid. We
+> should get concrete about what that means."*
+>
+> **"Fundamentally invalid" = speckit's CRITICAL severity** (adopted
+> from `/speckit.analyze` + `/speckit.plan` gate semantics). Triggers:
+> (1) constitution/invariant violation surfaced mid-impl; (2) a
+> foundational assumption (a resolved `NEEDS CLARIFICATION`) falsified;
+> (3) dependency structure proven impossible (cycle / unsatisfiable
+> ordering); (4) baseline-blocking coverage gap (a required leaf
+> omitted). Everything HIGH-and-below (buggy leaf, naming nits, sibling
+> conflict, "could be nicer") routes to **Q5 roll-forward within the
+> existing plan**, never replan.
+>
+> **Structural consequences:**
+> 1. **Stable planner-declared item ids are now REQUIRED for v0** (not
+>    just reserved) — the executor must reconcile a new plan against
+>    existing impl branches (keep completed leaf, retire invalidated,
+>    add replacements). Polyphony's P7, scoped to ids-only.
+> 2. **Detection owner: both-layered** — adopt speckit's CRITICAL
+>    definition as the *contract*, and make replan a Q5 recovery-menu
+>    action selectable only when a CRITICAL-class finding is present;
+>    human-gateable.
+>
+> **Spawned a bigger question:** Daniel asked *"is it too late to say
+> 'let's build around speckit?'"* — being tracked as **ADR-0009
+> (spec-kit alignment)**, forthcoming. Q6 adopted speckit's severity
+> ladder (Level 0 alignment); ADR-0009 decides how far up the stack to
+> go.
+>
+> See [ADR-0006 → Decision log → Q6](../decisions/0006-merge-group-topology.md)
+> for the canonical record + trigger table.
+
+---
+
+### § Decision needed (historical)
 Does v0 need to support mid-flight replan — the operator (or planner
 agent) modifies the plan tree while impl branches are open against the
 trunk — which would force stable planner-declared item ids and a
