@@ -42,7 +42,7 @@
 | Q5 | [atomic co-merge recovery](#q5-how-strict-is-the-atomic-co-merge-guarantee-when-one-leaf-fails-mid-trunk) | ADR-0006 OQ3 | **CLOSED 2026-06-01: curator-decided recovery; human-gate roll-forward a required menu option; abandon-trunk is terminal, not default. See "Q5 — closed" below.** |
 | Q6 | [replan mid-flight in scope](#q6-is-replan-mid-flight-in-scope-for-v0) | ADR-0006 OQ4 | **CLOSED 2026-06-01: in scope but narrowly gated to CRITICAL-class invalidity (speckit severity ladder); stable item ids now in-scope for v0. See "Q6 — closed" below.** |
 | Q7 | [review-group labels](#q7-should-the-planner-emit-review_group-labels) | ADR-0006 OQ5 | **CLOSED 2026-06-01: optional `review_group: str \| None` on `ChildPlan`; planner may set, dashboard clusters when present, no branch impact; seeds ADR-0008. See "Q7 — closed" below.** |
-| Q8 | [same-root run-lock UX](#q8-same-root-run-lock-ux-refuse-or-attach) | ADR-0006 OQ6 | Refuse-or-attach (polyphony's behaviour) or plain refusal when a fresh run hits an existing trunk? |
+| Q8 | [same-root run-lock UX](#q8-same-root-run-lock-ux-refuse-or-attach) | ADR-0006 OQ6 | **CLOSED 2026-06-02: refuse-or-attach (polyphony shape) — matching run_id attaches/resumes, mismatch refuses; run_id-keyed because Q5 roll-forward makes open-trunk a normal mid-run state. See "Q8 — closed" below.** |
 | Q9 | [drift-rebase location](#q9-where-does-the-rebase-featureroot-onto-main-verb-live) | ADR-0007 Q-B | Where does `rebase feature/<root> onto main` live — `implementation.py` exit, a new `merge_group.py`, or `pr_lifecycle.py` entry? |
 | Q10 | [leaf-only degenerate case](#q10-should-featureitem_id-survive-for-the-leaf-only-root) | ADR-0006 OQ7 | When the root *is* a leaf, do we collapse to today's `feature/<item>` shape or pay the consistency tax? |
 | Q11 | [remediation planner context](#q11-what-context-does-the-remediation-planner-read) | ADR-0007 Q-D | Does the remediation planner read the latest `CommentSynthesis` only, +all PR comments, or +the full diff? |
@@ -717,6 +717,16 @@ later is the cost of a `git pull` and a planner-prompt edit.
 ---
 
 ## Q8: Same-root run-lock UX — refuse-or-attach?
+
+> **CLOSED 2026-06-02 — refuse-or-attach (polyphony shape).** When a
+> dispatch hits a root with an existing `feature/<root>` trunk: matching
+> manifest `run_id` → attach (= resume); mismatch → refuse with a hint.
+> Detection is **run_id-keyed, not trunk-existence-keyed**, because Q5's
+> roll-forward recovery makes "open trunk + unmerged impl PRs" a normal
+> mid-run state. Plain refusal rejected (worse UX, but a valid leaner
+> fallback — strict upgrade path); attach-by-default rejected (silent
+> stale-trunk footgun for a single operator). Daniel: *"I think refuse or
+> attach still."* Recorded in ADR-0006 Decision log → Q8.
 
 ### § Decision needed
 When an operator starts a fresh run on a root that already has an open

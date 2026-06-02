@@ -588,7 +588,11 @@ under "Decision log" below as they close.
    seed of the agent-driven curation policy in **ADR-0008**. See
    "Decision log → Q7" below.
 
-6. **Same-root run lock semantics.** — OPEN. Tracked as Q8.
+6. **Same-root run lock semantics.** — **CLOSED 2026-06-02.**
+   Resolution: refuse-or-attach (polyphony shape) — matching `run_id`
+   attaches/resumes, mismatch refuses. Run_id-keyed because Q5
+   roll-forward makes the open-trunk state a normal mid-run condition.
+   See "Decision log → Q8" below.
 
 7. **Should `feature/<item_id>` survive for the single-leaf case?** —
    OPEN. Tracked as Q10.
@@ -864,6 +868,44 @@ group is best modelled as a *set of stable ids* so it survives a narrow
 replan. Interacts with **ADR-0009 (PR #52)** open question "stable-ID
 location," since the stable id and `review_group` fields are schema
 neighbours in `planning.py`. The deeper curation concept is **ADR-0008**.
+
+---
+
+### Q8 (closed 2026-06-02) — same-root run-lock UX: refuse-or-attach
+
+**Decision:** Adopt polyphony's **refuse-or-attach** behaviour. When a
+dispatch lands on a root that already has an open `feature/<root>` trunk,
+Requiem detects it and: if the existing manifest's `run_id` matches the
+incoming run → **attach (= resume)** the in-flight run; if it does not
+match → **refuse** with a hint. `root_dispatch`
+([`src/requiem/workflows/root_dispatch.py:1-44`](../../src/requiem/workflows/root_dispatch.py))
+gains this detect-then-branch step in front of its current idempotent
+read-or-create.
+
+**Daniel's framing:** *"I think refuse or attach still."*
+
+**Why this shape (not plain refusal, not attach-by-default):**
+
+| Option | Verdict | Reason |
+|---|---|---|
+| Refuse-or-attach (polyphony) | **Chosen** | The lock exists *specifically* for the operator-confusion case, and polyphony's operators are the closest analogue to the dogfood audience. One-command UX for the common resume-after-crash case; matching run_id resumes, mismatch refuses before stomping. |
+| Plain refusal | Rejected (but a valid leaner fallback) | Forces a manual decision + knowing the resume command on every re-dispatch. Refusal → refuse-or-attach is a strict UX upgrade on the same substrate, so it could ship first if v0 needs trimming. |
+| Attach-by-default + `--force-fresh` | Rejected | In a single-operator world the lock's main job is protecting the operator from their own forgotten run; silent attachment is the footgun that defeats that purpose (risk of attaching to a stale trunk). |
+
+**Interaction with Q5 (load-bearing):** Because Q5 chose curator-decided
+**roll-forward** recovery, "open trunk + unmerged impl PRs" is a *normal
+mid-run state*, not a failure. The lock therefore must key on **run_id
+identity** (resume vs fresh-start), NOT merely "a trunk exists" — a bare
+trunk-existence check would misread every legitimate resume as a
+collision.
+
+**Out of scope:** the lock *substrate* (file lock / manifest entry /
+git-ref check) is an implementation detail deferred to build time; this
+decision fixes only the UX contract.
+
+**Cross-references:** depends on Q5 (roll-forward makes the
+mid-run-trunk state normal, forcing run_id-keyed detection); extends
+`INV-FEATURE-TRUNK-PER-RUN`; closes ADR-0006 OQ6.
 
 ---
 
