@@ -173,6 +173,19 @@ class PlanResult:
     summary: str
     review_iterations: int
     final_verdict: Literal["approved", "needs_human"]
+    proposals: list[dict[str, Any]] = field(default_factory=list)
+    """The planner's raw child proposals for *this* node (creatable
+    metadata: title / description / work_item_type / optional pinned
+    ``item_id`` / optional ``review_group``).
+
+    Carried through the recursive serialisation so the ``.plan.tree.json``
+    artifact is self-describing at every depth — the downstream
+    ``commit_plan`` workflow can seed ADO children at any level without
+    folding each sub-run's event log. ``children[i]`` aligns with
+    ``proposals[i]`` by index (planning spawns one sub-workflow per
+    proposal in order); each child's ``item_id`` is the synthesised id
+    derived from this node, so alignment is verifiable.
+    """
 
 
 # ---- typed agent outputs ------------------------------------------------
@@ -291,6 +304,13 @@ class FakeTwigClient:
 
 # Iteration cap — change this only by editing the topology in `build_workflow`.
 ITER_CAP = 3
+
+# Version stamp for the `.plan.tree.json` sidecar. Bumped to 2 when each
+# recursive node gained its own `proposals` list (making the artifact
+# self-describing for the downstream `commit_plan` seeding workflow).
+# `commit_plan` refuses artifacts below this version — older trees lack the
+# per-node creatable metadata it needs.
+PLAN_TREE_SCHEMA_VERSION = 2
 
 
 def build_verb_registry(
@@ -774,6 +794,7 @@ def _plan_result_to_dict(plan: "PlanResult") -> dict[str, Any]:
         "summary": plan.summary,
         "review_iterations": plan.review_iterations,
         "final_verdict": plan.final_verdict,
+        "proposals": [dict(p) for p in plan.proposals],
         "children": [_plan_result_to_dict(c) for c in plan.children],
     }
 
@@ -834,6 +855,7 @@ def _write_plan_sidecar(
         path.write_text(
             json.dumps(
                 {
+                    "schema_version": PLAN_TREE_SCHEMA_VERSION,
                     "plan_id": plan_id,
                     "item_id": item.get("item_id"),
                     "item_title": item.get("title"),
@@ -1477,6 +1499,7 @@ def project_plan_result(completed: dict) -> PlanResult | None:
         summary=str(v.get("summary", "")),
         review_iterations=int(v.get("review_iterations", 0)),
         final_verdict=v.get("final_verdict", "approved"),
+        proposals=[dict(p) for p in (v.get("proposals") or [])],
     )
 
 
@@ -1490,6 +1513,7 @@ def _plan_result_from_dict(d: dict[str, Any]) -> PlanResult:
         summary=str(d.get("summary", "")),
         review_iterations=int(d.get("review_iterations", 0)),
         final_verdict=d.get("final_verdict", "approved"),
+        proposals=[dict(p) for p in (d.get("proposals") or [])],
     )
 
 
