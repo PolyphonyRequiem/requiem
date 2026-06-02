@@ -581,11 +581,12 @@ under "Decision log" below as they close.
    after impl began. Requires stable planner-declared item ids (now
    in-scope for v0). See "Decision log → Q6" below.
 
-5. **Should the planner declare review-group labels?** — OPEN; **scope
-   shifted** by the Q1 reframe. The reviewable-set decision is no longer
-   purely a "labels in YAML" question — it is the seed of an agent-driven
-   curation policy. Tracked as Q7; the deeper concept lives in **ADR-0008
-   (review-surface curation)**.
+5. **Should the planner declare review-group labels?** — **CLOSED 2026-06-01.**
+   Resolution: yes, as an **optional** `review_group: str | None` field on
+   `ChildPlan` — the planner may set it when it sees a grouping; the
+   dashboard clusters when present; absence is a valid no-op. It is the
+   seed of the agent-driven curation policy in **ADR-0008**. See
+   "Decision log → Q7" below.
 
 6. **Same-root run lock semantics.** — OPEN. Tracked as Q8.
 
@@ -826,6 +827,43 @@ holds: CRITICAL blocks; HIGH-and-below may proceed.
 feeds Q7 (stable ids interact with review-group labels); the CRITICAL
 contract is a candidate adoption point for a broader **spec-kit
 alignment** investigation (see ADR-0009, forthcoming).
+
+---
+
+### Q7 (closed 2026-06-01) — planner-emitted review-group labels
+
+**Decision:** Add an **optional** `review_group: str | None` field to
+`ChildPlan` ([`src/requiem/workflows/planning.py:181-198`](../../src/requiem/workflows/planning.py)).
+The planner *may* set it when it perceives a natural grouping among
+implementable leaves; the dashboard clusters impl PRs by group when the
+field is present; absence is a valid no-op. The planner is **not**
+required to assign one, and the value is **not** validated against a
+closed enum in v0. **No branch-topology impact** — this is a
+planner-output schema field plus a dashboard render hint.
+
+**Daniel's framing:** *"probably a good idea, yes. optional label."*
+
+**Why optional (not required, not deferred):**
+
+| Option | Verdict | Reason |
+|---|---|---|
+| Optional label | **Chosen** | Smallest forward-compatible commitment; no-op for small fan-outs; gives the dashboard wave something to render and the planner a place to express curation intent. |
+| Required label | Rejected | Forces awkward structure on 2-leaf fan-outs (`"data-layer"` + `"ui-layer"` for two PRs is silly). |
+| Defer entirely | Rejected | A large fan-out (e.g. 20 leaves) would surface 20 ungrouped impl PRs once the dashboard lands; consumers that hardcode the field's absence pay a migration cost later. |
+
+**Relationship to the Q1 reframe / ADR-0008:** `review_group` is the
+*seed* of the agent-driven review-surface curation policy, not the whole
+of it. Per Q1, "reviewable set" is an agent-curated concept orthogonal to
+branch topology. This field is the planner's lightweight expression of a
+grouping intent; the richer curator decisions (cut / gate / persist /
+review-surface = auto_merge | local_review | pr_review) live in **ADR-0008**.
+
+**Cross-references:** realises the Q1 reframe (agent-curated reviewable
+sets); attaches to the **stable item ids** made REQUIRED in Q6 — a review
+group is best modelled as a *set of stable ids* so it survives a narrow
+replan. Interacts with **ADR-0009 (PR #52)** open question "stable-ID
+location," since the stable id and `review_group` fields are schema
+neighbours in `planning.py`. The deeper curation concept is **ADR-0008**.
 
 ---
 
