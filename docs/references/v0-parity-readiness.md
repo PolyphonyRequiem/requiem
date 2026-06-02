@@ -160,7 +160,7 @@ whether those decisions are encoded *somewhere* in Requiem.
 | 1 | Type-agnostic routing from process config | ❌ missing | No `.requiem-config/` / process-config loader exists; ADO type names are referenced inline (`root_dispatch` validates against `Epic`/`Feature` literals) |
 | 2 | Polyphony CLI as deterministic decision layer (JSON stdout) | 🔵 better | Replaced by in-process Python verbs returning discriminated outcomes (INV-DISCRIMINATED-OUTCOMES). The *requirement underneath* — deterministic decisions — is honoured |
 | 3 | `twig` as write-side bridge to ADO | 🟡 partial | `TwigClient` has show/comment/set_state/`create_child_async` (used by `commit_plan` seeding, PR #59). PR-link surfacing still rough (issue #30) |
-| 4 | Root SDLC orchestrator (`polyphony@polyphony`) | 🟡 partial | `full_sdlc.py` is a five-stage linear pipeline; not a tree-walking root with batch dispatch or outer iterate-until-stable loop |
+| 4 | Root SDLC orchestrator (`polyphony@polyphony`) | 🟡 partial | `full_sdlc.py` is a five-stage linear pipeline; not a tree-walking root with batch dispatch or outer iterate-until-stable loop. **Fan-out executor** (dispatch implementable leaves into `implementation`) is the missing core — designed + **blocked**, see ADR-0013 (blockers B1 child-seam propagation, B3 branch model) |
 | 5 | Per-item worktree isolation for parallel dispatch | ❌ missing | No worktree primitive; no parallel dispatch; sub-workflow children run sequentially |
 | 6 | Recursive planning with child seeding and PR lifecycle | ✅ at-parity | Recursion ✅. Child seeding into ADO ✅ (`commit_plan`, PR #59, ADR-0011). Plan PR open + handoff ✅ (`plan_pr`, PR #60, ADR-0012); merge owned by `pr_lifecycle` (GitHub) |
 | 7 | Merge-group implementation (`mg/`, `impl/`) with idempotent re-entry | ❌ missing | `implementation.py` uses a single `feature/<item_id>` branch; no `mg/` or `impl/` topology |
@@ -169,6 +169,35 @@ whether those decisions are encoded *somewhere* in Requiem.
 | 10 | Platform-specific PR lifecycles (GitHub and ADO) | 🟡 partial | GitHub ✅ (`pr_lifecycle.py`). ADO ❌ (no `ado_pr` module) |
 
 **Scorecard:** 2 ✅ at-parity, 1 🔵 better, 4 🟡 partial, 3 ❌ missing. **Four of ten** non-negotiables have material work remaining. (#6 closed by PRs #59 + #60.)
+
+### 2.10 Fan-out executor — the critical-path blocker (ADR-0013)
+
+The biggest single parity gap is that nothing dispatches the seeded implementable
+leaves into `implementation` — recursive planning + seeding (#6) are inert without
+it. A rigorous design exists (bounded-slot dispatch per `decomposable==False`
+leaf), but a *correct, production-real* fan-out is **blocked** on three verified
+architectural issues (ADR-0013):
+
+- **B1 — child-seam propagation:** the kernel forwards only JSON-flat inputs to a
+  dispatched child's `build_engine` (filtered by signature, kernel.py:543-567).
+  `provider`/`toolbelt`/`gate_handler` are never forwarded, so a dispatched
+  `implementation` falls back to a canned LLM + fake gh/twig over **real** git
+  (implementation.py:1390-1401) — a silent-success footgun. Needs a contextvar/
+  shim seam (the pattern planning uses for `gate_handler`, planning.py:139-154).
+- **B2 — handoff≠failure:** `implementation`'s `end_handoff` is
+  `disposition="completed"` (implementation.py:1048) and the kernel maps any
+  child `Completed(completed)` → parent `Success` (kernel.py:765-772), so a naive
+  fan-out treats failing-tests / bad-coder / push-failure handoffs as successes.
+  Needs a per-slot classifier on `child_final_node`.
+- **B3 — branch model:** `implementation` hard-codes `feature/{item_id}`
+  (implementation.py:385), conflicting with ADR-0006's `feature/<root>` +
+  `impl/<root>-<item>`. Fan-out on the old branch shape is ADR-0006 Option B
+  (a re-scoped-v0 stopgap), not full parity.
+
+**Recommended order:** B1 (unblocks *all* real dispatch — full_sdlc, root
+orchestrator, fan-out) → B3 (a v0 scope decision: Option-B stopgap vs. Option-D
+topology) → then the executor (B2 classifier + resume-only idempotency are
+mechanical once B1/B3 land).
 
 ---
 
