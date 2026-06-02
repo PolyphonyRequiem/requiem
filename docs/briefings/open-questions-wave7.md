@@ -43,7 +43,7 @@
 | Q6 | [replan mid-flight in scope](#q6-is-replan-mid-flight-in-scope-for-v0) | ADR-0006 OQ4 | **CLOSED 2026-06-01: in scope but narrowly gated to CRITICAL-class invalidity (speckit severity ladder); stable item ids now in-scope for v0. See "Q6 — closed" below.** |
 | Q7 | [review-group labels](#q7-should-the-planner-emit-review_group-labels) | ADR-0006 OQ5 | **CLOSED 2026-06-01: optional `review_group: str \| None` on `ChildPlan`; planner may set, dashboard clusters when present, no branch impact; seeds ADR-0008. See "Q7 — closed" below.** |
 | Q8 | [same-root run-lock UX](#q8-same-root-run-lock-ux-refuse-or-attach) | ADR-0006 OQ6 | **CLOSED 2026-06-02: refuse-or-attach (polyphony shape) — matching run_id attaches/resumes, mismatch refuses; run_id-keyed because Q5 roll-forward makes open-trunk a normal mid-run state. See "Q8 — closed" below.** |
-| Q9 | [drift-rebase location](#q9-where-does-the-rebase-featureroot-onto-main-verb-live) | ADR-0007 Q-B | Where does `rebase feature/<root> onto main` live — `implementation.py` exit, a new `merge_group.py`, or `pr_lifecycle.py` entry? |
+| Q9 | [drift-rebase location](#q9-where-does-the-rebase-featureroot-onto-main-verb-live) | ADR-0007 Q-B | **CLOSED 2026-06-02: (ii) a new `merge_group.py` owns the drift-rebase verb — trunk-altitude, only host with the Q5 partial-work view. See "Q9 — closed" below.** |
 | Q10 | [leaf-only degenerate case](#q10-should-featureitem_id-survive-for-the-leaf-only-root) | ADR-0006 OQ7 | When the root *is* a leaf, do we collapse to today's `feature/<item>` shape or pay the consistency tax? |
 | Q11 | [remediation planner context](#q11-what-context-does-the-remediation-planner-read) | ADR-0007 Q-D | Does the remediation planner read the latest `CommentSynthesis` only, +all PR comments, or +the full diff? |
 
@@ -791,6 +791,16 @@ single common case (resume-after-crash).
 ---
 
 ## Q9: Where does the `rebase feature/<root> onto main` verb live?
+
+> **CLOSED 2026-06-02 — (ii) a new `merge_group.py`.** The trunk-level
+> workflow owns the drift-rebase verb. It sits at trunk altitude (where
+> trunk-vs-main drift belongs) and is the only host with a view of the
+> trunk's partial-work state, which Q5's roll-forward recovery makes a
+> normal mid-run condition. (i) strands trunk work in a leaf workflow;
+> (iii) re-introduces the topology↔PR-platform conflation ADR-0007 §3
+> separated. Britten's "(i) for v0" hedge expired when Q1 = D was
+> ratified. Rebase strategy stays an impl detail; verb must be idempotent
+> (INV-RESTART). Daniel: *"ii"*. Recorded in ADR-0007 §9 Q-B.
 
 ### § Decision needed
 When MG topology lands (Q1 = D), where does the `rebase feature/<root>

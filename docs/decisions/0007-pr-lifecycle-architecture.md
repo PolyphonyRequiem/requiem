@@ -797,6 +797,25 @@ blocker now.
 
 #### Q-B. Drift-integration timing
 
+> **CLOSED 2026-06-02 (Wave-7 Q9 walkthrough).** Resolution: **(ii) — a
+> new `merge_group.py` workflow** owns the `rebase feature/<root> onto
+> main` drift verb. Rationale: with ADR-0006 Option D ratified (Q1), the
+> trunk-level workflow is being built regardless, and trunk-vs-main drift
+> is structurally a *trunk* concern at the right altitude. It is the only
+> host with a view of the trunk's **partial-work state** that ADR-0006
+> Q5's roll-forward recovery makes a normal mid-run condition — a
+> leaf-level host (i) has no such view. Rejected: (i) strands trunk-level
+> work in a leaf workflow and forces unnatural re-entry semantics; (iii)
+> re-introduces the topology↔PR-platform conflation §3 deliberately
+> separated, and would force every platform impl to carry the rebase verb.
+> Britten's §5.1 "(i) for v0" was a hedge against Q1 being unresolved at
+> draft time; that hedge expired when Q1 = D was accepted. The rebase
+> *strategy* (auto-resolve / surrender-on-conflict) remains an
+> implementation detail; the verb must be idempotent (INV-RESTART).
+> Daniel: *"ii"*. Cross-ref: ADR-0006 Decision log Q1, Q5; the new
+> `merge_group.py` is the Berlioz-Phase-D piece ADR-0006 Option D commits
+> to.
+
 When MG topology lands (Mahler-3 §9 non-negotiable #7, post-v0), where
 does the `rebase feature/<root> onto main` verb live? Three places:
 
