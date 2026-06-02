@@ -837,7 +837,7 @@ alignment** investigation (see ADR-0009, forthcoming).
 ### Q7 (closed 2026-06-01) — planner-emitted review-group labels
 
 **Decision:** Add an **optional** `review_group: str | None` field to
-`ChildPlan` ([`src/requiem/workflows/planning.py:181-198`](../../src/requiem/workflows/planning.py)).
+`ChildPlan` ([`src/requiem/workflows/planning.py:181-209`](../../src/requiem/workflows/planning.py)).
 The planner *may* set it when it perceives a natural grouping among
 implementable leaves; the dashboard clusters impl PRs by group when the
 field is present; absence is a valid no-op. The planner is **not**
