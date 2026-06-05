@@ -556,6 +556,81 @@ def test_translate_state_unknown_schema_downgrades():
     assert out == "needs_human" and "handoff invalid" in reason
 
 
+def test_translate_state_missing_metadata_under_gating_needs_human():
+    """A done task with NO handoff metadata cannot be attributed to the leaf;
+    under the gating path (expect present) it is surfaced, never accepted."""
+    from requiem.workflows.kanban_executor import translate_state
+    out, reason = translate_state(
+        status="done", outcome="completed", result="ok", run_raw={},
+        expect={"leaf_id": "8101", "root_item": "7000", "plan_hash": "deadbeef"},
+    )
+    assert out == "needs_human" and "missing handoff" in reason
+
+
+def test_row_delivered_honors_requiem_outcome():
+    """A live row's disposition is authoritative — a done+completed row whose
+    evidence was rejected must NOT count as delivered."""
+    from requiem.workflows.kanban_executor import _row_delivered
+    rejected = {"leaf_id": "x", "status": "done", "outcome": "completed",
+                "result": "ok", "requiem_outcome": "needs_human"}
+    accepted = {"leaf_id": "y", "status": "done", "outcome": "completed",
+                "result": "ok", "requiem_outcome": "delivered"}
+    assert not _row_delivered(rejected)
+    assert _row_delivered(accepted)
+
+
+def test_row_delivered_falls_back_for_dry_run_rows():
+    """Dry-run rows carry no disposition; fall back to the raw receipt check."""
+    from requiem.workflows.kanban_executor import _row_delivered
+    dry = {"leaf_id": "z", "status": "done", "outcome": "completed", "result": "ok"}
+    assert _row_delivered(dry)
+
+
+def test_sim_handoff_metadata_attributes_via_idempotency_key():
+    """The sim reconstructs the worker's handoff blob from the task identity so
+    live sim deliveries carry attributable evidence (closes the emit side)."""
+    from requiem.clients.kanban import KanbanTask
+    from requiem.workflows.kanban_executor import _sim_handoff_metadata
+    task = KanbanTask(
+        id="t1", title="leaf", status="ready", assignee="coder",
+        workspace_kind="worktree", branch_name="impl/7000-8101",
+        result=None, idempotency_key="requiem:7000:deadbeef:8101",
+    )
+    blob = _sim_handoff_metadata(task)["metadata"]
+    assert blob["leaf_id"] == "8101"
+    assert blob["root_item"] == "7000"
+    assert blob["plan_hash"] == "deadbeef"
+    assert blob["worker_profile"] == "coder"
+    assert blob["schema_version"] == 1
+
+
+def test_sim_handoff_metadata_empty_without_requiem_key():
+    """A task created outside requiem yields no evidence — an evidence-less
+    completion the executor surfaces rather than silently accepts."""
+    from requiem.clients.kanban import KanbanTask
+    from requiem.workflows.kanban_executor import _sim_handoff_metadata
+    task = KanbanTask(
+        id="t9", title="rogue", status="ready", assignee="coder",
+        workspace_kind="worktree", branch_name="x", result=None,
+        idempotency_key="some-other-key",
+    )
+    assert _sim_handoff_metadata(task) == {}
+
+
+async def test_live_delivery_carries_attributable_evidence(tmp_path: Path):
+    """End-to-end: a live sim run's delivered leaves are counted via the
+    requiem disposition (translated from real handoff evidence), not the raw
+    receipt — proving the emit→consume wire contract closes."""
+    kanban = SimKanbanClient()
+    engine = _engine(tmp_path, kanban=kanban, live=True)
+    result = await engine.run("attrib")
+    assert isinstance(result, Completed)
+    completed = _completed(tmp_path / "attrib.events.jsonl")
+    per_leaf = completed["poll_kanban"]["value"]["per_leaf"]
+    assert per_leaf, "expected per-leaf rows"
+    assert all(p["requiem_outcome"] == "delivered" for p in per_leaf), per_leaf
+
+
 # ---- topology sanity --------------------------------------------------
 
 

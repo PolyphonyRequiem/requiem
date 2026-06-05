@@ -73,7 +73,12 @@ from requiem.clients.kanban import (
     is_hermes_on_path,
 )
 from requiem.dsl import AgentRegistry, VerbRegistry, Workflow, WorkflowBuilder
-from requiem.handoff import HandoffError, HandoffMetadata, extract_handoff
+from requiem.handoff import (
+    HANDOFF_SCHEMA_VERSION,
+    HandoffError,
+    HandoffMetadata,
+    extract_handoff,
+)
 from requiem.kernel import Engine
 from requiem.plan_tree import PlanArtifactError, load_committed_leaves
 from requiem.outcomes import (
@@ -392,21 +397,30 @@ def build_verb_registry(inputs: ExecInputs) -> VerbRegistry:
             per_leaf = []
             for lid, tid in leaf_to_task.items():
                 task = tasks.get(tid)
+                if task is None:
+                    # The task vanished from the board (deleted/corrupted). Settle
+                    # it as needs_human rather than polling a ghost forever.
+                    per_leaf.append({
+                        "leaf_id": lid, "task_id": tid, "status": "missing",
+                        "outcome": None, "result": None, "summary": None,
+                        "requiem_outcome": _OUT_NEEDS_HUMAN,
+                        "reason": "task missing from board",
+                    })
+                    continue
                 runs = await kanban.runs_async(tid, board=board)
                 latest = _latest_run(runs)
-                status = task.status if task else "unknown"
                 disposition, reason = translate_state(
-                    status=status,
+                    status=task.status,
                     outcome=latest.outcome if latest else None,
-                    result=task.result if task else None,
+                    result=task.result,
                     run_raw=latest.raw if latest else None,
                     expect={"leaf_id": lid, "root_item": inputs.root_item,
                             "plan_hash": plan_hash},
                 )
                 per_leaf.append({
-                    "leaf_id": lid, "task_id": tid, "status": status,
+                    "leaf_id": lid, "task_id": tid, "status": task.status,
                     "outcome": latest.outcome if latest else None,
-                    "result": task.result if task else None,
+                    "result": task.result,
                     "summary": latest.summary if latest else None,
                     "requiem_outcome": disposition, "reason": reason,
                 })
@@ -443,28 +457,54 @@ def build_verb_registry(inputs: ExecInputs) -> VerbRegistry:
                     blocked.add(lid)
                     changed = True
 
-        releasable = [
+        # A child is releasable once every parent is delivered AND its task has
+        # not yet started (status ready/todo). This covers both the fresh
+        # (unassigned) child and the crash-resumed one (assigned but never
+        # dispatched), so release is idempotent across a crash between
+        # assign and dispatch — we (re)assign if needed, then (re)dispatch.
+        to_release = [
             lid for lid, deps in deps_of.items()
             if deps
             and lid not in settled_self and lid not in blocked
             and all(d in delivered for d in deps)
             and leaf_to_task[lid] in tasks
-            and tasks[leaf_to_task[lid]].assignee is None
+            and tasks[leaf_to_task[lid]].status in ("ready", "todo")
         ]
-        if releasable and inputs.assignee is not None:
-            for lid in releasable:
-                await kanban.assign_async(leaf_to_task[lid], inputs.assignee, board=board)
-            await kanban.dispatch_async(board=board, dry_run=False)
+        if to_release and inputs.assignee is not None:
+            try:
+                for lid in to_release:
+                    t = tasks[leaf_to_task[lid]]
+                    if t.assignee is None:
+                        await kanban.assign_async(t.id, inputs.assignee, board=board)
+                await kanban.dispatch_async(board=board, dry_run=False)
+            except KanbanBusyError as e:
+                return RetryableFailure(
+                    retry_key=f"{ctx.run_id}:poll_kanban", error_kind="kanban.busy",
+                    message=str(e), attempt=ctx.attempt, after=inputs.poll_interval_s,
+                )
+            except KanbanClientError as e:
+                return NeedsHuman(
+                    gate="poll_kanban", prompt=f"kanban release failed: {e}",
+                    options=("approve", "abort"),
+                    context={"board": board, "error": str(e)},
+                )
             return RetryableFailure(
                 retry_key=f"{ctx.run_id}:poll_kanban",
                 error_kind="kanban.released_children",
-                message=f"released {len(releasable)} child leaf(s) after parent delivery",
+                message=f"released {len(to_release)} child leaf(s) after parent delivery",
                 attempt=ctx.attempt, after=inputs.poll_interval_s,
             )
 
         settled = settled_self | blocked
         if len(settled) == len(deps_of):
             return Success(value={"mode": mode, "terminal": True, "per_leaf": per_leaf})
+
+        # Budget exhausted: settle with a value-bearing timeout rather than
+        # exhausting kernel retries into a value-less aggregate (which would
+        # KeyError). Unsettled leaves read as in_flight → a partial verdict.
+        if ctx.attempt >= inputs.max_polls:
+            return Success(value={"mode": mode, "terminal": False, "timed_out": True,
+                                  "per_leaf": per_leaf})
         return RetryableFailure(
             retry_key=f"{ctx.run_id}:poll_kanban",
             error_kind="kanban.not_terminal",
@@ -489,8 +529,10 @@ def build_verb_registry(inputs: ExecInputs) -> VerbRegistry:
                          "per_leaf": per_leaf},
             )
 
-        delivered = [p for p in per_leaf if _is_delivered(p)]
-        failed = [p for p in per_leaf if not _is_delivered(p)]
+        delivered = [p for p in per_leaf if _row_delivered(p)]
+        failed = [p for p in per_leaf if not _row_delivered(p)]
+        timed_out = poll.get("timed_out", False)
+        timeout_note = " (poll budget exhausted — some workers never finished)" if timed_out else ""
         if not failed:
             return NeedsHuman(
                 gate="aggregate",
@@ -502,10 +544,11 @@ def build_verb_registry(inputs: ExecInputs) -> VerbRegistry:
         return NeedsHuman(
             gate="aggregate",
             prompt=f"{len(delivered)}/{len(per_leaf)} leaves delivered; "
-                   f"{len(failed)} need attention. Accept the partial batch?",
+                   f"{len(failed)} need attention{timeout_note}. Accept the partial batch?",
             options=("approve", "abort"),
             context={"mode": mode, "delivered": len(delivered),
-                     "failed": len(failed), "per_leaf": per_leaf},
+                     "failed": len(failed), "timed_out": timed_out,
+                     "per_leaf": per_leaf},
         )
 
     return verbs
@@ -625,6 +668,20 @@ def _is_delivered(per_leaf_row: dict[str, Any]) -> bool:
     )
 
 
+def _row_delivered(per_leaf_row: dict[str, Any]) -> bool:
+    """Whether a per-leaf row counts as delivered for the verdict.
+
+    For live rows (which carry a ``requiem_outcome`` from
+    :func:`translate_state`) the disposition is authoritative — so a ``done``
+    task whose evidence was rejected (misattributed/invalid/missing metadata)
+    is NOT counted as delivered even though its raw outcome is ``completed``.
+    Dry-run rows have no disposition; fall back to the raw receipt check.
+    """
+    if "requiem_outcome" in per_leaf_row:
+        return per_leaf_row["requiem_outcome"] == _OUT_DELIVERED
+    return _is_delivered(per_leaf_row)
+
+
 def _handoff_mismatch(handoff: HandoffMetadata, expect: Mapping[str, str]) -> str | None:
     """Reject worker evidence that belongs to a different leaf or plan version —
     evidence must never be misattributed (ADR-0017 §4)."""
@@ -676,7 +733,12 @@ def translate_state(
                 handoff = extract_handoff(run_raw or {})
             except HandoffError as e:
                 return _OUT_NEEDS_HUMAN, f"done but handoff invalid: {e}"
-            if handoff is not None and expect is not None:
+            if expect is not None:
+                # In the gating path we require attributable evidence: a done
+                # task with no handoff metadata is an evidence-less completion
+                # we cannot attribute to this leaf/plan — surface, never accept.
+                if handoff is None:
+                    return _OUT_NEEDS_HUMAN, "done but missing handoff metadata"
                 mism = _handoff_mismatch(handoff, expect)
                 if mism is not None:
                     return _OUT_NEEDS_HUMAN, f"done but evidence misattributed: {mism}"
@@ -722,8 +784,8 @@ def build_workflow() -> Workflow:
             .edge("dispatch_leaves", on="needs_human:abort", to="fail_end")
         .script("poll_kanban", verb="poll_kanban", retry_max=120)
             .edge("poll_kanban", on="success", to="aggregate")
-            .edge("poll_kanban", on="retry_exhausted", to="aggregate")
-            .edge("poll_kanban", on="needs_human:approve", to="aggregate")
+            .edge("poll_kanban", on="retry_exhausted", to="fail_end")
+            .edge("poll_kanban", on="needs_human:approve", to="fail_end")
             .edge("poll_kanban", on="needs_human:abort", to="fail_end")
         .script("aggregate", verb="aggregate")
             .edge("aggregate", on="needs_human:approve", to="end")
@@ -768,7 +830,7 @@ def _gate_context_aggregate(completed: dict) -> str:
     per_leaf = poll.get("per_leaf") or []
     if poll.get("mode") == "dry_run":
         return f"planned {len(per_leaf)} task(s) — nothing delivered (dry run)"
-    delivered = sum(1 for p in per_leaf if _is_delivered(p))
+    delivered = sum(1 for p in per_leaf if _row_delivered(p))
     return f"{delivered}/{len(per_leaf)} delivered"
 
 
@@ -794,14 +856,14 @@ def verdict_card(completed: dict) -> str | None:
     if mode == "dry_run":
         lines.append(f"  📋 Planned {len(per_leaf)} task(s) — DRY RUN (nothing delivered)")
     else:
-        delivered = sum(1 for p in per_leaf if _is_delivered(p))
+        delivered = sum(1 for p in per_leaf if _row_delivered(p))
         head = "✓ Delivered" if delivered == len(per_leaf) else "⚠ Partial delivery"
         lines.append(f"  {head}: {delivered}/{len(per_leaf)} leaves")
     for p in per_leaf:
         if mode == "dry_run":
             mark = "·"
         else:
-            mark = "✓" if _is_delivered(p) else "✗"
+            mark = "✓" if _row_delivered(p) else "✗"
         lines.append(f"      {mark} {p['leaf_id']} → {p['task_id']} "
                      f"[{p.get('status')}/{p.get('outcome') or '—'}]")
     lines.append("─────────────────────────────────────────────────────────────────────")
@@ -809,6 +871,33 @@ def verdict_card(completed: dict) -> str | None:
 
 
 # ---- demo simulation client ------------------------------------------
+
+
+def _sim_handoff_metadata(task: "KanbanTask") -> dict[str, Any]:
+    """Synthesize the handoff evidence a compliant worker would emit.
+
+    A real kanban worker calls ``kanban_complete(metadata={...})``; the sim has
+    no worker, so it reconstructs that blob from the task's own identity. The
+    idempotency key (``requiem:{root}:{plan_hash}:{leaf}``) carries the strict
+    identity fields the executor attributes evidence by; ``assignee`` is the
+    worker profile. Tasks created outside requiem (no parseable key) yield an
+    empty blob — an evidence-less completion the executor surfaces, not accepts.
+    """
+    key = task.idempotency_key or ""
+    parts = key.split(":")
+    if len(parts) != 4 or parts[0] != "requiem":
+        return {}
+    _, root_item, plan_hash, leaf_id = parts
+    return {
+        "metadata": {
+            "schema_version": HANDOFF_SCHEMA_VERSION,
+            "leaf_id": leaf_id,
+            "root_item": root_item,
+            "plan_hash": plan_hash,
+            "worker_profile": task.assignee or "sim-worker",
+            "branch": task.branch_name,
+        }
+    }
 
 
 class SimKanbanClient(KanbanClient):
@@ -884,6 +973,8 @@ class SimKanbanClient(KanbanClient):
         spawned = []
         skipped = []
         for tid, t in list(tasks.items()):
+            if t.status in _TERMINAL_STATUSES:
+                continue  # already settled — a real dispatcher never re-spawns it
             if t.assignee is None:
                 skipped.append(tid)
                 continue
@@ -893,9 +984,13 @@ class SimKanbanClient(KanbanClient):
             failed = any(k in self._fail_leaf_ids for k in (t.branch_name or "", t.title))
             self._seq += 1
             outcome = "crashed" if failed else "completed"
+            # A compliant worker calls kanban_complete(metadata={...}); model that
+            # by emitting the handoff evidence the executor consumes, attributed
+            # via the task's own idempotency key (requiem:{root}:{hash}:{leaf}).
+            run_raw = {} if failed else _sim_handoff_metadata(t)
             self._runs[tid].append(KanbanRun(
                 id=self._seq, status="done", outcome=outcome,
-                summary=f"sim worker {outcome}", profile=t.assignee, raw={},
+                summary=f"sim worker {outcome}", profile=t.assignee, raw=run_raw,
             ))
             tasks[tid] = KanbanTask(
                 id=t.id, title=t.title,
