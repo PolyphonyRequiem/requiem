@@ -50,7 +50,7 @@ lockstep: it round-trips each skill's documented receipt through the real
 parser, asserts the skill is byte-identical across all three profiles, and
 asserts `config.yaml` ships Manual orchestration (`auto_decompose: false`).
 
-### 2. Hermetic, Requiem-managed, containerized fleet
+### 2. Hermetic, Requiem-managed, containerized fleet — IMPLEMENTED (pure half)
 
 The fleet runs in a **pinned container Requiem ensures per run** (not an
 operator precondition). The container, by construction, provides:
@@ -61,9 +61,25 @@ operator precondition). The container, by construction, provides:
   distribution version, doctrine hash, models) is **snapshotted into the
   Requiem event log** — same durability pattern as ADR-0015's config snapshot.
 
+The two halves are kept distinct (the load-bearing correction): **reproducibility
+comes from immutable inputs** (the baked `fleet/` distributions — `deploy/`
+Dockerfile bakes them read-only) and **clean execution comes from a fresh
+per-run `HERMES_HOME`** (`deploy/entrypoint.sh` provisions one per run and
+installs the template into it — a persisted profile home is never reused).
+
 A **preflight** fails closed if: a required profile is missing, orchestration
-is not Manual, the gateway/version/config hash is unexpected, or a profile
-enables unauthorized writable memory.
+is not Manual, the gateway dispatcher is disabled, a profile home escapes the
+run root, a profile enables unauthorized writable memory, or any pinned
+version/hash cannot be corroborated. This is implemented as PURE, fully
+unit-tested logic in `requiem.fleet_preflight.evaluate_fleet`
+(`FleetInventory`/`ExpectedFleet` contracts; `fleet_identity_snapshot` does the
+schema-first repo-local artifact hashing). Two fail-closed postures:
+"no roles configured" is NOT "no fleet required" (the baseline delivery roles
+are required regardless), and "cannot verify a pinned dimension" is a failure,
+not a skip. The single deferred piece is the operator-side adapter that turns a
+**live** container into a `FleetInventory` (parsing `hermes profile list` /
+`hermes config get`) — it requires a real gateway to build, and everything it
+would feed is already judged by the tested pure logic.
 
 ### 3. Acceptance-gated release (the sharpest trap) — IMPLEMENTED
 

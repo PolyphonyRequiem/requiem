@@ -1,0 +1,34 @@
+# requiem delivery fleet — local bring-up (ADR-0017 §2).
+#
+# Honest scaffolding: env placeholders only, NO baked secrets, a per-run home
+# volume so kanban task-state never leaks across runs. Build context is the repo
+# root so the image can COPY ./fleet.
+#
+#   docker compose -f deploy/docker-compose.yml up --build
+#
+# Provide ADO_PAT / ANTHROPIC_API_KEY via your shell or a .env file that is
+# NEVER committed.
+
+services:
+  requiem-fleet:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: requiem-fleet:local
+    environment:
+      # Required at run time — sourced from the host env, never baked.
+      ADO_PAT: "${ADO_PAT:?set ADO_PAT in your env or .env}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      # Manual orchestration is enforced by the entrypoint; this only controls
+      # WHERE the dispatcher runs (in-gateway), not WHETHER it auto-decomposes.
+      HERMES_KANBAN_DISPATCH_IN_GATEWAY: "1"
+      REQUIEM_RUN_ID: "${REQUIEM_RUN_ID:-}"
+    volumes:
+      # Per-run homes live here; each run gets a fresh subdir (see entrypoint).
+      - requiem-runs:/var/lib/requiem/runs
+    # The base image supervises `gateway run` under s6; pass it as the CMD the
+    # entrypoint execs into after provisioning.
+    command: ["gateway", "run"]
+
+volumes:
+  requiem-runs:
