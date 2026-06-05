@@ -1,6 +1,6 @@
 # ADR 0018 — Trunk integration on the live (Hermes) path
 
-**Status:** Proposed (needs Daniel's call on Option, below)
+**Status:** Accepted (2026-06-05 — Option C ratified; sub-fork resolved, §"Component ownership")
 **Date:** 2026-06-05
 **Relates to:** ADR-0006 (merge-group topology / Option D), ADR-0007 (PR
 lifecycle), ADR-0014 (Hermes fan-out executor), ADR-0017 (Hermes delivery
@@ -133,9 +133,9 @@ producer* on `impl/<root>-<item>`; requiem owns everything around it:
 Option C is the only one that is fully actionable from this repo today, keeps
 requiem authoritative, and degrades gracefully without a Hermes release.
 
-## Decision (proposed)
+## Decision
 
-Adopt **Option C**. Specifically:
+Adopt **Option C** (ratified 2026-06-05). Specifically:
 
 - ADR-0007 §5.1's *placement* recommendation ("fold drift integration into
   `implementation.py`'s exit") is **superseded for the live path** by ADR-0014
@@ -164,6 +164,24 @@ Adopt **Option C**. Specifically:
 
 Each step is independently testable; the whole is wired only at step 4, so the
 tree never sits half-integrated.
+
+### Component ownership (sub-fork resolved 2026-06-05)
+
+The trunk git/gh operations (bootstrap `feature/<root>`, open leaf PRs, open
+the trunk→main PR) require a **local repo checkout + `gh` authority**. Two
+candidates held that authority: the `kanban_executor` (which only *coordinates
+a remote board* — it may run creds-light and has no guaranteed local checkout)
+and the `end_to_end` driver (which already runs each top-level engine with its
+own **real local provider/toolbelt** — ADR-0013/0014). **Resolution: the
+driver owns trunk git/gh ops.** The executor stays a remote-board coordinator;
+trunk bootstrap runs in the driver *before* it invokes the executor, and the
+leaf-PR-open + `feature_pr` steps run in the driver *after* the executor's
+`aggregate`. This keeps the executor's creds-light remote-coordination role
+intact and puts every git/gh mutation where the real toolbelt already lives.
+
+`feature_pr` is therefore built as a **standalone workflow** (its own engine +
+Fake gh client, exactly like `plan_pr.py`) that the driver invokes — not a verb
+bolted onto the executor.
 
 ## Consequences
 
