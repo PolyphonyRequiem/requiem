@@ -157,7 +157,7 @@ whether those decisions are encoded *somewhere* in Requiem.
 
 | # | Non-negotiable | Status | Note |
 | -- | --- | --- | --- |
-| 1 | Type-agnostic routing from process config | ❌ missing | No `.requiem-config/` / process-config loader exists; ADO type names are referenced inline (`root_dispatch` validates against `Epic`/`Feature` literals) |
+| 1 | Type-agnostic routing from process config | 🟡 partial | `requiem.process_config` loads `.requiem-config/process.yaml` into a frozen `ProcessConfig`; `root_dispatch.validate_root` now classifies root tier from `config.root_parent_types` (snapshotted into the event log by `start_run` for resume fidelity) instead of the old hardcoded `{Epic,Feature}` literal (ADR-0015). Reserved `decomposable_types`/`implementable_types` are parsed but not yet consumed by planning — that wiring is the remaining half. |
 | 2 | Polyphony CLI as deterministic decision layer (JSON stdout) | 🔵 better | Replaced by in-process Python verbs returning discriminated outcomes (INV-DISCRIMINATED-OUTCOMES). The *requirement underneath* — deterministic decisions — is honoured |
 | 3 | `twig` as write-side bridge to ADO | 🟡 partial | `TwigClient` has show/comment/set_state/`create_child_async` (used by `commit_plan` seeding, PR #59). PR-link surfacing still rough (issue #30) |
 | 4 | Root SDLC orchestrator (`polyphony@polyphony`) | 🟡 partial | `full_sdlc.py` is a five-stage linear pipeline; not a tree-walking root with batch dispatch or outer iterate-until-stable loop. **Fan-out executor** (dispatch implementable leaves into `implementation`) is the missing core — designed + **blocked**, see ADR-0013 (blockers B1 child-seam propagation, B3 branch model) |
@@ -168,7 +168,7 @@ whether those decisions are encoded *somewhere* in Requiem.
 | 9 | Durable seed manifest for partial-seed recovery | ✅ at-parity | `root_dispatch.write_manifest` is idempotent read-or-create; INV-RESTART covers re-entry |
 | 10 | Platform-specific PR lifecycles (GitHub and ADO) | 🟡 partial | GitHub ✅ (`pr_lifecycle.py`). ADO ❌ (no `ado_pr` module) |
 
-**Scorecard:** 2 ✅ at-parity, 1 🔵 better, 4 🟡 partial, 3 ❌ missing. **Four of ten** non-negotiables have material work remaining. (#6 closed by PRs #59 + #60.)
+**Scorecard:** 2 ✅ at-parity, 1 🔵 better, 5 🟡 partial, 2 ❌ missing. **Three of ten** non-negotiables have material work remaining (#7 merge-group, #8 web dashboard ❌; #1 process-config, #3 twig write-side, #5/#10 still partial). (#6 closed by PRs #59 + #60; #1 advanced to partial by ADR-0015.)
 
 ### 2.10 Fan-out executor — the critical-path blocker (ADR-0013)
 
@@ -198,6 +198,29 @@ architectural issues (ADR-0013):
 orchestrator, fan-out) → B3 (a v0 scope decision: Option-B stopgap vs. Option-D
 topology) → then the executor (B2 classifier + resume-only idempotency are
 mechanical once B1/B3 land).
+
+**Update (2026-06) — shipped via an external executor (ADR-0014).** Rather than
+wait on B1's in-process child-seam work, the `kanban_executor` workflow
+dispatches each implementable leaf to a **real external** executor — a Hermes
+kanban worker (`requiem.workflows.kanban_executor` + `requiem.clients.kanban`).
+This **sidesteps B1** (the executor brings its own real provider/toolbelt),
+satisfies B4 via a stable `requiem:{root}:{leaf}` idempotency key, lets the
+worker own B3's branch shape via worktree workspaces, and maps B2 onto a
+receipt check (`task_runs.outcome == completed` **and** a worker `result`),
+surfacing weak completions to a human. It does **not** unblock *in-process*
+sub-workflow seam propagation — that B1 work is still open for `full_sdlc` and
+the root orchestrator. See ADR-0014.
+
+Leaf resolution is now spec-faithful and **type-agnostic**: `requiem.plan_tree`
+enumerates every `decomposable == False` node depth-first from the approved
+committed plan tree + `id_map` (ADR-0013's `load_committed`), carrying each
+leaf's metadata from its parent proposal — *planning* decides the facet, not a
+hardcoded ADO-type set. `requiem.end_to_end` is a thin top-level driver
+(`python -m requiem.end_to_end --item <id> --board <b> [--commit] [--live]`)
+that chains planning → `commit_plan` → `kanban_executor` against any ADO item,
+including the **atomic-root** case (an item planning calls a leaf is dispatched
+as itself). The remaining type-agnosticism gap is `root_dispatch`'s hardcoded
+`ROOT_PARENT_TYPES` (non-negotiable #1 — process-config loader, still missing).
 
 ---
 
@@ -236,11 +259,11 @@ made in Phase A all held up under construction. The current shortfall is
 
 | # | Title | Severity | Mahler-3 verdict |
 | --- | --- | --- | --- |
-| #29 | `close_out`: terminate disposition vs verdict card | UX rough-edge | **v0 acceptable** — contradictory label is misleading but the verdict card carries the truth; operator can read past it. Fix is one-line (add `needs_human` disposition variant to terminate enum). Should be done before cutover but not a blocker. |
-| #30 | `close_out`: real twig JSON has no `pullRequests` field | Schema-parity gap | **v0 acceptable** — workflow gracefully escalates to `needs_human` when PR list is empty; operator passes `--pr N` explicitly. The right long-term fix is a `gh pr list --search` fallback or a `twig` enhancement; either is doable post-v0. Document the `--pr N` requirement in the close_out runbook before cutover. |
-| #31 | `planning`: no `permanent_failure` catch-all edges | Diagnostic rough-edge | **v0 blocker (recommended)** — `verb.crash` in any planning verb strands the run with `route.missing` and no verdict-card narrative. This silently degrades the observability story that the rest of Requiem invests heavily in. Fix is mechanical (`close_out` already has the pattern); ~30 LOC. Recommend closing before cutover. |
+| #29 | `close_out`: terminate disposition vs verdict card | UX rough-edge | **RESOLVED** — added a `needs_human` disposition variant to the terminate enum (`dsl.py`) and routed `close_out`'s `end_human` to it, so the run-completed disposition now agrees with the verdict card (and with `close_out_result`'s `needs_human` verdict). Subworkflow routing in `full_sdlc` is unchanged (`subworkflow.needs_human` still takes the `permanent_failure` edge to `paused_close`). |
+| #30 | `close_out`: real twig JSON has no `pullRequests` field | Schema-parity gap | **RESOLVED** — `resolve_pr` now falls back to a `gh pr list --search "head:feature/<item_id>"` query when the item carries no linked PR; a single hit auto-resolves (`source=gh_search`), multiple hits raise the ambiguous gate, and zero hits escalate as before. Operators can still pass `--pr N` explicitly. Covered by `test_pr_resolved_via_gh_search_fallback` and the updated `test_pr_not_linked_raises_needs_human`. |
+| #31 | `planning`: no `permanent_failure` catch-all edges | Diagnostic rough-edge | **RESOLVED** — every planning script/agent verb now routes its catch-all `permanent_failure` to the narrated `fail_end_crash` terminal, so a `verb.crash` produces a verdict-card narrative instead of stranding the run with `route.missing`. Covered by `test_planning_workflow.py::test_planning_verb_crash_routes_to_narrated_terminal` and the planner-crash test. |
 
-### 4.2 Tchaikovsky-class regression hazard
+### 4.2 Tchaikovsky-class regression hazard — RESOLVED (guard added)
 
 The BUG #1 fix (sync `twig.show()` → `async show_async`) in PR #32 broke
 Haydn's `root_dispatch.FakeTwigClient` because the test fake was not updated
@@ -259,6 +282,16 @@ that, add a `tests/test_fake_surface_contract.py` that introspects all
 `Fake*` classes in `tests/` and asserts they implement the matching
 Protocol. Either keeps a Tchaikovsky-class regression from re-emerging
 silently.
+
+**Closed:** shipped `tests/test_fake_surface_contract.py`. It AST-walks the
+whole `tests/` tree (no imports — avoids the heavy-fixture hang), discovers
+every `Fake*` client class and its methods, maps each to its real client
+(`TwigClient`/`GhClient`/`FilesystemClient`) by class-name token, and asserts
+**async-ness parity** for every method name shared with the real client —
+the exact `sync → async` drift that caused the original regression. Partial
+fakes stay legal (only overlapping methods are checked); a `checked > 0`
+guard prevents a vacuous pass if discovery ever breaks. Currently validates
+17 real overlaps across the shared and local fakes.
 
 ### 4.3 `full_sdlc.py` dispatch-shim post-merge fixup
 
@@ -313,13 +346,16 @@ The biggest v0 risk is simply *absence*:
   implementation exists. The event log is UI-ready (INV-EVENT-LOG-AUTHORITATIVE);
   the SSE/WebSocket bridge and the JS frontend are not.
 
-### 4.6 Implementation-workflow CLI gap (Tchaikovsky observation)
+### 4.6 Implementation-workflow CLI gap (Tchaikovsky observation) — RESOLVED
 
 Per bug-bash report §"implementation": *"Implementation workflow has no CLI
 argparse driver; must drive via Python script. Recommend adding one for
-parity with planning + close_out."* This is a minor ergonomics gap but
-becomes painful for the operator-facing v0 demo. Recommend adding
-`if __name__ == "__main__"` argparse driver before cutover.
+parity with planning + close_out."* **Closed:** `implementation.py` now has a
+`main()` + `_build_arg_parser()` driver (`python -m requiem.workflows.implementation
+[--item N] [--repo R] [--repo-path P] [--test-command C] [--dry-run] [--live]`),
+mirroring `close_out`'s pattern (live narration via the render context + verdict
+card). Defaults run the self-contained demo; `--live` wires the real Toolbelt and
+requires `--item`. Covered by three CLI tests in `test_implementation_workflow.py`.
 
 ### 4.7 Long-poll PR lifecycle ceiling
 

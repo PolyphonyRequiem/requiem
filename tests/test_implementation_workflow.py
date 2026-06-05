@@ -42,8 +42,31 @@ from requiem.workflows.implementation import (
     build_workflow,
     detect_test_command,
     ERROR_KINDS,
+    main as impl_main,
+    _build_arg_parser,
     _validate_relative_path,
 )
+
+
+# ---- CLI driver parity (bug-bash §"implementation") -------------------
+
+
+def test_cli_arg_parser_defaults_to_demo():
+    args = _build_arg_parser().parse_args([])
+    assert args.item is None
+    assert args.live is False
+
+
+def test_cli_live_without_item_is_rejected():
+    rc = impl_main(["--live", "--run-id", "x", "--log-dir", "."])
+    assert rc == 2
+
+
+def test_cli_demo_run_returns_zero(tmp_path: Path):
+    rc = impl_main(["--run-id", "cli-demo", "--log-dir", str(tmp_path)])
+    assert rc == 0
+    assert (tmp_path / "cli-demo.events.jsonl").exists()
+
 
 
 # ---- fakes (collected here, not in conftest, to keep the test

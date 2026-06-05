@@ -169,6 +169,41 @@ branch can feed them back into a re-prompt. If you don't wire a
 `bad_output` edge, the engine falls through to `permanent_failure` — so
 forgetting to wire it is safe, not silent.
 
+## How do I dispatch real implementation work to an external executor?
+
+**Problem.** Planning produced a tree of work items. You want each
+implementable leaf actually *built* — by a real agent that writes code,
+pushes a branch, and opens a PR — not by an in-process fake.
+
+**Solution.** Use `requiem.workflows.kanban_executor`. It creates one
+Hermes kanban task per leaf and lets a real Hermes worker deliver it.
+
+```powershell
+# Dry run (default): plan the tasks on a real board, spawn nothing.
+requiem run requiem.workflows.kanban_executor   # key-free in-process demo
+
+# End-to-end against a real ADO item: plan → seed children → dispatch workers.
+python -m requiem.end_to_end --item 12345 --board requiem-12345 \
+    --assignee my-coder-profile --commit --live
+```
+
+**Why it works.** Dispatching to an *external* executor sidesteps the
+in-process fan-out blocker (ADR-0013 §B1: a dispatched sub-workflow can't
+receive a real provider/toolbelt and silently falls back to fakes). Hermes
+brings its own real provider/toolbelt; Requiem just orchestrates. The driver
+runs planning → `commit_plan` → `kanban_executor` as sequential top-level
+engines. Implementable leaves are read from the **committed plan** (every
+`decomposable == False` node, depth-first, type-agnostically — planning decided
+the facet, not the ADO type), mapped to real ADO ids via the seed manifest's
+`id_map`. An *atomic* root (planning says it's already a leaf) is dispatched as
+itself. Each leaf's task carries a stable `requiem:{root}:{leaf}` idempotency
+key (fresh runs reuse tasks, not duplicate), tasks are created unassigned →
+linked → released (no create→claim race), and a leaf only counts as *delivered*
+when its worker run is `completed` **and** recorded a result. `--commit` and
+`--live` default off, so the safe default plans without seeding or spawning.
+See ADR-0014.
+
+
 ## How do I see what happened, after the fact?
 
 ```powershell
@@ -214,3 +249,4 @@ clicked.
 - [`writing-workflows.md`](writing-workflows.md) — the full walkthrough.
 - [`north-star.md`](north-star.md) — invariants that make these recipes
   safe.
+

@@ -321,6 +321,9 @@ async def test_partial_verifier_verdict_raises_needs_human_with_gaps(tmp_path: P
     result = await engine.run("partial")
     assert isinstance(result, Completed)
     assert result.final_node == "end_human"
+    # Issue #29: the terminate disposition now matches the verdict card —
+    # a human-handoff reports `needs_human`, not the misleading `failed`.
+    assert result.disposition == "needs_human"
 
     # NO closeout written, NO state transition.
     assert fs.files == {}
@@ -397,13 +400,14 @@ async def test_pr_not_merged_raises_needs_human_immediately(tmp_path: Path):
 
 
 async def test_pr_not_linked_raises_needs_human(tmp_path: Path):
-    """No explicit pr_number, no linked PR on the item → NeedsHuman from
-    resolve_pr. The brief test name is "PR not found" but the gate is
-    specifically PR-not-LINKED — we never even hit gh.pr_view."""
+    """No explicit pr_number, no linked PR, and a gh search that finds
+    nothing → NeedsHuman from resolve_pr. Issue #30: the search fallback is
+    attempted first (real twig often omits the linked-PR relation), but with
+    no hit the run still escalates to the operator."""
     log_dir = tmp_path / "runs"
     parent = make_twig_item(item_id=88, title="Orphan item", linked_prs=[])
     twig = FakeTwigClient(items={88: parent})
-    gh = FakeGhClient()  # never queried — fail before fetch_pr
+    gh = FakeGhClient()  # search returns [] → still escalates
     fs = FakeFilesystemClient()
 
     engine = _engine(
@@ -422,9 +426,51 @@ async def test_pr_not_linked_raises_needs_human(tmp_path: Path):
         and "PR linked" in g["payload"]["prompt"]
         for g in gates
     )
-    # And gh was never asked anything.
-    assert gh.search_queries == []
+    # Issue #30: gh WAS searched by the branch convention before escalating.
+    assert len(gh.search_queries) == 1
+    assert gh.search_queries[0]["query"] == "head:feature/88"
     assert twig.state_transitions == []
+
+
+async def test_pr_resolved_via_gh_search_fallback(tmp_path: Path):
+    """No linked PR on the item, but a gh search by branch convention finds
+    exactly one — resolve_pr adopts it (source=gh_search) and close-out
+    proceeds to end_success without operator intervention (issue #30)."""
+    log_dir = tmp_path / "runs"
+    closeout_dir = tmp_path / "docs" / "closeouts"
+    parent = make_twig_item(
+        item_id=91, title="Item w/ unlinked PR",
+        state="In Review", linked_prs=[],
+    )
+    crit1 = make_criterion(9101, "behaviour observed", parent_id=91)
+    twig = FakeTwigClient(
+        items={91: parent, 9101: crit1},
+        children_by_parent={91: [9101]},
+    )
+    found = make_pr(number=515, merged=True)
+    gh = FakeGhClient(
+        prs_by_repo={"acme/widgets": [found]},
+        pr_by_number={("acme/widgets", 515): make_pr(number=515, merged=True)},
+    )
+    fs = FakeFilesystemClient()
+    provider = _scripted_verifier(
+        overall="all_met", met=[9101], unmet=[], notes="ok",
+    )
+
+    engine = _engine(
+        log_dir, item_id=91, pr_number=None,
+        twig=twig, gh=gh, fs=fs, provider=provider,
+        closeout_dir=closeout_dir,
+    )
+    result = await engine.run("gh-search-hit")
+    assert isinstance(result, Completed)
+    assert result.final_node == "end_success"
+
+    completed = _completed_projection(log_dir / "gh-search-hit.events.jsonl")
+    rp = completed["resolve_pr"]["value"]
+    assert rp["pr_number"] == 515
+    assert rp["source"] == "gh_search"
+    assert gh.search_queries[0]["query"] == "head:feature/91"
 
 
 # ---- Verifier BadOutput → NeedsHuman, NO auto-retry ----------------

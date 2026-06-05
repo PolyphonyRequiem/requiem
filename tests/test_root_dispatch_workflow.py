@@ -584,3 +584,83 @@ def test_planning_shim_registered_on_build_engine(log_dir: Path):
     mod = sys.modules[mod_name]
     assert hasattr(mod, "build_engine")
     assert hasattr(mod, "build_workflow")
+
+
+# ---- 8. process-config-driven root classification (non-negotiable #1) ----
+
+
+async def test_custom_config_promotes_task_parent_to_root(log_dir: Path):
+    """A process config that lists ``Task`` as root-tier accepts a
+    Task-parented item without a human gate — routing is data, not code."""
+    from requiem.process_config import ProcessConfig
+
+    inputs = RootDispatchInputs(
+        item_id=ROOT_ITEM_ID, repo_path=Path("."), auto_plan=False,
+    )
+    engine = build_engine(
+        log_dir,
+        inputs=inputs,
+        twig=_twig_with_task_parent(),
+        today="2026-06-05",
+        process_config=ProcessConfig(
+            root_parent_types=frozenset({"Epic", "Feature", "Task"}),
+        ),
+    )
+    result = await engine.run("config-promotes-task")
+    assert isinstance(result, Completed)
+    assert result.final_node == "end_dispatched"
+
+    completed = completed_from_log(engine.log_path("config-promotes-task"))
+    assert completed["validate_root"]["kind"] == "success"
+    assert completed["validate_root"]["value"]["parent_type"] == "Task"
+
+
+async def test_custom_config_demotes_feature_parent_to_human(log_dir: Path):
+    """A process config that omits ``Feature`` routes a Feature-parented
+    item to the human gate — the override is honoured both ways."""
+    from requiem.process_config import ProcessConfig
+
+    inputs = RootDispatchInputs(
+        item_id=ROOT_ITEM_ID, repo_path=Path("."), auto_plan=False,
+    )
+    engine = build_engine(
+        log_dir,
+        inputs=inputs,
+        twig=_twig_with_feature_parent(),
+        gate_handler=_reject_handler,
+        process_config=ProcessConfig(root_parent_types=frozenset({"Epic"})),
+    )
+    result = await engine.run("config-demotes-feature")
+    assert isinstance(result, Completed)
+    assert result.final_node == "end_human"
+
+    completed = completed_from_log(engine.log_path("config-demotes-feature"))
+    vr = completed["validate_root"]
+    assert vr["kind"] == "needs_human"
+    assert vr["gate"] == "not_root"
+    # The rejection prompt reflects the *effective* config, not the default.
+    assert "['Epic']" in vr["prompt"]
+
+
+async def test_start_run_snapshots_effective_config(log_dir: Path):
+    """start_run records the effective config so resume reads a durable
+    snapshot rather than ambient disk (INV-RESTART)."""
+    from requiem.process_config import ProcessConfig
+
+    inputs = RootDispatchInputs(
+        item_id=ROOT_ITEM_ID, repo_path=Path("."), auto_plan=False,
+    )
+    engine = build_engine(
+        log_dir,
+        inputs=inputs,
+        twig=_twig_one_root(),
+        today="2026-06-06",
+        process_config=ProcessConfig(
+            root_parent_types=frozenset({"Epic", "Feature", "Initiative"}),
+        ),
+    )
+    await engine.run("config-snapshot")
+    completed = completed_from_log(engine.log_path("config-snapshot"))
+    snap = completed["start"]["value"]["process_config"]
+    assert snap["root_parent_types"] == ["Epic", "Feature", "Initiative"]
+

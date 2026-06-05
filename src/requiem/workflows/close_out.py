@@ -16,7 +16,7 @@ Node structure (the brief, as drawn):
 
     start
       → fetch_item                # twig.show
-      → resolve_pr                # if pr_number is None: scan item.raw
+      → resolve_pr                # pr_number, else item.raw, else gh search
       → fetch_pr                  # gh.pr_view; assert merged
          ├─ merged → fetch_criteria
          └─ not_merged → needs_human
@@ -388,7 +388,7 @@ def build_verb_registry(
 
     # ---- resolve_pr ------------------------------------------------
     @verbs.register("resolve_pr")
-    def _resolve_pr(ctx):
+    async def _resolve_pr(ctx):
         item_value = ctx.completed["fetch_item"]["value"]
         if inputs.pr_number is not None:
             return Success(
@@ -404,14 +404,49 @@ def build_verb_registry(
                 },
             )
         if len(linked) == 0:
+            # Issue #30: real twig JSON frequently omits the `pullRequests`
+            # link relation, so an absent linked-PR list is not proof there
+            # is no PR. Before escalating, fall back to a gh search by the
+            # implementation branch convention (`feature/<item_id>`).
+            search_hits = await _search_prs_for_item(ctx)
+            if len(search_hits) == 1:
+                return Success(
+                    value={
+                        "pr_number": int(search_hits[0].number),
+                        "source": "gh_search",
+                    },
+                )
+            if len(search_hits) > 1:
+                return NeedsHuman(
+                    gate=GATE_PR_AMBIGUOUS,
+                    prompt=(
+                        f"{len(search_hits)} PRs in {inputs.repo} match "
+                        f"AB#{inputs.item_id}'s branch convention. "
+                        f"Pass --pr <number> to disambiguate, or abort."
+                    ),
+                    options=("abort",),
+                    context={
+                        "item_id": inputs.item_id,
+                        "source": "gh_search",
+                        "candidates": [
+                            {"number": int(p.number), "title": p.title}
+                            for p in search_hits
+                        ],
+                    },
+                )
             return NeedsHuman(
                 gate=GATE_PR_NOT_LINKED,
                 prompt=(
-                    f"No PR linked to AB#{inputs.item_id} in {inputs.repo}. "
+                    f"No PR linked to AB#{inputs.item_id} in {inputs.repo}, "
+                    f"and a gh search found none. "
                     f"Pass --pr <number> or abort."
                 ),
                 options=("abort",),
-                context={"item_id": inputs.item_id, "repo": inputs.repo},
+                context={
+                    "item_id": inputs.item_id,
+                    "repo": inputs.repo,
+                    "searched": True,
+                },
             )
         # Multiple linked PRs — out of v0 scope to auto-pick; ask the operator.
         return NeedsHuman(
@@ -429,6 +464,21 @@ def build_verb_registry(
                 ],
             },
         )
+
+    async def _search_prs_for_item(ctx) -> list:
+        """Best-effort gh-search fallback for a PR linked to the item.
+
+        Searches by the implementation branch convention
+        (``head:feature/<item_id>``). A search failure is swallowed — the
+        caller then escalates to a human, which is the same safe destination
+        as before the fallback existed (issue #30).
+        """
+        gh = _require_gh(ctx)
+        query = f"head:feature/{inputs.item_id}"
+        try:
+            return await gh.pr_search(inputs.repo, query)
+        except GhClientError:
+            return []
 
     # ---- fetch_pr --------------------------------------------------
     @verbs.register("fetch_pr")
@@ -979,7 +1029,7 @@ def build_workflow() -> Workflow:
                 .edge("close_item", on="needs_human:abort", to="end_human")
             .terminate("end_success", disposition="completed")
             .terminate("end_failed",  disposition="failed")
-            .terminate("end_human",   disposition="failed")
+            .terminate("end_human",   disposition="needs_human")
             .humanize({
                 "start":               "Starting close-out",
                 "fetch_item":          "Fetched work item",

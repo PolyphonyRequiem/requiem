@@ -17,6 +17,7 @@ from typing import Protocol
 
 from requiem.clients.fs import FilesystemClient
 from requiem.clients.gh import GhClient
+from requiem.clients.kanban import KanbanClient
 from requiem.clients.twig import TwigClient
 
 
@@ -129,6 +130,7 @@ class Toolbelt:
     gh: GhClient | None = None
     fs: FilesystemClient | None = None
     twig: TwigClient | None = None
+    kanban: KanbanClient | None = None
 
     @classmethod
     def real(cls) -> "Toolbelt":
@@ -138,4 +140,5 @@ class Toolbelt:
             gh=GhClient(),
             fs=FilesystemClient(),
             twig=TwigClient(),
+            kanban=KanbanClient(),
         )

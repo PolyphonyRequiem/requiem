@@ -68,7 +68,11 @@ Out of scope (v0, deferred to ADR if revisited):
 """
 from __future__ import annotations
 
+import argparse
+import asyncio
 import subprocess
+import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -91,7 +95,12 @@ from requiem.outcomes import (
     PermanentFailure,
     Success,
 )
-from requiem.toolbelt import FakeFileClient, RealGitClient, Toolbelt
+from requiem.toolbelt import (
+    FakeFileClient,
+    RealFileClient,
+    RealGitClient,
+    Toolbelt,
+)
 
 
 # ---- public dataclasses (the workflow's return shape) -----------------
@@ -1427,3 +1436,112 @@ def _default_gate_handler(node_id: str, prompt: str, options: tuple[str, ...]) -
 
 
 _default_gate_handler.__requiem_auto__ = True  # type: ignore[attr-defined]
+
+
+# ---- standalone CLI entry point ------------------------------------
+#
+# Parity with planning + close_out: an operator can drive the
+# implementation workflow directly without writing a Python script
+# (bug-bash §"implementation"). Defaults run the self-contained demo;
+# `--live` wires the real Toolbelt against a real repo + ADO + GitHub.
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="python -m requiem.workflows.implementation",
+        description=(
+            "Implementation workflow — agent writes code for a leaf item, "
+            "tests it, opens a PR, hands off."
+        ),
+    )
+    p.add_argument(
+        "--item", type=int, default=None,
+        help="Leaf work-item id to implement (default: self-contained demo)",
+    )
+    p.add_argument(
+        "--repo", default="PolyphonyRequiem/requiem",
+        help="owner/repo the PR targets",
+    )
+    p.add_argument(
+        "--repo-path", default=".",
+        help="Local working copy the coder edits (default: cwd)",
+    )
+    p.add_argument("--base-branch", default="main", help="PR base branch")
+    p.add_argument(
+        "--test-command", default=None,
+        help="Shell command run to gate the change (e.g. 'pytest -q')",
+    )
+    p.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Inspect-only: no commit, push, or PR create",
+    )
+    p.add_argument(
+        "--live", action="store_true", default=False,
+        help="Use the real Toolbelt (git/gh/twig/fs) instead of demo fakes",
+    )
+    p.add_argument("--run-id", default=None)
+    p.add_argument("--log-dir", default=".runs")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_arg_parser().parse_args(argv)
+    log_dir = Path(args.log_dir).resolve()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    run_id = args.run_id or f"impl-{int(time.time())}"
+
+    inputs: ImplementationInputs | None = None
+    toolbelt: Toolbelt | None = None
+    if args.item is not None:
+        repo_path = Path(args.repo_path).resolve()
+        inputs = ImplementationInputs(
+            item_id=args.item,
+            repo=args.repo,
+            repo_path=repo_path,
+            base_branch=args.base_branch,
+            test_command=args.test_command,
+            dry_run=args.dry_run,
+        )
+        if args.live:
+            toolbelt = Toolbelt(
+                git=RealGitClient(),
+                files=RealFileClient(),
+                gh=GhClient(),
+                twig=TwigClient(),
+                fs=FilesystemClient(repo_path),
+            )
+    elif args.live:
+        print(
+            "error: --live requires --item (the demo has no real work item)",
+            file=sys.stderr,
+        )
+        return 2
+
+    engine = build_engine(log_dir, inputs=inputs, toolbelt=toolbelt)
+
+    from requiem.cli.main import _print_verdict_card, _render_context_for
+    from requiem.cli.render import render_event
+
+    mod = sys.modules[__name__]
+    cx = _render_context_for(mod, engine.workflow.name, engine.workflow.humanize)
+
+    print(f"requiem.workflows.implementation — run_id={run_id}")
+    print(f"log: {engine.log_path(run_id)}")
+    print("─" * 72)
+
+    def _observer(envelope: dict[str, Any]) -> None:
+        for line in render_event(envelope, cx):
+            print(line)
+    engine.on_event = _observer
+
+    result = asyncio.run(engine.run(run_id))
+
+    print("─" * 72)
+    _print_verdict_card(mod, cx)
+    print(f"result: {type(result).__name__}")
+    print(f"log: {engine.log_path(run_id)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

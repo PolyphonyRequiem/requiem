@@ -17,6 +17,7 @@ classifiers = [
 ]
 dependencies = [
     "pydantic>=2.5,<3",
+    "pyyaml>=6",
 ]
 
 [project.optional-dependencies]

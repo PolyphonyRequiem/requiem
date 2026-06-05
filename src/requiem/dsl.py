@@ -62,7 +62,7 @@ class HumanGateNode(BaseModel):
 class TerminateNode(BaseModel):
     kind: Literal["terminate"] = "terminate"
     node_id: str
-    disposition: Literal["completed", "failed", "cancelled"] = "completed"
+    disposition: Literal["completed", "failed", "cancelled", "needs_human"] = "completed"
 
 
 class SubWorkflowNode(BaseModel):

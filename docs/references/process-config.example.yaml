@@ -1,0 +1,35 @@
+# Example Requiem process config.
+#
+# Copy to `<repo>/.requiem-config/process.yaml` to override the built-in
+# polyphony-equivalent tier model. Requiem discovers this file by walking up
+# from the run's repo_path; with no file present, the defaults below apply.
+# See ADR-0015 and `requiem.process_config`.
+
+# Parent work-item types that still qualify a child as a dispatchable SDLC
+# root. A User Story / Task whose parent is one of these is a valid root;
+# anything else routes to a human gate. (Default: [Epic, Feature].)
+root_parent_types:
+  - Epic
+  - Feature
+
+# Optional: collapse type synonyms before any routing decision.
+# type_aliases:
+#   Bug: Task
+
+# Role -> profile routing for the Hermes delivery fleet (ADR-0017 §1). Each
+# role maps to a fleet profile, the skills it runs with, and an optional model
+# override. Absent `roles` means the executor uses its single --assignee flag.
+# roles:
+#   implementer:
+#     profile: requiem-implementer
+#     skills: [coder]
+#   reviewer:
+#     profile: requiem-reviewer
+#     skills: [code-review]
+#   closer:
+#     profile: requiem-closer
+
+# Reserved — parsed and snapshotted into the run, but not yet consumed by
+# planning (planning decides decomposability per-node today; see ADR-0010).
+# decomposable_types: [Epic, Feature]
+# implementable_types: [Task, Bug, User Story]

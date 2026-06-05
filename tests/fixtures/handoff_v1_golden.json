@@ -1,0 +1,21 @@
+{
+  "_comment": "GOLDEN FIXTURE — the kanban worker→requiem handoff wire contract (ADR-0017 §4). This is the EXACT shape a requiem-* profile worker must emit via kanban_complete(metadata=...) and that requiem.handoff.parse_handoff must accept. Co-owned by the kanban-delivery and profile-distribution tracks: neither side changes the emitted/consumed shape without updating this file AND tests/test_handoff_contract.py.",
+  "schema_version": 1,
+  "leaf_id": "22002",
+  "root_item": "880",
+  "plan_hash": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2",
+  "worker_profile": "requiem-implementer",
+  "branch": "impl/880-22002",
+  "commit_sha": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c",
+  "pr_url": "https://github.com/acme/widgets/pull/417",
+  "changed_files": [
+    "src/widgets/auth/reset.py",
+    "src/widgets/auth/tests/test_reset.py",
+    "migrations/003_single_use_reset_tokens.sql"
+  ],
+  "tests_run": [
+    "tests/test_reset.py::test_happy_path",
+    "tests/test_reset.py::test_expired_token_410"
+  ],
+  "worker_profile_version": "1.4.2"
+}

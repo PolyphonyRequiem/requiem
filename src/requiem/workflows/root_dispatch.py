@@ -95,6 +95,12 @@ from requiem.outcomes import (
     RetryableFailure,
     Success,
 )
+from requiem.process_config import (
+    DEFAULT_ROOT_PARENT_TYPES,
+    ProcessConfig,
+    default_process_config,
+    resolve_process_config,
+)
 from requiem.toolbelt import Toolbelt
 from requiem.workflows import planning as _planning
 
@@ -180,13 +186,15 @@ ERROR_KINDS: frozenset[str] = frozenset({
 # ---- root-tier policy --------------------------------------------------
 
 
-ROOT_PARENT_TYPES: frozenset[str] = frozenset({"Epic", "Feature"})
-"""Parent work-item types that still qualify the child as a root.
+ROOT_PARENT_TYPES: frozenset[str] = DEFAULT_ROOT_PARENT_TYPES
+"""Default parent work-item types that still qualify the child as a root.
 
-Polyphony's tier model puts ``Epic`` and ``Feature`` above the
-implementable tier; a User Story / Task whose parent is one of these
-is a valid root for the SDLC pipeline. Anything else (Story under
-Story, Task under Task, etc.) routes to the human gate.
+Retained for back-compat; the *effective* set now comes from the run's
+process config (``.requiem-config/process.yaml`` → :class:`ProcessConfig`),
+snapshotted into the event log by ``start_run`` and consumed by
+``validate_root``. Polyphony's tier model puts ``Epic`` and ``Feature`` above
+the implementable tier; a User Story / Task whose parent is one of these is a
+valid root for the SDLC pipeline. Anything else routes to the human gate.
 """
 
 
@@ -386,14 +394,19 @@ def build_verb_registry(
     twig: TwigClientProto,
     manifest_dir: Path,
     today: str | None = None,
+    process_config: ProcessConfig | None = None,
 ) -> VerbRegistry:
     """Build the closure-bound verb registry for one dispatch run.
 
     ``today`` is a hook so tests can pin the calendar date that
     ``compute_run_id`` uses for fresh manifests — mirrors Bizet's
-    ``test_runner`` injection pattern.
+    ``test_runner`` injection pattern. ``process_config`` is the effective
+    type-routing config; when ``None`` it falls back to the documented
+    defaults. It is snapshotted into ``start_run``'s output so resume reads
+    the durable snapshot rather than re-reading disk (INV-RESTART).
     """
     verbs = VerbRegistry()
+    config = process_config or default_process_config()
 
     @verbs.register("start_run")
     def _start(ctx):
@@ -405,6 +418,7 @@ def build_verb_registry(
             "base_branch": inputs.base_branch,
             "dry_run": inputs.dry_run,
             "auto_plan": inputs.auto_plan,
+            "process_config": config.to_snapshot(),
         })
 
     # ---- fetch_item ---------------------------------------------------
@@ -453,6 +467,14 @@ def build_verb_registry(
     def _validate_root(ctx):
         item = ctx.completed["fetch_item"]["value"]
         parent_id = item.get("parent_id")
+        # Use the config snapshot recorded by start_run so a resume re-reads
+        # the durable routing facts, not ambient disk (INV-RESTART). Fall back
+        # to the closed-over config for direct-verb unit tests.
+        snap = (ctx.completed.get("start") or {}).get("value", {}).get(
+            "process_config"
+        )
+        eff = ProcessConfig.from_snapshot(snap) if snap else config
+        root_types = eff.root_parent_types
         if parent_id is None:
             return Success(value={
                 "is_root": True,
@@ -496,7 +518,7 @@ def build_verb_registry(
                 },
             )
 
-        if parent.work_item_type in ROOT_PARENT_TYPES:
+        if eff.is_root_parent_type(parent.work_item_type):
             return Success(value={
                 "is_root": True,
                 "reason": f"parent is {parent.work_item_type}",
@@ -511,7 +533,7 @@ def build_verb_registry(
                 f"AB#{inputs.item_id} (\"{item.get('title')}\") has parent "
                 f"AB#{parent.id} of type {parent.work_item_type!r} "
                 f"(\"{parent.title}\") — not at root tier "
-                f"({sorted(ROOT_PARENT_TYPES)}). Force-root or reject?"
+                f"({sorted(root_types)}). Force-root or reject?"
             ),
             options=("force-root", "reject"),
             context={
@@ -1127,6 +1149,7 @@ def build_engine(
     gate_handler: Callable | None = None,
     manifest_dir: Path | None = None,
     today: str | None = None,
+    process_config: ProcessConfig | None = None,
 ) -> Engine:
     """Construct a runnable Engine for the root-dispatch workflow.
 
@@ -1146,6 +1169,7 @@ def build_engine(
     if twig is None:
         twig = _demo_twig(inputs.item_id)
     mdir = manifest_dir or inputs.manifest_dir or (log_dir / ".runs")
+    config = resolve_process_config(process_config, inputs.repo_path)
 
     planning_module = _register_planning_shim(
         item_id=inputs.item_id,
@@ -1158,6 +1182,7 @@ def build_engine(
         workflow=build_workflow(planning_module=planning_module),
         verbs=build_verb_registry(
             inputs, twig=twig, manifest_dir=mdir, today=today,
+            process_config=config,
         ),
         agents=build_agent_registry(),
         # The root-dispatch workflow itself invokes no agents; the
