@@ -160,10 +160,40 @@ Adopt **Option C** (ratified 2026-06-05). Specifically:
    trunk exists; verify every expected leaf PR is head/base-correct and
    merged; (optionally) verify requirement dispositions or gate if omitted;
    open/reuse `feature/<root>` → `main`; backlink; end. No self-merge.
+   **STATUS: landed 2026-06-05** (`src/requiem/workflows/feature_pr.py`,
+   `tests/test_feature_pr_workflow.py`, commit `0625cf6`). Takes the expected
+   leaf set as `(leaf_id, pr_number)` and reads each via `gh.pr_view` (merged
+   state is unreliable through an open-only `gh pr list`).
 4. **Driver wiring** — invoke after `aggregate` approval in `end_to_end`.
 
 Each step is independently testable; the whole is wired only at step 4, so the
 tree never sits half-integrated.
+
+### Open refinement — the Hermes worktree cuts from HEAD (flagged 2026-06-05)
+
+Scoping steps 1–2 surfaced a wrinkle the body above glossed. Because
+`hermes kanban create` only takes `--branch` (the worktree branch name) and the
+worker cuts that worktree from the **board repo's current HEAD**, requiem cannot
+make a leaf branch *descend from* `feature/<root>` — only *name* it
+`impl/<root>-<item>`. Two consequences for steps 1–2:
+
+- **"Trunk-before-fan-out" does not auto-correct the leaf base.** Its only real
+  job is ensuring `feature/<root>` exists before requiem *opens* the leaf PR
+  (`base=feature/<root>`). The leaf commits still originate from default HEAD.
+- **Drift accrues as leaves merge.** A leaf branch cut from `main` PRs cleanly
+  into a fresh `feature/<root>` (initially == `main`), but once earlier leaves
+  merge into the trunk, a later leaf branch (still rooted at old `main`) can
+  conflict against the now-advanced trunk. This is the target-drift problem
+  ADR-0007 §5.1 foresaw, arriving via the worktree model rather than a
+  long-lived feature branch. v0 surfaces an unmergeable leaf PR to the human
+  (no auto-rebase); a `rebase_onto_target` verb (the sole trunk writer, per
+  INV-NO-DIRECT-TRUNK-COMMITS) is the eventual answer.
+
+Steps 1–2 should therefore be **built against a live Hermes loop** (or a
+faithful integration harness) rather than blind, because the base-ancestry and
+drift behaviour is exactly what unit fakes cannot exercise. `feature_pr.py`
+(step 3) is unaffected — it only reads merged PR state — which is why it landed
+first.
 
 ### Component ownership (sub-fork resolved 2026-06-05)
 
