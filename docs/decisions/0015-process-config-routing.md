@@ -54,11 +54,49 @@ deterministically from the snapshot `start_run` recorded first (INV-RESTART).
 
 ## Scope / not yet
 
-This closes the `root_dispatch` half of non-negotiable #1. `decomposable_types`
-/ `implementable_types` are parsed and snapshotted but not yet consumed by
-planning (planning decides decomposability per-node today, ADR-0010); wiring
-those into planning's tier hints is a follow-up. This is **process-config-backed
-root classification**, not "type-agnostic routing fully solved."
+This ADR's original scope closed the `root_dispatch` half of non-negotiable #1.
+The planning half — consuming `decomposable_types` / `implementable_types` —
+landed subsequently and is recorded in the addendum below.
+
+## Addendum (planning tier enforcement)
+
+`branch_decomposable` in `requiem.workflows.planning` now consults the process
+config's tier sets via `ProcessConfig.tier_for_type(work_item_type)` and treats
+them as **authoritative over the planner's own `decomposable` flag** — the tier
+model is a `process.yaml` thing, not an LLM judgement call:
+
+- **implementable type → forced leaf.** Even if the planner proposed a
+  decomposition, the node is recorded as a leaf and the discarded child count is
+  kept as a breadcrumb (`overrode_planner` / `discarded_child_count`). This is
+  the *contracting* direction — we never fabricate work — so it applies silently
+  rather than gating.
+- **decomposable type the planner left as a leaf (or with zero children) →
+  fail closed** to a new `type_policy_gate` (`config_requires_decomposition`);
+  the operator proceeds (records needs-human) or aborts. We never fabricate
+  children to satisfy the policy.
+- **configured policy but no `work_item_type` to classify → fail closed**
+  (`missing_work_item_type_for_policy`) rather than silently reverting to
+  LLM-driven tiering.
+- **empty tier sets (the default) → the planner's decision stands**, so every
+  existing repo and test is behaviourally unchanged.
+- The planner *prompt* is also seeded with the policy so a cooperating model
+  complies by default; the gate is the deterministic backstop, not the
+  first line of defence.
+
+**Resume fidelity / propagation.** The effective config is snapshotted into
+planning's `start_run` output (mirroring `validate_root`) and **threaded into
+recursive child sub-workflow inputs** (`child_inputs`), so a child tiers with
+the exact config the parent run started with. This is restart-safe by
+construction: the config travels as recorded JSON inputs, never as ambient disk
+state or a contextvar that a process restart would drop (INV-RESTART). The
+record verb and the human-readable sidecar both reflect `branch_decomposable`'s
+*effective* decision, never the raw planner flag, so the durable plan can't
+contradict the routing that actually happened.
+
+**Contradiction handling.** A type declared both decomposable and implementable
+(directly or via aliases) is a contradictory policy and raises
+`ProcessConfigError` at construction — covering YAML load, `from_snapshot`, and
+direct construction (`__post_init__`), checked after alias normalization.
 
 ## Example `.requiem-config/process.yaml`
 
@@ -70,7 +108,7 @@ root_parent_types:
 # Optional: collapse synonyms before routing.
 type_aliases:
   Bug: Task
-# Reserved (parsed + snapshotted; not yet consumed by planning).
+# Consumed by planning's branch_decomposable (tier enforcement).
 decomposable_types: [Epic, Feature]
-implementable_types: [Task, Bug, User Story]
+implementable_types: [Task, User Story]
 ```

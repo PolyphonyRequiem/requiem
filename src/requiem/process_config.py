@@ -86,10 +86,12 @@ class ProcessConfigError(Exception):
 class ProcessConfig:
     """The type-routing facts a workflow needs, loaded from ``process.yaml``.
 
-    Only ``root_parent_types`` is consumed today; the remaining fields are
-    reserved so the on-disk schema can grow (decomposable/leaf hints, type
-    aliases) without a breaking migration. ``source``/``sha256`` carry the
-    provenance of the effective config so it can be snapshotted into the run.
+    ``root_parent_types`` drives root classification (root_dispatch) and
+    ``decomposable_types``/``implementable_types`` drive the planning tier
+    decision (see :meth:`tier_for_type`); ``type_aliases`` normalize type
+    names on both. ``roles`` map Requiem roles to the Hermes fleet.
+    ``source``/``sha256`` carry the provenance of the effective config so it
+    can be snapshotted into the run.
     """
 
     root_parent_types: frozenset[str] = DEFAULT_ROOT_PARENT_TYPES
@@ -100,15 +102,67 @@ class ProcessConfig:
     source: Path | None = None
     sha256: str | None = None
 
+    def __post_init__(self) -> None:
+        # A type cannot be declared both decomposable and implementable — that
+        # is a contradictory tier policy. Catch it loud at construction (covers
+        # parsing, ``from_snapshot``, and direct construction) rather than
+        # letting it resolve inconsistently at routing time (INV-NO-CORRUPT-
+        # FORWARD). The check is alias-normalized so an indirect contradiction
+        # (e.g. ``Bug -> Task`` with ``Bug`` decomposable and ``Task``
+        # implementable) is also rejected.
+        overlap = self._normalize_set(self.decomposable_types) & self._normalize_set(
+            self.implementable_types
+        )
+        if overlap:
+            raise ProcessConfigError(
+                "process config declares type(s) as both decomposable and "
+                f"implementable (after alias normalization): {sorted(overlap)}",
+                path=self.source,
+            )
+
     def normalize_type(self, work_item_type: str | None) -> str | None:
         """Resolve a work-item type through the configured aliases."""
         if work_item_type is None:
             return None
         return self.type_aliases.get(work_item_type, work_item_type)
 
+    def _normalize_set(self, types: frozenset[str]) -> frozenset[str]:
+        """Alias-resolve every member of a tier set."""
+        return frozenset(self.type_aliases.get(t, t) for t in types)
+
     def is_root_parent_type(self, work_item_type: str | None) -> bool:
         """True if a parent of ``work_item_type`` keeps its child at root tier."""
         return self.normalize_type(work_item_type) in self.root_parent_types
+
+    def has_tier_policy(self) -> bool:
+        """True if any decompose/implement tier constraint is configured."""
+        return bool(self.decomposable_types or self.implementable_types)
+
+    def tier_for_type(
+        self, work_item_type: str | None
+    ) -> str:
+        """Classify a work-item type against the configured tier sets.
+
+        Returns one of:
+
+        * ``"implementable"`` — the type must be a leaf (never decomposed);
+        * ``"decomposable"``  — the type must be broken down into children;
+        * ``"unspecified"``   — no config opinion; the planner's judgment stands.
+
+        Alias normalization is applied to both the input type and the
+        configured sets, so ``type_aliases`` are honored on both sides. A
+        ``None``/blank type is always ``"unspecified"`` here; callers that have
+        a tier policy configured should fail closed on a missing type rather
+        than relying on this method (see the planning workflow).
+        """
+        norm = self.normalize_type(work_item_type)
+        if norm is None:
+            return "unspecified"
+        if norm in self._normalize_set(self.implementable_types):
+            return "implementable"
+        if norm in self._normalize_set(self.decomposable_types):
+            return "decomposable"
+        return "unspecified"
 
     def role(self, name: str) -> RoleBinding | None:
         """The fleet binding for a role, or ``None`` when none is configured."""

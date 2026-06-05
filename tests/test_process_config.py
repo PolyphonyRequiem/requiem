@@ -115,6 +115,90 @@ def test_roles_must_be_mapping(tmp_path: Path):
         load_process_config(tmp_path / CONFIG_DIRNAME / CONFIG_FILENAME)
 
 
+# ---- tier policy: decomposable / implementable (#1) -------------------
+
+
+def test_tier_for_type_classifies_against_configured_sets():
+    cfg = ProcessConfig(
+        decomposable_types=frozenset({"User Story"}),
+        implementable_types=frozenset({"Task", "Bug"}),
+    )
+    assert cfg.tier_for_type("User Story") == "decomposable"
+    assert cfg.tier_for_type("Task") == "implementable"
+    assert cfg.tier_for_type("Bug") == "implementable"
+    # A type named by neither set has no config opinion.
+    assert cfg.tier_for_type("Feature") == "unspecified"
+    # A missing type is unspecified at this layer (callers fail closed).
+    assert cfg.tier_for_type(None) == "unspecified"
+
+
+def test_default_config_has_no_tier_policy():
+    cfg = default_process_config()
+    assert not cfg.has_tier_policy()
+    assert cfg.tier_for_type("Task") == "unspecified"
+
+
+def test_has_tier_policy_true_when_either_set_present():
+    assert ProcessConfig(implementable_types=frozenset({"Task"})).has_tier_policy()
+    assert ProcessConfig(decomposable_types=frozenset({"Epic"})).has_tier_policy()
+
+
+def test_tier_for_type_honors_aliases_on_input():
+    cfg = ProcessConfig(
+        type_aliases={"Issue": "Task"},
+        implementable_types=frozenset({"Task"}),
+    )
+    assert cfg.tier_for_type("Issue") == "implementable"
+
+
+def test_tier_for_type_honors_aliases_on_configured_set():
+    # The configured set entry itself is alias-resolved, so an item whose raw
+    # type equals the alias target classifies correctly.
+    cfg = ProcessConfig(
+        type_aliases={"Bug": "Task"},
+        implementable_types=frozenset({"Bug"}),
+    )
+    assert cfg.tier_for_type("Task") == "implementable"
+
+
+def test_contradictory_tier_sets_fail_closed():
+    with pytest.raises(ProcessConfigError):
+        ProcessConfig(
+            decomposable_types=frozenset({"Task"}),
+            implementable_types=frozenset({"Task"}),
+        )
+
+
+def test_alias_induced_tier_contradiction_fails_closed():
+    # Bug -> Task makes the two sets overlap after normalization.
+    with pytest.raises(ProcessConfigError):
+        ProcessConfig(
+            type_aliases={"Bug": "Task"},
+            decomposable_types=frozenset({"Bug"}),
+            implementable_types=frozenset({"Task"}),
+        )
+
+
+def test_contradiction_caught_loading_from_yaml(tmp_path: Path):
+    path = _write_config(
+        tmp_path,
+        "decomposable_types: [Task]\nimplementable_types: [Task]\n",
+    )
+    with pytest.raises(ProcessConfigError):
+        load_process_config(path)
+
+
+def test_tier_sets_round_trip_through_snapshot():
+    cfg = ProcessConfig(
+        decomposable_types=frozenset({"Epic", "Feature"}),
+        implementable_types=frozenset({"Task"}),
+        type_aliases={"Issue": "Task"},
+    )
+    back = ProcessConfig.from_snapshot(cfg.to_snapshot())
+    assert back.tier_for_type("Epic") == "decomposable"
+    assert back.tier_for_type("Issue") == "implementable"
+
+
 
 def test_load_overrides_root_parent_types(tmp_path: Path):
     path = _write_config(tmp_path, "root_parent_types: [Epic, Initiative]\n")

@@ -157,7 +157,7 @@ whether those decisions are encoded *somewhere* in Requiem.
 
 | # | Non-negotiable | Status | Note |
 | -- | --- | --- | --- |
-| 1 | Type-agnostic routing from process config | 🟡 partial | `requiem.process_config` loads `.requiem-config/process.yaml` into a frozen `ProcessConfig`; `root_dispatch.validate_root` now classifies root tier from `config.root_parent_types` (snapshotted into the event log by `start_run` for resume fidelity) instead of the old hardcoded `{Epic,Feature}` literal (ADR-0015). Reserved `decomposable_types`/`implementable_types` are parsed but not yet consumed by planning — that wiring is the remaining half. |
+| 1 | Type-agnostic routing from process config | 🟡 partial | `requiem.process_config` loads `.requiem-config/process.yaml` into a frozen `ProcessConfig`; `root_dispatch.validate_root` classifies root tier from `config.root_parent_types` (snapshotted into the event log by `start_run` for resume fidelity) instead of the old hardcoded `{Epic,Feature}` literal (ADR-0015). `decomposable_types`/`implementable_types` are now **consumed by `planning`**: `branch_decomposable` enforces the tier policy over the planner's `decomposable` flag (implementable → forced leaf; decomposable the planner left as a leaf → fail-closed `type_policy_gate`), the config is snapshotted into `start_run` and threaded into recursive child inputs (INV-RESTART), and `tier_for_type` honours aliases on both sides. Remaining: surfacing the policy in the web dashboard (#8) and the live ADO worker loop. |
 | 2 | Polyphony CLI as deterministic decision layer (JSON stdout) | 🔵 better | Replaced by in-process Python verbs returning discriminated outcomes (INV-DISCRIMINATED-OUTCOMES). The *requirement underneath* — deterministic decisions — is honoured |
 | 3 | `twig` as write-side bridge to ADO | 🟡 partial | `TwigClient` has show/comment/set_state/`create_child_async` (used by `commit_plan` seeding, PR #59). PR-link surfacing still rough (issue #30) |
 | 4 | Root SDLC orchestrator (`polyphony@polyphony`) | 🟡 partial | `full_sdlc.py` is a five-stage linear pipeline; not a tree-walking root with batch dispatch or outer iterate-until-stable loop. **Fan-out executor** (dispatch implementable leaves into `implementation`) is the missing core — designed + **blocked**, see ADR-0013 (blockers B1 child-seam propagation, B3 branch model) |
@@ -168,7 +168,7 @@ whether those decisions are encoded *somewhere* in Requiem.
 | 9 | Durable seed manifest for partial-seed recovery | ✅ at-parity | `root_dispatch.write_manifest` is idempotent read-or-create; INV-RESTART covers re-entry |
 | 10 | Platform-specific PR lifecycles (GitHub and ADO) | 🟡 partial | GitHub ✅ (`pr_lifecycle.py`). ADO ❌ (no `ado_pr` module) |
 
-**Scorecard:** 2 ✅ at-parity, 1 🔵 better, 5 🟡 partial, 2 ❌ missing. **Three of ten** non-negotiables have material work remaining (#7 merge-group, #8 web dashboard ❌; #1 process-config, #3 twig write-side, #5/#10 still partial). (#6 closed by PRs #59 + #60; #1 advanced to partial by ADR-0015.)
+**Scorecard:** 2 ✅ at-parity, 1 🔵 better, 5 🟡 partial, 2 ❌ missing. **Three of ten** non-negotiables have material work remaining (#7 merge-group, #8 web dashboard ❌; #1 process-config, #3 twig write-side, #5/#10 still partial). (#6 closed by PRs #59 + #60; #1 advanced to partial by ADR-0015 and further by the planning tier-policy wiring — `decomposable_types`/`implementable_types` now drive `branch_decomposable`.)
 
 ### 2.10 Fan-out executor — the critical-path blocker (ADR-0013)
 

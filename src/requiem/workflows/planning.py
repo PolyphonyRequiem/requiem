@@ -126,6 +126,7 @@ from requiem.dsl import AgentRegistry, VerbRegistry, Workflow, WorkflowBuilder
 from requiem.kernel import Engine
 from requiem.outcomes import NeedsHuman, PermanentFailure, RetryableFailure, Success
 from requiem.persistence import replay
+from requiem.process_config import ProcessConfig, default_process_config
 from requiem.toolbelt import Toolbelt
 
 
@@ -151,6 +152,14 @@ _active_provider_cv: contextvars.ContextVar["AgentProvider | None"] = (
 )
 _active_gate_handler_cv: contextvars.ContextVar[Any] = (
     contextvars.ContextVar("requiem.planning.active_gate_handler", default=None)
+)
+# The process config IS recorded into child sub-workflow inputs (durable,
+# restart-safe — see ``child_inputs``), so unlike the seams above it never
+# depends on this contextvar for correctness across a restart. The contextvar
+# is only a convenience for in-process recursive construction; recorded inputs
+# (and the ``start_run`` snapshot) remain authoritative (INV-RESTART).
+_active_process_config_cv: contextvars.ContextVar["ProcessConfig | None"] = (
+    contextvars.ContextVar("requiem.planning.active_process_config", default=None)
 )
 
 
@@ -322,9 +331,25 @@ def build_verb_registry(
     ancestor_item_ids: Sequence[int],
     twig: TwigClientProto,
     log_dir: Path,
+    config: ProcessConfig | None = None,
 ) -> VerbRegistry:
     verbs = VerbRegistry()
     ancestor_set = tuple(int(a) for a in ancestor_item_ids)
+    closed_config = config or default_process_config()
+
+    def _effective_config(ctx) -> ProcessConfig:
+        """The tier-routing config for this run.
+
+        Prefer the durable snapshot recorded by ``start_run`` so a resume
+        re-reads the routing facts the run was started with, not ambient disk
+        (INV-RESTART). Fall back to the closed-over config for direct-verb unit
+        tests that invoke a verb without running ``start_run`` first. This
+        mirrors root_dispatch's ``validate_root``.
+        """
+        snap = (ctx.completed.get("start") or {}).get("value", {}).get(
+            "process_config"
+        )
+        return ProcessConfig.from_snapshot(snap) if snap else closed_config
 
     @verbs.register("start_run")
     def _start(ctx):
@@ -335,6 +360,9 @@ def build_verb_registry(
                 "current_depth": current_depth,
                 "max_depth": max_depth,
                 "ancestor_item_ids": list(ancestor_set),
+                # Snapshot the effective tier-routing config so a resume reads
+                # the durable facts rather than re-reading disk (INV-RESTART).
+                "process_config": closed_config.to_snapshot(),
             },
         )
 
@@ -390,10 +418,25 @@ def build_verb_registry(
     def _planner_prompt(iteration: int):
         def _prompt(ctx):
             item = ctx.completed["fetch_item"]["value"]
+            policy = _effective_config(ctx).tier_for_type(item.get("work_item_type"))
+            policy_line = ""
+            if policy == "implementable":
+                policy_line = (
+                    f"Per repo process policy, work items of type "
+                    f"'{item['work_item_type']}' are IMPLEMENTABLE leaves: do NOT "
+                    "decompose. Set decomposable=false and propose no children.\n"
+                )
+            elif policy == "decomposable":
+                policy_line = (
+                    f"Per repo process policy, work items of type "
+                    f"'{item['work_item_type']}' MUST be decomposed: set "
+                    "decomposable=true and propose at least one child.\n"
+                )
             base = (
                 f"Plan work item AB#{item['item_id']} — \"{item['title']}\" "
                 f"(type={item['work_item_type']}, state={item['state']}).\n"
                 f"Current planning depth: {current_depth} of {max_depth}.\n"
+                + policy_line
             )
             if iteration == 1:
                 return base + "Produce a first plan."
@@ -478,15 +521,82 @@ def build_verb_registry(
                                                   sequential child spawning)
         * ``PermanentFailure("recursion_depth_exceeded")`` → recursion_depth_gate
         * ``PermanentFailure("too_many_children")``        → too_many_children_gate
+        * ``PermanentFailure("config_requires_decomposition")`` → type_policy_gate
+        * ``PermanentFailure("missing_work_item_type_for_policy")`` → type_policy_gate
+
+        The process config's tier policy (``implementable_types`` /
+        ``decomposable_types``) is *authoritative* over the planner's
+        ``decomposable`` flag: config owns the tier model (§9 #1). An
+        implementable type is forced to a leaf (the safe, contracting
+        direction — we never fabricate work); a decomposable type the planner
+        failed to break down fails closed to a human gate. When neither tier
+        set names the type, the planner's judgment stands unchanged.
 
         Using PermanentFailure variants as branch selectors is the
         established convention in this workflow (see ``router_i``).
         """
         approved_iter = _find_approved_iteration(ctx.completed)
         planner = ctx.completed[f"planner_{approved_iter}"]["value"]["parsed"]
-        decomposable = bool(planner.get("decomposable"))
+        planner_decomposable = bool(planner.get("decomposable"))
         children = planner.get("children", [])
         child_count = len(children)
+
+        cfg = _effective_config(ctx)
+        work_item_type = ctx.completed["fetch_item"]["value"].get("work_item_type")
+        policy = cfg.tier_for_type(work_item_type)
+
+        # Fail closed: a configured tier policy cannot be applied to an item
+        # whose type is missing/blank — surface it rather than silently
+        # falling back to LLM-driven tiering (the very thing §9 #1 forbids).
+        if cfg.has_tier_policy() and not (work_item_type or "").strip():
+            return PermanentFailure(
+                error_kind="missing_work_item_type_for_policy",
+                message=(
+                    "process config declares a tier policy but the work item "
+                    "has no work_item_type to classify"
+                ),
+                details={
+                    "approved_iteration": approved_iter,
+                    "planner_decomposable": planner_decomposable,
+                },
+            )
+
+        # Implementable types are forced to leaves regardless of the planner.
+        if policy == "implementable":
+            return Success(
+                value={
+                    "decomposable": False,
+                    "branch": "leaf",
+                    "child_count": 0,
+                    "approved_iteration": approved_iter,
+                    "policy_tier": "implementable",
+                    "overrode_planner": planner_decomposable,
+                    "planner_decomposable": planner_decomposable,
+                    "discarded_child_count": child_count if planner_decomposable else 0,
+                },
+            )
+
+        # Decomposable types MUST break down; a planner leaf (or zero proposed
+        # children) is an unsatisfiable policy → fail closed to a human gate.
+        if policy == "decomposable" and (not planner_decomposable or child_count == 0):
+            return PermanentFailure(
+                error_kind="config_requires_decomposition",
+                message=(
+                    f"process config requires type '{work_item_type}' to be "
+                    f"decomposed, but the planner produced "
+                    f"{'a leaf plan' if not planner_decomposable else 'no children'}"
+                ),
+                details={
+                    "approved_iteration": approved_iter,
+                    "policy_tier": "decomposable",
+                    "planner_decomposable": planner_decomposable,
+                    "child_count": child_count,
+                    "work_item_type": work_item_type,
+                },
+            )
+
+        # No tier override applies; the planner's decision stands.
+        decomposable = planner_decomposable
         if not decomposable:
             return Success(
                 value={
@@ -494,6 +604,8 @@ def build_verb_registry(
                     "branch": "leaf",
                     "child_count": 0,
                     "approved_iteration": approved_iter,
+                    "policy_tier": policy,
+                    "overrode_planner": False,
                 },
             )
         if child_count > MAX_CHILDREN:
@@ -609,12 +721,20 @@ def build_verb_registry(
         # from the parent's item_id + run_id.
         parent_handle = f"plan-{item_id}-{ctx.run_id}"
         new_ancestors = list(ancestor_set) + [item_id]
+        # Carry the durable config snapshot into the child's recorded inputs so
+        # the recursive sub-workflow tiers with the SAME config the parent run
+        # started with — restart-safe, never re-reading ambient disk and never
+        # depending on a contextvar surviving a process restart (INV-RESTART).
+        snap = (ctx.completed.get("start") or {}).get("value", {}).get(
+            "process_config"
+        )
         return {
             "item_id": child_id,
             "current_depth": current_depth + 1,
             "max_depth": max_depth,
             "parent_plan_id": parent_handle,
             "ancestor_item_ids": new_ancestors,
+            "process_config": snap,
         }
 
     @verbs.register("aggregate_children")
@@ -693,6 +813,35 @@ def build_verb_registry(
         aggregate = (ctx.completed.get("aggregate_children") or {}).get("value") or {}
         children = aggregate.get("children") or []
 
+        # branch_decomposable is the authority on the effective tier decision:
+        # a process-config tier override (e.g. implementable type → forced leaf)
+        # must win over the planner's own ``decomposable`` flag in the durable
+        # record and sidecar, or the recorded plan would contradict the routing
+        # that actually happened. On the recurse path branch_decomposable routed
+        # via permanent_failure (no Success value recorded); aggregate_children's
+        # presence means we decomposed.
+        branch_entry = ctx.completed.get("branch_decomposable") or {}
+        if branch_entry.get("kind") == "success":
+            bval = branch_entry.get("value") or {}
+            effective_decomposable = bool(bval.get("decomposable"))
+            overrode_planner = bool(bval.get("overrode_planner"))
+            policy_tier = bval.get("policy_tier")
+            discarded_child_count = int(bval.get("discarded_child_count") or 0)
+        else:
+            # Recurse path: the planner decomposed and we aggregated children.
+            effective_decomposable = True
+            overrode_planner = False
+            policy_tier = _effective_config(ctx).tier_for_type(
+                item.get("work_item_type")
+            )
+            discarded_child_count = 0
+
+        # When config forced a leaf over a planner that proposed children, the
+        # proposals are discarded (not committed) — keep only a diagnostic count.
+        proposals = (
+            [] if overrode_planner else [dict(c) for c in planner.get("children", [])]
+        )
+
         artifact = _write_plan_sidecar(
             log_dir=log_dir,
             run_id=ctx.run_id,
@@ -702,15 +851,21 @@ def build_verb_registry(
             approved_iteration=approved_iter,
             current_depth=current_depth,
             recursive_children=children,
+            effective_decomposable=effective_decomposable,
+            policy_tier=policy_tier,
+            discarded_child_count=discarded_child_count,
         )
         return Success(
             value={
                 "plan_id": plan_id,
                 "item_id": item["item_id"],
                 "item_title": item["title"],
-                "decomposable": bool(planner.get("decomposable")),
+                "decomposable": effective_decomposable,
                 "children": children,
-                "proposals": [dict(c) for c in planner.get("children", [])],
+                "proposals": proposals,
+                "policy_tier": policy_tier,
+                "overrode_planner": overrode_planner,
+                "discarded_child_count": discarded_child_count,
                 "summary": planner["summary"],
                 "estimated_complexity": planner["estimated_complexity"],
                 "review_iterations": approved_iter,
@@ -836,6 +991,9 @@ def _write_plan_sidecar(
     current_depth: int,
     recursive_children: list[dict[str, Any]] | None = None,
     needs_human: bool = False,
+    effective_decomposable: bool | None = None,
+    policy_tier: str | None = None,
+    discarded_child_count: int = 0,
 ) -> Path:
     """Write the plan to a sidecar file.
 
@@ -844,11 +1002,24 @@ def _write_plan_sidecar(
       full recursive sub-plan tree (each child is a serialised
       :class:`PlanResult` with its own ``children`` list).
 
+    ``effective_decomposable`` lets the caller override the planner's own
+    ``decomposable`` flag — used when a process-config tier policy forced a
+    different tier (e.g. an implementable type forced to a leaf). When ``None``
+    the planner's flag is used (backward-compatible default).
+
     The event log remains authoritative; this file is for humans and for
     downstream tooling that wants the tree without folding the log.
     """
     log_dir.mkdir(parents=True, exist_ok=True)
-    decomposable = bool(planner.get("decomposable")) if planner else False
+    if effective_decomposable is not None:
+        decomposable = effective_decomposable
+    else:
+        decomposable = bool(planner.get("decomposable")) if planner else False
+    overrode = bool(
+        planner
+        and planner.get("decomposable")
+        and effective_decomposable is False
+    )
     rec_children = list(recursive_children or [])
     if decomposable and not needs_human:
         path = log_dir / f"{run_id}.plan.tree.json"
@@ -892,6 +1063,15 @@ def _write_plan_sidecar(
         f"- **Decomposable:** {decomposable}",
         f"- **Estimated complexity:** "
         f"{planner.get('estimated_complexity', 'unknown') if planner else 'unknown'}",
+    ]
+    if policy_tier and policy_tier != "unspecified":
+        body.append(f"- **Tier policy:** {policy_tier}")
+    if overrode:
+        body.append(
+            f"- **Process policy override:** type is implementable; "
+            f"discarded {discarded_child_count} planner-proposed child(ren)."
+        )
+    body += [
         "",
         "## Summary",
         "",
@@ -903,7 +1083,10 @@ def _write_plan_sidecar(
         "",
         planner.get("rationale", "(no rationale recorded)") if planner else "(no rationale recorded)",
     ]
-    if planner and planner.get("children"):
+    # Only list proposed children for a genuine decomposable-but-not-yet-
+    # committed leaf record; when config forced a leaf the proposals are
+    # discarded, not pending, so we don't present them as live proposals.
+    if planner and planner.get("children") and not overrode:
         body.append("")
         body.append("## Proposed children (v0: proposals only, not yet committed)")
         body.append("")
@@ -1211,6 +1394,20 @@ def build_workflow() -> Workflow:
                 on="permanent_failure:too_many_children",
                 to="too_many_children_gate",
             )
+            # Process-config tier policy could not be satisfied
+            # deterministically (config demands decomposition the planner
+            # didn't produce, or a configured policy with no work_item_type
+            # to classify) → fail closed to a human gate.
+            .edge(
+                "branch_decomposable",
+                on="permanent_failure:config_requires_decomposition",
+                to="type_policy_gate",
+            )
+            .edge(
+                "branch_decomposable",
+                on="permanent_failure:missing_work_item_type_for_policy",
+                to="type_policy_gate",
+            )
             # Catch-all (verb.crash, unexpected errors) → narrated terminal.
             .edge(
                 "branch_decomposable",
@@ -1247,6 +1444,22 @@ def build_workflow() -> Workflow:
             .edge(
                 "too_many_children_gate", on="needs_human:abort", to="fail_end"
             )
+        .human_gate(
+            "type_policy_gate",
+            prompt=(
+                "Process config tier policy could not be applied "
+                "deterministically (config requires decomposition the planner "
+                "did not produce, or the item has no type to classify). "
+                "Accept as needs-human (proceed) or abort?"
+            ),
+            options=["proceed", "abort"],
+        )
+            .edge(
+                "type_policy_gate",
+                on="needs_human:proceed",
+                to="record_needs_human",
+            )
+            .edge("type_policy_gate", on="needs_human:abort", to="fail_end")
         .human_gate(
             "cycle_gate",
             prompt=(
@@ -1368,6 +1581,7 @@ def _humanize_map() -> dict[str, str]:
             f"planner proposed > {MAX_CHILDREN} children — proceed?"
         ),
         "cycle_gate": "cycle detected in plan tree — proceed?",
+        "type_policy_gate": "config tier policy unsatisfiable — proceed?",
         "branch_decomposable": "Branched on plan shape",
         "aggregate_children": "Aggregated child plans",
         "record_plan": "Recorded plan",
@@ -1416,6 +1630,7 @@ def build_engine(
     twig: TwigClientProto | None = None,
     provider: AgentProvider | None = None,
     gate_handler=None,
+    process_config: "ProcessConfig | dict[str, Any] | None" = None,
 ) -> Engine:
     """Construct a runnable Engine for the planning workflow.
 
@@ -1447,10 +1662,24 @@ def build_engine(
     final_provider = resolved_provider or demo_provider()
     final_gate = resolved_gate or _default_gate_handler
 
+    # Resolve the tier-routing config. ``process_config`` may arrive as a live
+    # ProcessConfig (programmatic caller) or as a JSON snapshot dict (recorded
+    # child-workflow inputs reconstructed by the kernel). Recorded inputs are
+    # authoritative; the contextvar is only a convenience for in-process calls
+    # that didn't pass one. Fall back to the documented defaults.
+    if isinstance(process_config, ProcessConfig):
+        resolved_config: ProcessConfig | None = process_config
+    elif isinstance(process_config, dict):
+        resolved_config = ProcessConfig.from_snapshot(process_config)
+    else:
+        resolved_config = _active_process_config_cv.get()
+    final_config = resolved_config or default_process_config()
+
     # Install for any recursive child invocation in this asyncio task.
     _active_twig_cv.set(final_twig)
     _active_provider_cv.set(final_provider)
     _active_gate_handler_cv.set(final_gate)
+    _active_process_config_cv.set(final_config)
 
     return Engine(
         workflow=build_workflow(),
@@ -1462,6 +1691,7 @@ def build_engine(
             ancestor_item_ids=ancestor_item_ids,
             twig=final_twig,
             log_dir=log_dir,
+            config=final_config,
         ),
         agents=build_agent_registry(),
         provider=final_provider,
