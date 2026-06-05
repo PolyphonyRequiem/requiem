@@ -218,6 +218,14 @@ and the reasoning. Each is up for revision in §9.
 
 ### 5.1 Does `feature_pr` need to be a separate workflow?
 
+> **Update (2026-06-05, ADR-0018):** the *placement* recommendation below
+> ("on `implementation.py`'s exit") is **superseded for the live path** by
+> ADR-0014 — `implementation.py` is B1-blocked and does not run on the live
+> Hermes path, so it is not the integration point. The *spirit* (a small
+> opener/gate, not a polyphony aggregator) is retained. See ADR-0018 for the
+> reconciled decision and the Hermes `kanban create` base-branch limitation
+> that drives it.
+
 **Position: NO.** The work polyphony's `feature-pr.yaml` does that is
 *not already done elsewhere in Requiem* is:
 
