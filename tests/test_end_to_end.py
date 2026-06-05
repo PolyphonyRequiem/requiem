@@ -50,7 +50,7 @@ class _Calls:
 def _factories(calls: _Calls, *, decomposable: bool, plan_verdict: str = "approved",
                exec_final: str = "end", item_id: int = 500):
     def planning_factory(log_dir, *, item_id=item_id, twig=None, provider=None,
-                         gate_handler=None):
+                         gate_handler=None, process_config=None):
         calls.planning += 1
         node = "record_plan" if plan_verdict == "approved" else "record_needs_human"
 

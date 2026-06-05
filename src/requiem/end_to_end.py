@@ -98,6 +98,7 @@ async def run_pipeline(
     provider: Any | None = None,
     kanban: Any | None = None,
     gate_handler: Any | None = None,
+    process_config: Any | None = None,
     poll_interval_s: float = 5.0,
     max_polls: int = 120,
     planning_factory: PlanningFactory = planning_mod.build_engine,
@@ -110,7 +111,7 @@ async def run_pipeline(
     plan_run = f"plan-{item_id}"
     plan_engine = planning_factory(
         log_dir, item_id=item_id, twig=twig, provider=provider,
-        gate_handler=gate_handler,
+        gate_handler=gate_handler, process_config=process_config,
     )
     plan_outcome = await plan_engine.run(plan_run)
     plan_record = _plan_record(_completed_map(log_dir, plan_run))
@@ -233,6 +234,9 @@ def _build_arg_parser():
                    help="Actually spawn Hermes workers (default: dispatch dry-run).")
     p.add_argument("--log-dir", type=Path, default=Path(".runs"),
                    help="Durable run-log directory (default: .runs).")
+    p.add_argument("--repo", type=Path, default=Path("."),
+                   help="Repo root to discover .requiem-config/process.yaml from "
+                        "(drives the type-agnostic tier policy; default: cwd).")
     p.add_argument("--poll-interval", type=float, default=5.0)
     p.add_argument("--max-polls", type=int, default=120)
     return p
@@ -243,6 +247,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from requiem.clients.kanban import KanbanClient
     from requiem.clients.twig import TwigClient
+    from requiem.process_config import discover_process_config
     from requiem.providers import default_provider
 
     args = _build_arg_parser().parse_args(argv)
@@ -250,6 +255,10 @@ def main(argv: list[str] | None = None) -> int:
         print("refusing to use the 'default' Hermes board; pass a dedicated "
               "--board (e.g. requiem-<item>).")
         return 2
+
+    # Discover the repo's tier policy (falls back to polyphony-equivalent
+    # defaults when no .requiem-config/process.yaml is present).
+    process_config = discover_process_config(args.repo)
 
     result = asyncio.run(run_pipeline(
         args.item,
@@ -261,6 +270,7 @@ def main(argv: list[str] | None = None) -> int:
         twig=TwigClient(),
         provider=default_provider(),
         kanban=KanbanClient(),
+        process_config=process_config,
         poll_interval_s=args.poll_interval,
         max_polls=args.max_polls,
     ))
