@@ -163,10 +163,26 @@ does not match the leaf it is attached to **downgrades to `needs_human`** rather
 than being trusted.
 
 
-### 7. Write-back loop (deferred, ADR-0016 §4)
+### 7. Write-back loop — legible core IMPLEMENTED (ADR-0016 §4)
 
-When a run produces a durable learning, Requiem opens a PR against
-`process.yaml`/doctrine. Built last; gated on the foundation above.
+When a run produces a durable learning, Requiem opens a PR against the
+repo-resident doctrine. The **legible core** — the part that makes write-back
+legitimate under ADR-0016 — ships in `requiem.doctrine_writeback`: a candidate
+learning becomes a **reviewable, provenance-bearing, idempotent** proposed
+doctrine edit (`propose_doctrine_section` → `DoctrineProposal`, with
+`render_pr_title`/`render_pr_body` tracing the change to the run id, rationale,
+and evidence, and `is_stale` guarding against doctrine drift). Sections are
+fenced by a stable marker so a re-discovered learning updates in place or
+no-ops, never stacking duplicates. Fully unit-tested
+(`tests/test_doctrine_writeback.py`).
+
+Two pieces remain deferred (each genuinely out of the current foundation):
+the **trigger** (deciding *what* is a durable learning — no run has yet produced
+a learning-extraction signal) and the **live PR-open** (a thin composition over
+the existing `FsClient` branch/push + `GhClient.pr_create`, validated against a
+live repo). Structured `process.yaml` edits are a separate, harder proposal
+shape and are also deferred; the implemented target is doctrine (free-form
+markdown).
 
 ## What this does NOT solve
 
