@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from requiem import branch_model
 from requiem.kernel import Completed, Engine
 from requiem.persistence import replay
 from requiem.toolbelt import Toolbelt
@@ -137,7 +138,7 @@ async def run_pipeline(
             leaf_id=str(item_id),
             title=str(plan_record.get("item_title") or f"item {item_id}"),
             body=str(plan_record.get("summary") or ""),
-            branch=f"impl/{item_id}-{item_id}",
+            branch=branch_model.impl_branch(item_id, item_id),
             skills=skills,
         )
         exec_inputs = ExecInputs(

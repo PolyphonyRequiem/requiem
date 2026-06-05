@@ -48,6 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from requiem import branch_model
 from requiem.clients.fs import FilesystemClient
 from requiem.clients.gh import GhClientError
 from requiem.clients.twig import TwigClientError
@@ -273,7 +274,7 @@ def _render_tree_md(art: dict, *, source_name: str) -> str:
 
 def build_verb_registry(inputs: PlanPrInputs) -> VerbRegistry:
     verbs = VerbRegistry()
-    branch_name = f"plan/{inputs.root_item_id}"
+    branch_name = branch_model.plan_branch(inputs.root_item_id)
 
     def _require_fs(ctx) -> FilesystemClient | PermanentFailure:
         fs = ctx.toolbelt.fs

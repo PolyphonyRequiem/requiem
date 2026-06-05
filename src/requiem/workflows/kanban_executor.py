@@ -62,6 +62,7 @@ from pathlib import Path
 from collections.abc import Mapping
 from typing import Any
 
+from requiem import branch_model
 from requiem.clients.kanban import (
     KanbanBoardMissingError,
     KanbanBusyError,
@@ -220,7 +221,7 @@ def build_verb_registry(inputs: ExecInputs) -> VerbRegistry:
                     leaf_id=str(r.real_id),
                     title=r.title,
                     body=r.body,
-                    branch=f"impl/{inputs.root_item}-{r.real_id}",
+                    branch=branch_model.impl_branch(inputs.root_item, r.real_id),
                     skills=inputs.skills,
                 )
                 for r in resolved
