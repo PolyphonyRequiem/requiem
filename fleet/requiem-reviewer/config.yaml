@@ -1,0 +1,23 @@
+# requiem-implementer — model + tool defaults.
+#
+# PRESERVED on `hermes profile update` (config.yaml is operator-owned). Pin the
+# model below or with `hermes -p requiem-implementer model`; requiem never sets
+# the model per-task (there is no `--model` flag on `hermes kanban create`).
+
+model:
+  provider: anthropic
+  default: anthropic/claude-sonnet-4
+  base_url: ''
+  api_mode: chat_completions
+
+# Manual orchestration — requiem is the ONLY decomposition authority. The Hermes
+# auto-decomposer must stay OFF so a triage task is never silently fanned out
+# behind requiem's back; requiem creates every leaf task explicitly and gates
+# child release itself (ADR-0017 §3).
+kanban:
+  auto_decompose: false
+  dispatch_in_gateway: true
+  dispatch_interval_seconds: 60
+  # Failures stop after this many attempts; requiem's idempotency key makes a
+  # re-dispatch safe, so keep the circuit-breaker conservative.
+  failure_limit: 2

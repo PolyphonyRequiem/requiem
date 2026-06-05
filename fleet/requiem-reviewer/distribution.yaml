@@ -1,0 +1,22 @@
+name: requiem-reviewer
+version: 0.1.0
+description: >-
+  Requiem review worker. Reviews a delivered leaf's pull request against the
+  repo's house-style and the leaf's spec, then emits the requiem handoff receipt
+  (ADR-0017 §4) recording the review outcome.
+hermes_requires: ">=0.15.0"
+author: "Requiem"
+license: "MIT"
+
+env_requires:
+  - name: ADO_PAT
+    description: "Azure DevOps PAT the worker uses to read/comment on PRs"
+    required: true
+  - name: ANTHROPIC_API_KEY
+    description: "Model provider key (matches config.yaml model.default)"
+    required: false
+    default: ""
+
+distribution_owned:
+  - SOUL.md
+  - skills/handoff-receipt/

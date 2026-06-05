@@ -25,7 +25,7 @@ resolve, not gloss.
 
 ## Decision
 
-### 1. Roles are data; profiles are a hydrated fleet
+### 1. Roles are data; profiles are a hydrated fleet — IMPLEMENTED
 
 `process.yaml` gains a **role→profile routing** dimension (agnostic, same
 pattern as the tier model — never hardcoded):
@@ -38,9 +38,17 @@ roles:
   closer:      { profile: requiem-closer,       skills: [] }
 ```
 
-The `requiem-*` profiles ship as a **profile distribution** (a git repo
-installed via `hermes profile install`), baked into the fleet image. Their
+The `requiem-*` profiles ship as **profile distributions** (each a directory
+installed via `hermes profile install`), under `fleet/` in this repo. Their
 durable knowledge is repo-resident doctrine (ADR-0016), not profile memory.
+
+Each profile carries an **identical** `skills/handoff-receipt/SKILL.md` — the
+emit side of the §4 wire contract, single-sourced so a fleet member cannot
+speak a divergent dialect. `tests/test_fleet_distribution.py` keeps the skill,
+`requiem.handoff.parse_handoff`, and `tests/fixtures/handoff_v1_golden.json` in
+lockstep: it round-trips each skill's documented receipt through the real
+parser, asserts the skill is byte-identical across all three profiles, and
+asserts `config.yaml` ships Manual orchestration (`auto_decompose: false`).
 
 ### 2. Hermetic, Requiem-managed, containerized fleet
 
