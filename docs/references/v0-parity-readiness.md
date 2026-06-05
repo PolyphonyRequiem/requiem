@@ -163,12 +163,12 @@ whether those decisions are encoded *somewhere* in Requiem.
 | 4 | Root SDLC orchestrator (`polyphony@polyphony`) | 🟡 partial | `full_sdlc.py` is a five-stage linear pipeline; not a tree-walking root with batch dispatch or outer iterate-until-stable loop. **Fan-out executor** (dispatch implementable leaves into `implementation`) is the missing core — designed + **blocked**, see ADR-0013 (blockers B1 child-seam propagation, B3 branch model) |
 | 5 | Per-item worktree isolation for parallel dispatch | ❌ missing | No worktree primitive; no parallel dispatch; sub-workflow children run sequentially |
 | 6 | Recursive planning with child seeding and PR lifecycle | ✅ at-parity | Recursion ✅. Child seeding into ADO ✅ (`commit_plan`, PR #59, ADR-0011). Plan PR open + handoff ✅ (`plan_pr`, PR #60, ADR-0012); merge owned by `pr_lifecycle` (GitHub) |
-| 7 | Merge-group implementation (`mg/`, `impl/`) with idempotent re-entry | ❌ missing | `implementation.py` uses a single `feature/<item_id>` branch; no `mg/` or `impl/` topology |
+| 7 | Merge-group implementation (`mg/`, `impl/`) with idempotent re-entry | 🟡 partial | Branch topology authority landed (`branch_model.py`, ADR-0006 Option D): `feature/<root>`/`plan/<root>`/`impl/<root>-<item>`/`evidence/<root>-<item>` constructors + `parse_branch`, consumed by `kanban_executor`/`end_to_end`/`plan_pr`. Pending: `implementation.py` trunk rename + idempotency-key migration, `feature_pr.py` trunk→main gating, same-root run-lock |
 | 8 | Human gates in both terminal and web dashboard | 🟡 partial | Terminal ✅. Web ❌ |
 | 9 | Durable seed manifest for partial-seed recovery | ✅ at-parity | `root_dispatch.write_manifest` is idempotent read-or-create; INV-RESTART covers re-entry |
 | 10 | Platform-specific PR lifecycles (GitHub and ADO) | 🟡 partial | GitHub ✅ (`pr_lifecycle.py`). ADO ❌ (no `ado_pr` module) |
 
-**Scorecard:** 2 ✅ at-parity, 1 🔵 better, 5 🟡 partial, 2 ❌ missing. **Three of ten** non-negotiables have material work remaining (#7 merge-group, #8 web dashboard ❌; #1 process-config, #3 twig write-side, #5/#10 still partial). (#6 closed by PRs #59 + #60; #1 advanced to partial by ADR-0015 and further by the planning tier-policy wiring — `decomposable_types`/`implementable_types` now drive `branch_decomposable`.)
+**Scorecard:** 2 ✅ at-parity, 1 🔵 better, 6 🟡 partial, 1 ❌ missing. **Three of ten** non-negotiables have material work remaining (#8 web dashboard ❌; #7 merge-group, #1 process-config, #3 twig write-side, #5/#10 still partial). (#6 closed by PRs #59 + #60; #1 advanced to partial by ADR-0015 and further by the planning tier-policy wiring — `decomposable_types`/`implementable_types` now drive `branch_decomposable`; #7 advanced ❌→🟡 by `branch_model.py`, the Option-D topology authority.)
 
 ### 2.10 Fan-out executor — the critical-path blocker (ADR-0013)
 

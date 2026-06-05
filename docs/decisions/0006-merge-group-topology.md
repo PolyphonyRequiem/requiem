@@ -495,6 +495,30 @@ Rationale:
 Option A's analogous estimate is, eyeballing the polyphony skill,
 3-4× larger plus operator-doc work.
 
+### Implementation status (incremental landing)
+
+Option D is landing component-by-component rather than as one ~10-day
+big-bang, so each piece is independently testable and the tree never
+sits half-wired.
+
+- **[LANDED] Branch-topology authority — `src/requiem/branch_model.py`.**
+  The four ref-class constructors (`feature/<root>`, `plan/<root>`,
+  `impl/<root>-<item>`, `evidence/<root>-<item>`), their inverse
+  `parse_branch`, and the `BranchRef` round-trip. Two-delimiter discipline
+  (`/` ref-class, `-` payload; no `_`, no nested `mg/`) is enforced; ids
+  that can't be a safe git-ref segment fail closed with `BranchModelError`
+  (INV-NO-CORRUPT-FORWARD). This is the single authority the rest of the
+  follow-ups build on, so no workflow hand-rolls a branch-name f-string and
+  the `<root>-<item>` payload parses back unambiguously for PR attribution.
+  Already consumed by the fan-out executor (`kanban_executor`,
+  `impl/<root>-<item>` per leaf), the atomic-leaf `end_to_end` driver, and
+  the plan-PR workflow (`plan/<root>`). Tests: `tests/test_branch_model.py`.
+- **[PENDING]** `implementation.py` trunk rename (`feature/<item_id>` →
+  `feature/<root>` + `impl/<root>-<item>`) with idempotency-key migration;
+  `feature_pr.py` (trunk → main gating); same-root run-lock extension in
+  `root_dispatch.write_manifest`; per-leaf worktree isolation (#5).
+
+
 ---
 
 ## Consequences
