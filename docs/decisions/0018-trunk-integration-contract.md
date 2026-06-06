@@ -154,8 +154,33 @@ Adopt **Option C** (ratified 2026-06-05). Specifically:
 
 1. **Trunk bootstrap verb** — ensure `feature/<root>` (idempotent, off the
    detected default branch) before `dispatch_leaves` in `kanban_executor`.
+   **STATUS: deferred — requires a ratification decision.** The git client
+   (`toolbelt.GitClient`) is read-only (`show` only), so there is no
+   local-git path to create a branch. The natural mechanism is a *remote* ref
+   create via the GitHub API (`GET`/`POST repos/{owner}/{repo}/git/refs`,
+   idempotent), but that turns `GhClient` from "read-only + `pr_create`" into
+   "remote branch mutation" — a **new topology-mutation surface**, not mere
+   plumbing, and distinct from `feature_pr`/`leaf_pr` (which only *observe* or
+   open PRs with the already-approved `pr_create`). Per the design critique,
+   this deserves explicit ratification (its own ADR/refinement) AND live
+   validation before implementation — it manufactures the branch state every
+   later gate depends on, and a fake can prove we `POST /git/refs` but not that
+   the topology behaves under Hermes branch creation, protection rules, or the
+   drift wrinkle below. **Recommended shape when ratified:** a narrow
+   `ensure_branch_ref(owner, repo, branch, source_sha)` capability (GET; POST
+   if missing; re-read on 422 race), not arbitrary `gh api` mutation scattered
+   through workflow code.
 2. **Requiem-owned leaf-PR open/reconcile** — `head=impl/<root>-<item>`,
    `base=feature/<root>`, after delivery; idempotent.
+   **STATUS: landed 2026-06-06** (`src/requiem/workflows/leaf_pr.py`,
+   `tests/test_leaf_pr_workflow.py`, 11 tests). Reuse-open-or-create per
+   delivered leaf; fail-closed on a wrong-base / ambiguous / errored leaf
+   (never half-opens a partial set); emits the `{leaf_id: pr_number}` map
+   `feature_pr` consumes (re-exports `feature_pr.LeafPr` to keep the hand-off
+   type-explicit). Idempotent reuse covers the *pre-merge* window only —
+   post-merge re-derivation of the map is the driver's job (a default
+   `gh pr list` is open-only), consistent with requiem persisting every
+   decision in the event log.
 3. **`feature_pr.py`** — load expected leaves from the committed plan; verify
    trunk exists; verify every expected leaf PR is head/base-correct and
    merged; (optionally) verify requirement dispositions or gate if omitted;
