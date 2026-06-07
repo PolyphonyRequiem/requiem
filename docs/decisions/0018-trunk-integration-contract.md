@@ -1,7 +1,7 @@
 # ADR 0018 — Trunk integration on the live (Hermes) path
 
-**Status:** Accepted (2026-06-05 — Option C ratified; sub-fork resolved, §"Component ownership")
-**Date:** 2026-06-05
+**Status:** Accepted (2026-06-05 — Option C ratified; sub-fork resolved, §"Component ownership"). Remote-ref trunk-bootstrap mechanism ratified 2026-06-07 (see §"Trunk-bootstrap mechanism").
+**Date:** 2026-06-05 (updated 2026-06-07)
 **Relates to:** ADR-0006 (merge-group topology / Option D), ADR-0007 (PR
 lifecycle), ADR-0014 (Hermes fan-out executor), ADR-0017 (Hermes delivery
 fleet)
@@ -154,22 +154,18 @@ Adopt **Option C** (ratified 2026-06-05). Specifically:
 
 1. **Trunk bootstrap verb** — ensure `feature/<root>` (idempotent, off the
    detected default branch) before `dispatch_leaves` in `kanban_executor`.
-   **STATUS: deferred — requires a ratification decision.** The git client
-   (`toolbelt.GitClient`) is read-only (`show` only), so there is no
-   local-git path to create a branch. The natural mechanism is a *remote* ref
-   create via the GitHub API (`GET`/`POST repos/{owner}/{repo}/git/refs`,
-   idempotent), but that turns `GhClient` from "read-only + `pr_create`" into
-   "remote branch mutation" — a **new topology-mutation surface**, not mere
-   plumbing, and distinct from `feature_pr`/`leaf_pr` (which only *observe* or
-   open PRs with the already-approved `pr_create`). Per the design critique,
-   this deserves explicit ratification (its own ADR/refinement) AND live
-   validation before implementation — it manufactures the branch state every
-   later gate depends on, and a fake can prove we `POST /git/refs` but not that
-   the topology behaves under Hermes branch creation, protection rules, or the
-   drift wrinkle below. **Recommended shape when ratified:** a narrow
-   `ensure_branch_ref(owner, repo, branch, source_sha)` capability (GET; POST
-   if missing; re-read on 422 race), not arbitrary `gh api` mutation scattered
-   through workflow code.
+   **STATUS: landed 2026-06-07** (`src/requiem/workflows/trunk_bootstrap.py`,
+   `tests/test_trunk_bootstrap_workflow.py` + `tests/test_gh_branch_ref.py`).
+   The git client (`toolbelt.GitClient`) is read-only (`show` only), so there is
+   no local-git path to create a branch; the **remote-ref mechanism was
+   ratified 2026-06-07** (see §"Trunk-bootstrap mechanism" below) and confined
+   to a narrow `gh.branch_sha` / `gh.ensure_branch_ref` pair rather than
+   scattered `gh api` mutation. The workflow GETs the base SHA, creates
+   `feature/<root>` only when absent (never force-moves an existing trunk, so a
+   re-run can't rewind a trunk leaves have advanced), fails closed on a missing
+   base, and probes read-only in dry-run. **Contract-tested; live behaviour
+   (and the drift wrinkle below) still gated on a live Hermes loop — not yet
+   wired into the driver.**
 2. **Requiem-owned leaf-PR open/reconcile** — `head=impl/<root>-<item>`,
    `base=feature/<root>`, after delivery; idempotent.
    **STATUS: landed 2026-06-06** (`src/requiem/workflows/leaf_pr.py`,
@@ -193,6 +189,39 @@ Adopt **Option C** (ratified 2026-06-05). Specifically:
 
 Each step is independently testable; the whole is wired only at step 4, so the
 tree never sits half-integrated.
+
+### Trunk-bootstrap mechanism — remote GitHub-refs create (ratified 2026-06-07)
+
+**Decision:** requiem bootstraps `feature/<root>` **remotely** via the GitHub
+refs API, exposed as a narrow two-method capability on `GhClient`
+(`branch_sha(repo, branch)` and `ensure_branch_ref(repo, branch, source_sha)`),
+NOT via a local git-mutation client.
+
+**Why this was a real decision (and a trade-off).** The toolbelt `GitClient` is
+deliberately read-only (one `show` method). Creating `feature/<root>` therefore
+forced a choice between two genuinely different surfaces:
+
+- **(A) Remote ref create** — `GET repos/{repo}/git/ref/heads/{base}` for the
+  source SHA, `POST repos/{repo}/git/refs` if the trunk ref is absent. No
+  working tree, idempotent, fits the "driver owns trunk topology" split. Cost:
+  it turns `GhClient` from "read-only + `pr_create`" into a client that also
+  mutates branch refs — a new, broader mutation surface.
+- **(B) Local git-mutation client** — a new client with checkout / branch /
+  push, plus working-tree lifecycle management. Heavier, and misaligned with the
+  current driver/toolbelt split (the executor coordinates a *remote* board).
+
+**Chosen: (A).** Daniel ratified the remote-ref mutation surface (2026-06-07,
+"1 sure"). It is materially narrower than (B) and needs no local clone. The
+risk the rubber-duck flagged — that this manufactures the branch state every
+later gate depends on, and that a fake can prove we `POST /git/refs` but not
+that the topology behaves under Hermes branch creation, branch protection, or
+the drift wrinkle — is contained two ways: (1) the capability is **two
+enumerated methods**, not an open `gh api` mutation hatch handed to workflow
+code; (2) `ensure_branch_ref` **never force-moves** an existing ref, so the
+worst a buggy re-run can do is no-op, not rewind a trunk leaves have advanced.
+Live validation of the end-to-end topology remains an explicit precondition of
+**driver wiring** (step 4), which is why the workflow ships standalone and
+unwired.
 
 ### Open refinement — the Hermes worktree cuts from HEAD (flagged 2026-06-05)
 

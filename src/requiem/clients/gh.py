@@ -31,9 +31,12 @@ print it on `gh api` rate-limit surfaces). Value is a unix epoch second;
 Scope (v0)
 ----------------------------------------------------------------------
 Read-only paths only: `pr_view`, `pr_search`, and a low-level `api`
-escape hatch. Mutations (`gh pr merge --auto`, comments, labels) are
-deferred to a future seat to avoid scope creep — this client deliberately
-does not even know how to *form* a mutating argv today.
+escape hatch. Mutations are deliberately narrow and enumerated:
+`pr_create` (PR open) and — per ADR-0018, ratified 2026-06-07 — the
+branch-ref pair `branch_sha` / `ensure_branch_ref` (remote
+`feature/<root>` trunk bootstrap, because the local git client is
+read-only). No other mutating argv exists; broader mutations (merge,
+comments, labels) remain out of scope.
 
 `gh` JSON output requires explicit `--json` field listing. Each method
 ships a per-method `_FIELDS` tuple; we never request `*`. This shields
@@ -460,8 +463,66 @@ class GhClient:
         # head, url all populated from gh's own JSON).
         return await self.pr_view(repo, number)
 
-    # ---- subprocess seam ----
+    # ---- mutation: branch ref create (ADR-0018 trunk bootstrap) ----
+    #
+    # The git client (`toolbelt.GitClient`) is read-only, so requiem cannot
+    # create the `feature/<root>` integration trunk locally. Per ADR-0018
+    # (ratified 2026-06-07) the driver bootstraps it *remotely* via the GitHub
+    # refs API — no working tree required, idempotent, and confined to these
+    # two narrow methods rather than letting orchestration code reach for raw
+    # `api()` mutation. The L-1 caveat still applies: an unclassified failure
+    # surfaces as GhUnknownError → NeedsHuman, never a silent retry.
 
+    async def branch_sha(self, repo: str, branch: str) -> str:
+        """Return the commit SHA a branch points at (``git/ref/heads/...``).
+
+        Raises ``GhNotFoundError`` if the branch does not exist — callers
+        treat a missing *source* branch as fail-closed (can't bootstrap a
+        trunk off a base that isn't there).
+        """
+        payload = await self.api(f"repos/{repo}/git/ref/heads/{branch}")
+        obj = payload.get("object")
+        if not isinstance(obj, dict) or "sha" not in obj:
+            raise GhUnknownError(
+                f"git/ref/heads/{branch} returned no object.sha: {payload!r}",
+                exit_code=0, stderr="", argv=(),
+            )
+        return str(obj["sha"])
+
+    async def ensure_branch_ref(
+        self, repo: str, branch: str, source_sha: str
+    ) -> bool:
+        """Idempotently ensure ``refs/heads/<branch>`` exists at ``source_sha``.
+
+        Returns ``True`` if it created the ref, ``False`` if it already
+        existed. Does **not** move an existing ref (no force-update): an
+        already-present branch is left exactly as-is, so re-runs never rewind
+        a trunk that leaves have advanced. A create that loses a 422 race
+        (someone else created the ref first) is reconciled to ``False``.
+        """
+        try:
+            await self.api(f"repos/{repo}/git/ref/heads/{branch}")
+            return False  # already exists — leave it untouched
+        except GhNotFoundError:
+            pass
+        try:
+            await self.api(
+                f"repos/{repo}/git/refs",
+                method="POST",
+                body={"ref": f"refs/heads/{branch}", "sha": source_sha},
+            )
+            return True
+        except GhClientError as create_err:
+            # Lost a create race? Re-read; if the ref now exists, treat as a
+            # benign no-op. Otherwise the create genuinely failed — re-raise
+            # the original error (don't mask it behind the recheck).
+            try:
+                await self.api(f"repos/{repo}/git/ref/heads/{branch}")
+            except GhClientError:
+                raise create_err from None
+            return False
+
+    # ---- subprocess seam ----
     async def _run_json_text(
         self, argv: tuple[str, ...], *, stdin: bytes | None = None
     ) -> str:
