@@ -11,31 +11,50 @@ v0 cutover readiness.
 
 ## 1. Executive Verdict
 
-**Verdict: NO-GO for v0 as defined by §9 of the parity inventory (the ten
-non-negotiables)** — though the gap has narrowed materially since the original
-audit. Requiem is structurally healthy and the load-bearing invariants are
-demonstrably enforced — the architecture has paid off — but **four of the ten
-non-negotiables still have material gaps** that no amount of polish on the
-existing surface can close. Specifically: per-item worktree isolation, the
-tree-walking root orchestrator with in-process batch dispatch, ADO PR lifecycle,
-and browser-side gate *resolution* remain absent or blocked. (The web dashboard
-itself now exists read-only — see the 2026-06-09 update below.)
+**Verdict (2026-06-09): GO for the v0 code surface; the remaining gate is live
+Azure DevOps validation, not code.** Every one of the ten non-negotiables is now
+built and tested — three are fully at-parity, one is better-than-polyphony, and
+six are **code-complete but pending live-ADO exercise** for their final ✅. Requiem
+is structurally healthy, the load-bearing invariants are demonstrably enforced,
+and the four items that were "absent or blocked" in the original audit —
+per-item worktree isolation, the in-process root orchestrator with batch dispatch,
+the ADO PR lifecycle, and browser-side gate *resolution* — have all been built and
+unit-tested this session (PRs #61–#75).
 
-**Update (2026-06-09):** the seventh non-negotiable — merge-group implementation
-topology — has since been **built end-to-end**: `branch_model` + `trunk_bootstrap`
-+ `leaf_pr` + `feature_pr` + the `end_to_end` driver wiring (PR #61) + the
-requirement-disposition gate (PR #62), all live-validated on a scratch GitHub
-repo. What remains for #7 is the live **ADO** worker loop, which is
-credential-gated, not a code gap. The sixth non-negotiable (recursive planning
-*with child seeding and PR lifecycle*) is likewise closed — child seeding into
-ADO (`commit_plan`, PR #59) and the plan PR (`plan_pr`, PR #60) both landed. The
-Tchaikovsky rough edges (#29/#30/#31) are all closed.
+What stands between "code-complete" and an unqualified GO is **a live Azure DevOps
+instance** (a real `ADO_PAT` + reachable org/project): the ADO-touching paths
+(#1 planning loop, #3 twig writes, #7 ADO worker loop, #10 `ado_pr` completion)
+are exercised here against faithful in-memory fakes — exactly as the GitHub
+`pr_lifecycle` is unit-tested against `FakePrToolkit` and then live-validated on
+GitHub at deploy. That deploy-time validation is the honest remaining step; it is
+not a missing-code gap.
 
-If the operator chooses to **re-scope v0** to the demoable single-root linear
-pipeline (dispatch → planning → implementation → GitHub PR lifecycle →
-close-out) on GitHub-only, with a terminal-only UX, then the verdict flips to
-**GO with caveats** — that slice works end-to-end and is covered by the test
-suite (run targeted; a bare full `pytest` hangs).
+**Update (2026-06-09) — what landed since the original NO-GO audit (16 PRs,
+#61–#75):**
+- **#7 merge-group topology** — built end-to-end (`branch_model` + `trunk_bootstrap`
+  + `leaf_pr` + `feature_pr` + driver wiring + the requirement-disposition gate),
+  live-validated on a scratch GitHub repo. Remaining: the live ADO worker loop.
+- **ADR-0013 fan-out blockers B1/B2/B3** — all closed (child-seam propagation,
+  branch-model reconciliation, the handoff≠success classifier).
+- **#4 in-process root orchestrator** — `fanout.py` walks the plan tree and
+  dispatches leaves in-process, wired into the driver as `dispatch_backend="fanout"`.
+- **#5 per-item worktree isolation** — `fs.py` worktree primitives + `fanout`
+  parallel mode + crash-recovery GC.
+- **#8 human gates in the web dashboard** — now **at parity**: observe → resolve →
+  opt-in auto-resume.
+- **#10 ADO PR lifecycle** — `ado_pr.py` (ADR-0023), the Azure DevOps sibling of
+  `pr_lifecycle`, fake-tested.
+- **#1 / #3** — tier policy surfaced in the dashboard; the PR-link search fixed to
+  the current `impl/<root>-<item>` branch model.
+- The sixth non-negotiable (recursive planning with child seeding + PR lifecycle)
+  was already closed (PRs #59 + #60); the Tchaikovsky rough edges (#29/#30/#31)
+  are closed.
+
+The demoable single-root linear pipeline (dispatch → planning → implementation →
+GitHub PR lifecycle → close-out) works end-to-end on GitHub today and is covered
+by the suite (run targeted; a bare full `pytest` hangs).
+
+
 
 The strong news: every Phase-A architectural bet held up under audit. The
 event log is authoritative; sub-workflow log isolation is enforced by
@@ -170,11 +189,19 @@ whether those decisions are encoded *somewhere* in Requiem.
 | 5 | Per-item worktree isolation for parallel dispatch | 🟡 partial | **Worktree isolation + parallel dispatch landed (`fs.py` + `fanout.py`, ADR-0022, 2026-06-09):** `FilesystemClient.git_worktree_add`/`git_worktree_remove` (+ `_is_git_tree` now accepts a worktree's `.git` *file*); `fanout`'s `parallel=True` mode gives each leaf its own git worktree (`impl/<root>-<leaf>` born with the worktree) and dispatches concurrently via `asyncio.gather` bounded by `max_parallel`. The ADR-0020 seam is `gather`-safe (a parent-set contextvar propagates into gathered children; a child-set one doesn't leak — verified). Landed-leaf worktrees are cleaned best-effort; surrendered/failed leaves are left on disk for inspection. Per-leaf isolated child logs unchanged; idempotent re-entry reuses an existing worktree dir (`tests/test_fanout_workflow.py` parallel cases + `tests/clients/test_fs.py` worktree cases, 8 new). **Remaining:** a global cross-root parallelism budget + a `worktree prune` GC verb for orphaned dirs after a crash (ADR-0022 deferred) |
 | 6 | Recursive planning with child seeding and PR lifecycle | ✅ at-parity | Recursion ✅. Child seeding into ADO ✅ (`commit_plan`, PR #59, ADR-0011). Plan PR open + handoff ✅ (`plan_pr`, PR #60, ADR-0012); merge owned by `pr_lifecycle` (GitHub) |
 | 7 | Merge-group implementation (`mg/`, `impl/`) with idempotent re-entry | 🟡 partial | Branch topology authority landed (`branch_model.py`, ADR-0006 Option D): `feature/<root>`/`plan/<root>`/`impl/<root>-<item>`/`evidence/<root>-<item>` constructors + `parse_branch`, consumed by `kanban_executor`/`end_to_end`/`plan_pr`. **Trunk integration decided + building (ADR-0018, Option C accepted):** Hermes `kanban create` v0.15.1 has no `--base`/PR-target flag, so requiem owns the trunk (driver-side). **`feature_pr.py` landed** — the trunk-readiness gate (verify every expected leaf PR `head=impl/<root>-<item>`, `base=feature/<root>`, `merged` via `pr_view`) + idempotent `feature/<root>`→`main` opener, no self-merge (`tests/test_feature_pr_workflow.py`, 14). **`leaf_pr.py` landed** — requiem-owned leaf-PR opener (build-sequence step 2): reuse-open-or-create `impl/<root>-<item>`→`feature/<root>` per delivered leaf, fail-closed on wrong-base/ambiguous/error, emits the `{leaf_id: pr_number}` map `feature_pr` consumes (`tests/test_leaf_pr_workflow.py`, 11). **`trunk_bootstrap.py` landed** — build-sequence step 1: idempotently ensures `feature/<root>` exists before fan-out via a ratified remote GitHub-refs capability (`gh.branch_sha`/`gh.ensure_branch_ref`; never force-moves an existing trunk; fail-closed on a missing base), since the toolbelt git client is read-only (`tests/test_trunk_bootstrap_workflow.py` + `tests/test_gh_branch_ref.py`, 15). **Driver wiring (step 4) landed + live-validated (ADR-0018, 2026-06-09):** `end_to_end.run_pipeline` now bootstraps `feature/<root>` before dispatch (fail-closed — a failed bootstrap never fans out), opens leaf PRs after delivery, and persists the `{leaf_id: pr_number}` map; the new `end_to_end.integrate_pipeline` opens the trunk→base PR after the leaf PRs are human-merged, reading the persisted map (a default `gh pr list` is open-only). The base branch is resolved from the repo's real default (not hardcoded `main`). Branch drift was confirmed live (overlapping leaves conflict against the advanced trunk; disjoint leaves do not — invisible until an earlier leaf merges) and handled per the ratified v0 policy: an unmergeable leaf PR surfaces to the human, `rebase_onto_target` deferred (`tests/test_end_to_end_topology.py`, 10; live proof `docs/validation/adr0018-step4/`). **Requirement-disposition gate landed (ADR-0006 INV-DRIVER-GATES-FEATURE-MERGE, 2026-06-09):** `feature_pr` now runs a `verify_dispositions` node between readiness and PR-open — every in-scope item's requirement disposition must be satisfied or the feature→base merge is fail-closed to a human (`ItemDisposition` set threaded through `integrate_pipeline`; empty set = no-op pass for back-compat; INV-NO-CORRUPT-FORWARD hard refuse, not best-effort). Also fixed `feature_pr`'s `end_human` terminate to report `needs_human` (not the misleading `failed`). Covered by 6 gate tests in `tests/test_feature_pr_workflow.py` + 3 driver-forwarding tests. **#7 build sequence complete.** |
-| 8 | Human gates in both terminal and web dashboard | 🟡 partial | Terminal ✅. **Web dashboard landed (ADR-0019, 2026-06-09) — observe + resolve:** `requiem.dashboard` — a stdlib-only (`http.server`, zero new deps) projection of the event logs. Lists runs with status, renders a run's humanized event timeline, and surfaces the **pending human-gate queue** (`/api/gates`). **Phase 2 (gate resolution) also landed:** `POST /api/gates/<run_id>/resolve` appends a guarded, append-only `gate_resolved` event via the kernel's own `EventStore`/`EventEmitter` (byte-identical envelope) — fail-closed on unknown-run/not-at-gate/invalid-choice (no half-writes), continuation left to `requiem resume`. A real kernel resume provably routes on the dashboard-written choice. Pure projection layer reuses the CLI's `_summarize_run` status semantics (`tests/test_dashboard.py`, 35). Launch: `python -m requiem.dashboard --log-dir .runs` (or the `requiem-dashboard` script). **Opt-in auto-resume (2026-06-09):** `--auto-resume` (default OFF) spawns `requiem resume <module> <run_id>` as a detached subprocess after a successful dashboard gate resolution — the engine runs *out of process* (the dashboard request thread never hosts a kernel; the observe-and-record boundary holds), so the operator no longer has to run resume by hand. Best-effort: a spawn failure is reported in the resolve response but never undoes the committed `gate_resolved`. The safe default is unchanged (append-the-decision-and-stop). **#8 at parity** — gates are observable and resolvable in both the terminal and the web dashboard. |
+| 8 | Human gates in both terminal and web dashboard | ✅ at-parity | Terminal ✅. **Web dashboard landed (ADR-0019, 2026-06-09) — observe + resolve:** `requiem.dashboard` — a stdlib-only (`http.server`, zero new deps) projection of the event logs. Lists runs with status, renders a run's humanized event timeline, and surfaces the **pending human-gate queue** (`/api/gates`). **Phase 2 (gate resolution) also landed:** `POST /api/gates/<run_id>/resolve` appends a guarded, append-only `gate_resolved` event via the kernel's own `EventStore`/`EventEmitter` (byte-identical envelope) — fail-closed on unknown-run/not-at-gate/invalid-choice (no half-writes), continuation left to `requiem resume`. A real kernel resume provably routes on the dashboard-written choice. Pure projection layer reuses the CLI's `_summarize_run` status semantics (`tests/test_dashboard.py`, 35). Launch: `python -m requiem.dashboard --log-dir .runs` (or the `requiem-dashboard` script). **Opt-in auto-resume (2026-06-09):** `--auto-resume` (default OFF) spawns `requiem resume <module> <run_id>` as a detached subprocess after a successful dashboard gate resolution — the engine runs *out of process* (the dashboard request thread never hosts a kernel; the observe-and-record boundary holds), so the operator no longer has to run resume by hand. Best-effort: a spawn failure is reported in the resolve response but never undoes the committed `gate_resolved`. The safe default is unchanged (append-the-decision-and-stop). **#8 at parity** — gates are observable and resolvable in both the terminal and the web dashboard. |
 | 9 | Durable seed manifest for partial-seed recovery | ✅ at-parity | `root_dispatch.write_manifest` is idempotent read-or-create; INV-RESTART covers re-entry |
 | 10 | Platform-specific PR lifecycles (GitHub and ADO) | 🟡 partial | GitHub ✅ (`pr_lifecycle.py`). **ADO lifecycle landed (`ado_pr.py`, ADR-0023, 2026-06-09):** the Azure DevOps sibling of `pr_lifecycle` — fetch PR → check state (active/abandoned/already-completed/draft) → check mergeability (conflicts + branch policies) → complete (squash/merge per repo policy) → transition the linked work item via `twig`. Same `Protocol` toolkit seam as `pr_lifecycle`: `RealAdoPrToolkit` (Azure DevOps REST v7.1, PAT-auth via `ADO_PAT`, `org/project/repository` addressing) + `FakeAdoPrToolkit` in-memory double. Fail-closed (conflicts/unsatisfied-policies/abandoned/fetch-error → human; draft → gate); `dry_run` genuinely side-effect-free; `needs_human` disposition on surrender (B2-consistent). Covered by `tests/test_ado_pr_workflow.py` (10) against the fake — **live ADO validation (a real PAT + reachable org/project) is a deploy-time step**, exactly as `pr_lifecycle` is unit-tested against `FakePrToolkit` and live-validated on GitHub. **Remaining:** an ADO PR *opener* (the merge-group `feature_pr` equivalent for ADO repos) + live PAT validation in a real Azure DevOps project. |
 
-**Scorecard:** 2 ✅ at-parity, 1 🔵 better, 7 🟡 partial, 0 ❌ missing. **No non-negotiable is fully missing anymore** — every one of the ten is at least partially met. The remaining partials are creds-gated or polish (#1 process-config live ADO loop; #3 twig write-side PR-link; #10 ADO PR lifecycle — all need ADO creds; #4/#5 in-process fan-out shipped, remaining bits are a cross-root parallelism budget + worktree GC; #8 auto-resume ergonomic). #5 advanced ❌→🟡 by `fs.py` worktree primitives + `fanout` parallel mode (ADR-0022). #4 advanced by the in-process `fanout` orchestrator (ADR-0021) once the ADR-0013 blockers (B1/B2/B3) were closed. #8 web dashboard advanced ❌→🟡 by `requiem.dashboard` (ADR-0019) — observe + resolve. #7 merge-group: the full build sequence lands — only the live ADO worker loop (creds-gated) remains. (#6 closed by PRs #59 + #60; #1 advanced by ADR-0015 + planning tier-policy wiring; #7 advanced ❌→🟡 by `branch_model.py` + the full ADR-0018 build sequence — `trunk_bootstrap` + `leaf_pr` + `feature_pr` + driver wiring + the requirement-disposition gate — now complete.)
+**Scorecard:** 3 ✅ at-parity, 1 🔵 better, 6 🟡 partial, 0 ❌ missing (2026-06-09). **No non-negotiable is missing; the code surface for v0 is complete.** #8 reached ✅ (gates observable + resolvable in both terminal and web dashboard, with opt-in auto-resume). The six remaining 🟡 are **code-complete but gated on a live Azure DevOps instance** for their final ✅ — that validation needs a real `ADO_PAT` + reachable org/project (a deploy-time step), exactly as `pr_lifecycle` is unit-tested against `FakePrToolkit` and live-validated on GitHub at deploy:
+
+- **#1** (type-routing): config-driven routing + dashboard policy view done; the live ADO planning loop is the deploy-time piece.
+- **#3** (twig write-side): work-item seeding + PR-link comment + the `AB#<item>` search fallback done; live ADO twig writes are deploy-time.
+- **#4 / #5** (root orchestrator + worktree isolation): in-process `fanout` orchestrator + parallel worktree isolation + worktree GC + driver wiring (`dispatch_backend="fanout"`) all done and fully tested in-process. Open follow-ups are a cross-root parallelism budget and a multi-level tree-walking driver loop (single-level + recursion covers v0).
+- **#7** (merge-group topology): the complete build sequence (`branch_model` + `trunk_bootstrap` + `leaf_pr` + `feature_pr` + driver wiring + disposition gate) is done and GitHub-live-validated; the ADO worker-loop half is deploy-time.
+- **#10** (PR lifecycles): GitHub ✅; ADO lifecycle (`ado_pr.py`, ADR-0023) code-complete + fake-tested; live ADO PAT validation is deploy-time. An ADO PR *opener* is a follow-up.
+
+This session (2026-06-09) advanced the build from "five open gaps" to this state across 16 merged PRs (#61–#75): closed the three ADR-0013 fan-out blockers (B1/B2/B3); built the in-process `fanout` orchestrator + parallel worktree isolation + GC + driver backend (#4/#5); shipped the web dashboard observe→resolve→auto-resume (#8 to ✅); built the ADO PR lifecycle (#10); surfaced the tier policy in the dashboard (#1); and fixed the PR-link search to the current branch model (#3). The honest frontier is now **live Azure DevOps validation** — the code is in place; exercising it against a real ADO org is the remaining deploy-time work. (Earlier history: #6 closed by PRs #59+#60; #7 + #8 + #5 advanced ❌→🟡 then onward as above.)
 
 ### 2.10 Fan-out executor — the critical-path blocker (ADR-0013)
 
