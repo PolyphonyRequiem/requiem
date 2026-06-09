@@ -29,6 +29,8 @@ from urllib.parse import unquote, urlparse
 
 from requiem.dashboard import projection
 from requiem.dashboard.page import PAGE_HTML
+from requiem.dashboard.auto_resume import AutoResumeError as _AutoResumeError
+from requiem.dashboard.auto_resume import spawn_resume as _spawn_resume
 from requiem.dashboard.resolution import GateResolutionError, resolve_gate
 
 
@@ -36,11 +38,16 @@ def _json_bytes(obj: Any) -> bytes:
     return json.dumps(obj, default=str).encode("utf-8")
 
 
-def make_handler(log_dir: Path) -> type[BaseHTTPRequestHandler]:
+def make_handler(log_dir: Path, *, auto_resume: bool = False) -> type[BaseHTTPRequestHandler]:
     """Build a request-handler class bound to ``log_dir``.
 
     A factory (rather than a module global) so multiple dashboards / tests can
     run against different log dirs in one process without clobbering state.
+
+    ``auto_resume`` (opt-in, default off): when True, a successful gate resolution
+    also spawns ``requiem resume`` for the run as a detached subprocess, so the
+    operator doesn't have to run it by hand (ADR-0019). Off by default — the
+    dashboard's safe contract is append-the-decision-and-stop.
     """
 
     class _Handler(BaseHTTPRequestHandler):
@@ -121,7 +128,20 @@ def make_handler(log_dir: Path) -> type[BaseHTTPRequestHandler]:
                     status = 404 if e.reason == "run_not_found" else 409
                     self._json({"error": str(e), "reason": e.reason}, status=status)
                     return
-                self._json(res.to_dict())
+                # Success: the gate_resolved event is committed. Optionally fire
+                # `requiem resume` (opt-in) so the run continues without a manual
+                # step. Best-effort — a spawn failure is reported but never undoes
+                # the already-committed resolution.
+                payload = res.to_dict()
+                if auto_resume:
+                    try:
+                        _spawn_resume(log_dir, run_id)
+                        payload["auto_resume"] = "spawned"
+                    except _AutoResumeError as e:
+                        payload["auto_resume"] = f"failed: {e}"
+                else:
+                    payload["auto_resume"] = "disabled"
+                self._json(payload)
                 return
             self._json({"error": "not found"}, status=404)
 
@@ -149,18 +169,28 @@ def make_handler(log_dir: Path) -> type[BaseHTTPRequestHandler]:
     return _Handler
 
 
-def build_server(log_dir: Path, host: str = "127.0.0.1", port: int = 8770) -> ThreadingHTTPServer:
-    """Construct (but do not start) the dashboard HTTP server."""
-    handler = make_handler(Path(log_dir))
+def build_server(
+    log_dir: Path, host: str = "127.0.0.1", port: int = 8770,
+    *, auto_resume: bool = False,
+) -> ThreadingHTTPServer:
+    """Construct (but do not start) the dashboard HTTP server.
+
+    ``auto_resume`` (opt-in, default off) spawns ``requiem resume`` after a
+    successful dashboard gate resolution — see :func:`make_handler`.
+    """
+    handler = make_handler(Path(log_dir), auto_resume=auto_resume)
     return ThreadingHTTPServer((host, port), handler)
 
 
-def serve(log_dir: Path, host: str = "127.0.0.1", port: int = 8770) -> None:
+def serve(
+    log_dir: Path, host: str = "127.0.0.1", port: int = 8770,
+    *, auto_resume: bool = False,
+) -> None:
     """Run the dashboard until interrupted (Ctrl-C)."""
-    httpd = build_server(log_dir, host, port)
+    httpd = build_server(log_dir, host, port, auto_resume=auto_resume)
     sa = httpd.socket.getsockname()
     print(f"requiem dashboard → http://{sa[0]}:{sa[1]}  (log-dir: {Path(log_dir).resolve()})")
-    print("read-only; Ctrl-C to stop.")
+    print("read-only" + (" + auto-resume ON" if auto_resume else "") + "; Ctrl-C to stop.")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

@@ -22,6 +22,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Bind host (default: 127.0.0.1 — operator-local).")
     p.add_argument("--port", type=int, default=8770,
                    help="Bind port (default: 8770).")
+    p.add_argument("--auto-resume", action="store_true",
+                   help="Opt-in: after resolving a gate in the dashboard, spawn "
+                        "`requiem resume` for that run automatically (default off — "
+                        "the safe contract is append-the-decision-and-stop).")
     return p
 
 
@@ -30,7 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.log_dir.exists():
         print(f"note: log-dir {args.log_dir} does not exist yet — "
               "the dashboard will show no runs until one appears.")
-    serve(args.log_dir, host=args.host, port=args.port)
+    serve(args.log_dir, host=args.host, port=args.port, auto_resume=args.auto_resume)
     return 0
 
 
