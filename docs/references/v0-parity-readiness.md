@@ -201,10 +201,16 @@ architectural issues (ADR-0013):
   child `Completed(completed)` → parent `Success` (kernel.py:765-772), so a naive
   fan-out treats failing-tests / bad-coder / push-failure handoffs as successes.
   Needs a per-slot classifier on `child_final_node`.
-- **B3 — branch model:** `implementation` hard-codes `feature/{item_id}`
-  (implementation.py:385), conflicting with ADR-0006's `feature/<root>` +
-  `impl/<root>-<item>`. Fan-out on the old branch shape is ADR-0006 Option B
-  (a re-scoped-v0 stopgap), not full parity.
+- **B3 — branch model:** ✅ **CLOSED (2026-06-09).** Was: `implementation`
+  hard-coded `feature/{item_id}`, conflicting with ADR-0006's `feature/<root>` +
+  `impl/<root>-<item>`. Fixed by an optional `root` field on
+  `ImplementationInputs`: when set, `create_branch` builds
+  `branch_model.impl_branch(root, item_id)` → `impl/<root>-<item>` (the ratified
+  Option-D shape `feature_pr`/`leaf_pr` consume); when absent (standalone/legacy)
+  it keeps `feature/<item_id>` (the Option-B stopgap) — so existing callers are
+  byte-for-byte unchanged. `tests/test_implementation_workflow.py::test_root_yields_impl_topology_branch`.
+  A live in-process orchestrator now just passes `root` to get full Option-D
+  topology end-to-end.
 
 **Recommended order:** B1 (unblocks *all* real dispatch — full_sdlc, root
 orchestrator, fan-out) → B3 (a v0 scope decision: Option-B stopgap vs. Option-D
