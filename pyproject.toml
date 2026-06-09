@@ -35,6 +35,7 @@ test = [
 
 [project.scripts]
 requiem = "requiem.cli:main"
+requiem-dashboard = "requiem.dashboard.__main__:main"
 
 [project.entry-points.pytest11]
 requiem-harness = "requiem.harness.pytest_plugin"
