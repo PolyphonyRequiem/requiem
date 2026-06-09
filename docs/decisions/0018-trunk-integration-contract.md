@@ -1,7 +1,7 @@
 # ADR 0018 — Trunk integration on the live (Hermes) path
 
-**Status:** Accepted (2026-06-05 — Option C ratified; sub-fork resolved, §"Component ownership"). Remote-ref trunk-bootstrap mechanism ratified 2026-06-07 (see §"Trunk-bootstrap mechanism").
-**Date:** 2026-06-05 (updated 2026-06-07)
+**Status:** Accepted (2026-06-05 — Option C ratified; sub-fork resolved, §"Component ownership"). Remote-ref trunk-bootstrap mechanism ratified 2026-06-07 (see §"Trunk-bootstrap mechanism"). Step 4 (driver wiring) landed + live-validated 2026-06-09; drift refinement RESOLVED (see §"Open refinement — RESOLVED").
+**Date:** 2026-06-05 (updated 2026-06-09)
 **Relates to:** ADR-0006 (merge-group topology / Option D), ADR-0007 (PR
 lifecycle), ADR-0014 (Hermes fan-out executor), ADR-0017 (Hermes delivery
 fleet)
@@ -186,6 +186,25 @@ Adopt **Option C** (ratified 2026-06-05). Specifically:
    leaf set as `(leaf_id, pr_number)` and reads each via `gh.pr_view` (merged
    state is unreliable through an open-only `gh pr list`).
 4. **Driver wiring** — invoke after `aggregate` approval in `end_to_end`.
+   **STATUS: landed + live-validated 2026-06-09** (`src/requiem/end_to_end.py`,
+   `tests/test_end_to_end_topology.py`, 10 stub-engine tests). `run_pipeline`
+   gained `github_repo`/`base_branch`/`gh` params and three injectable engine
+   factories. Phase 2.5 runs `trunk_bootstrap` **before** dispatch and fails
+   closed (a failed bootstrap never fans out — invariant 1). Phase 4 runs
+   `leaf_pr` **after** the executor reports delivery and **persists** the
+   `{leaf_id: pr_number}` map to `leaf-pr-map-<item>.json` (a default
+   `gh pr list` is open-only — step 2's caveat). `feature_pr` is a **separate**
+   `integrate_pipeline` invocation, because the leaf PRs must be merged into the
+   trunk between the two calls (a human/`pr_lifecycle`-owned step — no
+   self-merge); it reads the persisted map, never re-queries. The base branch is
+   resolved from the repo's real default via the narrow `gh.api()` read hatch
+   (Q2 — no new mutation surface). The no-`github_repo` path is byte-for-byte the
+   legacy executor-only pipeline. `live=False` threads `dry_run=True` to every
+   topology step (genuinely side-effect-free). Live proof:
+   `.runs/live_wiring_check.py` against a scratch repo created `feature/<root>`
+   (idempotent re-run → `exists`, no force-move), opened two leaf PRs
+   `base=feature/<root>`, merged them, and opened the trunk→`main` PR off the
+   persisted map. (Repro: `docs/validation/adr0018-step4/`.)
 
 Each step is independently testable; the whole is wired only at step 4, so the
 tree never sits half-integrated.
@@ -248,6 +267,38 @@ faithful integration harness) rather than blind, because the base-ancestry and
 drift behaviour is exactly what unit fakes cannot exercise. `feature_pr.py`
 (step 3) is unaffected — it only reads merged PR state — which is why it landed
 first.
+
+### Open refinement — RESOLVED (Q1 live finding, 2026-06-09)
+
+The drift hypothesis was tested live before wiring step 4, on a throwaway scratch
+repo with a faithful integration harness (real `feature/<root>` + `impl/*`
+branches, real PRs, real `gh` merges; the leaves cut from `main` HEAD exactly as
+the Hermes worktree model does, then only *named* `impl/<root>-<item>`). Two
+multi-leaf roots were run, advancing the trunk by merging leaf #1 and then
+re-checking the downstream leaves' mergeability:
+
+| Regime | Before any merge | After leaf #1 merged | Merge leaf #2 |
+|---|---|---|---|
+| **Disjoint** leaves (distinct files) | all `MERGEABLE CLEAN` | all `MERGEABLE CLEAN` | **clean — no drift** |
+| **Overlapping** leaves (same line) | all `MERGEABLE CLEAN` | `CONFLICTING DIRTY` | **refused — drift bites** |
+
+**Finding:** the hypothesis is **true but conditional**. Drift bites **only when
+two leaves touch the same lines**; disjoint leaves never drift. Crucially it is
+**invisible pre-merge** — every leaf PR reads `MERGEABLE CLEAN` until an earlier
+overlapping leaf actually merges, so no pre-flight gate can predict it. And the
+conflict lands on the **leaf-PR → trunk merge**, a step requiem does **not** own
+(`GhClient` has no `pr_merge`; `pr_lifecycle`/the human merges).
+
+**Decision (Daniel, 2026-06-09):** because the conflict surfaces exactly where
+Option C ¶4 + this section already place it (a human-owned merge, unmergeable PR
+surfaced by `pr_lifecycle`), **wire the v0 straight sequence** —
+bootstrap → dispatch → `leaf_pr` → [human merges] → `feature_pr` — and **keep
+`rebase_onto_target` deferred**. The briefing's binary ("conflict ⇒ build rebase
+before wiring") was a false dichotomy against this evidence: drift is real yet
+conditional and already has a ratified v0 home. When `rebase_onto_target` is
+eventually built it remains the **sole** trunk writer (INV-NO-DIRECT-TRUNK-COMMITS).
+Harness + live wiring proof: `docs/validation/adr0018-step4/q1_drift_probe.sh`,
+`docs/validation/adr0018-step4/live_wiring_check.py`.
 
 ### Component ownership (sub-fork resolved 2026-06-05)
 
