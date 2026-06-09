@@ -302,6 +302,37 @@ class FilesystemClient:
         """Switch HEAD to existing branch ``name``."""
         await self._git("checkout", name)
 
+    async def git_worktree_add(
+        self, path: Path, *, branch: str, from_ref: str
+    ) -> None:
+        """Add a git worktree at ``path`` on a new ``branch`` off ``from_ref``.
+
+        Equivalent to ``git worktree add -b <branch> <path> <from_ref>``. Each
+        worktree has its own working directory, HEAD, and index over the shared
+        object store — so concurrent ``implementation`` children can run in
+        parallel without clobbering each other's checkout (ADR-0022 / parity #5).
+
+        Call on the *main* repo's client; bind a fresh ``FilesystemClient`` to
+        ``path`` for the child. Idempotency (don't re-add an existing worktree
+        dir) is the caller's responsibility.
+        """
+        await self._git(
+            "worktree", "add", "-b", branch, str(Path(path)), from_ref
+        )
+
+    async def git_worktree_remove(self, path: Path, *, force: bool = False) -> None:
+        """Remove the worktree at ``path`` (``git worktree remove``).
+
+        ``force`` passes ``--force`` (drop even with uncommitted changes). A
+        best-effort cleanup; callers typically swallow errors and leave the
+        worktree on disk for inspection on a failed leaf.
+        """
+        argv = ["worktree", "remove"]
+        if force:
+            argv.append("--force")
+        argv.append(str(Path(path)))
+        await self._git(*argv)
+
     async def git_push(
         self, remote: str, branch: str, *, set_upstream: bool = True
     ) -> None:
@@ -352,6 +383,9 @@ class FilesystemClient:
     # ---- internals --------------------------------------------------
 
     def _is_git_tree(self) -> bool:
+        # A normal checkout has a `.git` DIRECTORY; a linked worktree has a
+        # `.git` FILE (a gitdir pointer to <main>/.git/worktrees/<name>). Accept
+        # both so a worktree-bound client (ADR-0022, parallel fan-out) works.
         return (self.repo_root / ".git").exists()
 
     @staticmethod

@@ -235,3 +235,128 @@ async def test_rerun_skips_already_landed_leaves(repo: Path, tmp_path: Path):
     assert res.outcomes[0].skipped is True
     # Disposition carried forward from the prior child run.
     assert res.outcomes[0].disposition in ("completed", "needs_human", "failed")
+
+
+# ---- parallel mode + worktree isolation (ADR-0022, #5) ------------------
+
+
+class _RepeatProvider:
+    """A stateless provider that returns the same coder output for EVERY call.
+
+    Safe to share across concurrent leaf children (unlike FakeProvider, whose
+    cursor is stateful and races under asyncio.gather). Each leaf writes a
+    distinctly-named marker so we can prove per-worktree isolation.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def invoke(self, call):
+        from requiem.outcomes import Success
+        self.calls.append(call.spec.name)
+        # A valid CoderOutput dict → Success (the kernel validates it).
+        return Success(value={
+            "intent_summary": "create a marker",
+            "file_changes": [
+                {"path": "MARKER.md", "operation": "create", "content": "x\n"},
+            ],
+            "notes": "",
+        })
+
+
+@pytest.fixture
+def main_repo(tmp_path: Path) -> Path:
+    """A repo whose default branch is `main` (so base_branch=main resolves for
+    `git worktree add`)."""
+    r = tmp_path / "mrepo"
+    r.mkdir()
+    for cmd in (
+        ["git", "init", "-q", "-b", "main"],
+        ["git", "config", "user.email", "t@t"],
+        ["git", "config", "user.name", "t"],
+    ):
+        subprocess.run(cmd, cwd=r, check=True)
+    (r / "README.md").write_text("hi\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=r, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=r, check=True)
+    return r
+
+
+def _parallel_engine(repo: Path, log_dir: Path, *, leaves, provider, max_parallel=4):
+    inputs = fanout.FanoutInputs(
+        root_item_id=ROOT, repo=REPO, repo_path=repo, log_dir=log_dir,
+        base_branch="main", dry_run=True, parallel=True, max_parallel=max_parallel,
+        leaves=tuple(leaves),
+    )
+    return fanout.build_engine(
+        log_dir, inputs=inputs, toolbelt=_toolbelt(repo), provider=provider,
+    )
+
+
+async def test_parallel_dispatch_lands_all_leaves_in_worktrees(
+    main_repo: Path, tmp_path: Path
+):
+    """#5: leaves dispatched in parallel, each in its own git worktree, all land."""
+    leaves = [
+        fanout.FanoutLeaf(real_id=1, title="one", body="m"),
+        fanout.FanoutLeaf(real_id=2, title="two", body="m"),
+        fanout.FanoutLeaf(real_id=3, title="three", body="m"),
+    ]
+    engine = _parallel_engine(
+        main_repo, tmp_path, leaves=leaves, provider=_RepeatProvider(),
+    )
+    result = await engine.run("par")
+    assert isinstance(result, Completed)
+    res = _result(engine, "par", result.final_node)
+    assert res.leaves_total == 3
+    assert res.leaves_landed == 3, [o.disposition for o in res.outcomes]
+    assert res.verdict == "previewed"  # dry_run
+    # Each leaf wrote its own isolated child log.
+    for rid in (1, 2, 3):
+        assert (tmp_path / f"fanout-{ROOT}__leaf-{rid}.events.jsonl").exists()
+
+
+async def test_parallel_leaf_branch_is_impl_topology(main_repo: Path, tmp_path: Path):
+    """Each parallel leaf's worktree is created on impl/<root>-<leaf> (B3)."""
+    leaves = [fanout.FanoutLeaf(real_id=7, title="seven", body="m")]
+    engine = _parallel_engine(
+        main_repo, tmp_path, leaves=leaves, provider=_RepeatProvider(),
+    )
+    await engine.run("par1")
+    child_completed = completed_from_log(
+        tmp_path / f"fanout-{ROOT}__leaf-7.events.jsonl")
+    branch = (child_completed.get("create_branch") or {}).get("value", {}).get("branch_name")
+    assert branch == f"impl/{ROOT}-7"
+
+
+async def test_parallel_landed_leaf_worktree_cleaned(main_repo: Path, tmp_path: Path):
+    """A landed leaf's worktree is removed (best-effort); the repo stays tidy."""
+    leaves = [fanout.FanoutLeaf(real_id=5, title="five", body="m")]
+    engine = _parallel_engine(
+        main_repo, tmp_path, leaves=leaves, provider=_RepeatProvider(),
+    )
+    await engine.run("par5")
+    # Worktree dir for the landed leaf was cleaned up.
+    wt = main_repo.parent / f".requiem-wt-{ROOT}-5"
+    assert not wt.exists()
+
+
+async def test_parallel_isolation_no_cross_leaf_contamination(
+    main_repo: Path, tmp_path: Path
+):
+    """Concurrent leaves don't clobber each other: each leaf's child run reaches
+    its own terminal independently (proves worktree isolation under gather)."""
+    leaves = [fanout.FanoutLeaf(real_id=i, title=f"leaf{i}", body="m")
+              for i in range(1, 6)]
+    engine = _parallel_engine(
+        main_repo, tmp_path, leaves=leaves, provider=_RepeatProvider(),
+        max_parallel=5,
+    )
+    result = await engine.run("par_many")
+    res = _result(engine, "par_many", result.final_node)
+    assert res.leaves_total == 5
+    assert res.leaves_landed == 5, [
+        (o.real_id, o.disposition, o.final_node) for o in res.outcomes
+    ]
+    # Every leaf id appears exactly once in the outcomes (no lost/dup leaves).
+    assert sorted(o.real_id for o in res.outcomes) == [1, 2, 3, 4, 5]
