@@ -71,6 +71,7 @@ class RunDetail:
     gate: dict[str, Any] | None       # the open gate's prompt/options, if suspended
     timeline: list[TimelineEntry] = field(default_factory=list)
     corrupt: str | None = None        # error detail if the log is torn
+    policy: dict[str, Any] | None = None  # ProcessConfig tier-policy snapshot (#1)
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -170,6 +171,7 @@ class _Folded:
     gate: dict[str, Any] | None = None     # currently-open gate payload
     corrupt: str | None = None
     timeline: list[TimelineEntry] = field(default_factory=list)
+    policy: dict[str, Any] | None = None   # ProcessConfig snapshot from start_run
 
 
 def _fold(log_path: Path, *, with_timeline: bool) -> _Folded:
@@ -214,6 +216,16 @@ def _fold(log_path: Path, *, with_timeline: bool) -> _Folded:
                     f.status = "Needs human"
                 else:
                     f.status = "Completed"
+            elif kind == "verb_completed" and f.policy is None:
+                # The start_run verb snapshots the effective ProcessConfig (tier
+                # policy: root/decomposable/implementable types) into its outcome
+                # value. Surface it read-only so an operator can audit *why* the
+                # run classified work the way it did (#1 dashboard policy view).
+                outcome = payload.get("outcome") or {}
+                value = outcome.get("value") or {}
+                snap = value.get("process_config")
+                if isinstance(snap, dict):
+                    f.policy = snap
             if with_timeline:
                 f.timeline.append(TimelineEntry(
                     event_id=int(ev.get("event_id", -1)),
@@ -280,6 +292,7 @@ def run_detail(log_dir: Path, run_id: str) -> RunDetail | None:
         gate=f.gate,
         timeline=f.timeline,
         corrupt=f.corrupt,
+        policy=f.policy,
     )
 
 

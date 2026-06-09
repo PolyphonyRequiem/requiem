@@ -59,6 +59,12 @@ PAGE_HTML = r"""<!doctype html>
   .rbtn:disabled { opacity:.5; cursor:default; }
   .gatebar .rhint { color:var(--dim); font-size:12px; margin-top:7px; }
   .gatebar code { color:var(--accent); }
+  .policy { background:#161616; border:1px solid #2a2a2a; border-radius:8px;
+            padding:10px 12px; margin:10px 0; font-size:13px; }
+  .policy .ptitle { font-weight:600; margin-bottom:6px; }
+  .policy .prow { margin:3px 0; }
+  .policy .plabel { color:var(--dim); display:inline-block; min-width:130px; }
+  .policy .dim, .dim { color:var(--dim); }
   .ev { display:grid; grid-template-columns: 30px 150px 1fr 150px; gap:8px;
         padding:3px 0; border-bottom:1px solid #1b2027; font-size:13px; }
   .ev .g { text-align:center; } .ev .k { color:var(--dim); }
@@ -137,6 +143,18 @@ async function openRun(id){
       <div class="opts">options: ${(r.gate.options||[]).map(esc).join(" · ")}</div>
       <div class="resolve">${(r.gate.options||[]).map(o=>`<button class="rbtn" data-run="${esc(r.run_id)}" data-choice="${esc(o)}">resolve: ${esc(o)}</button>`).join(" ")}</div>
       <div class="rhint">Appends a guarded <code>gate_resolved</code> event — then run <code>requiem resume ${esc(r.run_id)}</code> to continue.</div></div>`;
+    if(r.policy){
+      const p = r.policy;
+      const row = (label, arr) => `<div class="prow"><span class="plabel">${esc(label)}</span> ${(arr||[]).length ? (arr||[]).map(esc).join(" · ") : "<span class=\\"dim\\">—</span>"}</div>`;
+      const aliases = p.type_aliases && Object.keys(p.type_aliases).length
+        ? Object.entries(p.type_aliases).map(([k,v])=>`${esc(k)}→${esc(v)}`).join(" · ") : "—";
+      html += `<div class="policy"><div class="ptitle">⚙ tier policy <span class="dim">(process config)</span></div>
+        ${row("root parent types", p.root_parent_types)}
+        ${row("decomposable", p.decomposable_types)}
+        ${row("implementable", p.implementable_types)}
+        <div class="prow"><span class="plabel">aliases</span> ${aliases}</div>
+        ${p.source?`<div class="prow"><span class="plabel">source</span> <code>${esc(p.source)}</code>${p.sha256?` <span class="dim">sha ${esc((p.sha256||"").slice(0,12))}</span>`:""}</div>`:""}</div>`;
+    }
     html += (r.timeline||[]).map(e=>`<div class="ev"><span class="g">${esc(e.glyph)}</span>
       <span class="k">${esc(e.kind)}</span><span class="s">${esc(e.summary)}</span>
       <span class="t">${esc((e.ts||"").slice(11,19))}</span></div>`).join("");
