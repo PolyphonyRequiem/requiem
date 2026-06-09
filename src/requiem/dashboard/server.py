@@ -1,21 +1,23 @@
-"""requiem.dashboard.server — a stdlib-only, read-only web dashboard.
+"""requiem.dashboard.server — a stdlib-only web dashboard for run event logs.
 
 No FastAPI, no uvicorn, no framework: a ``ThreadingHTTPServer`` +
 ``BaseHTTPRequestHandler`` serving a tiny JSON API and one self-contained HTML
-page (ADR-0019). Everything it shows is a pure projection of the event log
-(``requiem.dashboard.projection``), so the server itself holds no state.
+page (ADR-0019). All read endpoints are pure projections of the event log
+(``requiem.dashboard.projection``); the single write endpoint
+(``POST /api/gates/<run_id>/resolve``, phase 2) appends one guarded,
+append-only ``gate_resolved`` event via ``requiem.dashboard.resolution`` and
+leaves continuation to a separate ``requiem resume`` (it never runs the engine).
 
-Read-only by design: no route mutates a run. Gate *resolution* from the browser
-is phase 2 (ADR-0019 §4). Binds to ``127.0.0.1`` — an operator-local tool, not a
-public service.
+Binds to ``127.0.0.1`` — an operator-local tool, not a public service.
 
 Routes::
 
-    GET /                     → the HTML page
-    GET /api/runs             → list_runs(...)        as JSON
-    GET /api/runs/<run_id>    → run_detail(...)       as JSON  (404 if absent)
-    GET /api/gates            → pending_gates(...)    as JSON
-    GET /healthz              → {"ok": true}
+    GET  /                              → the HTML page
+    GET  /api/runs                      → list_runs(...)        as JSON
+    GET  /api/runs/<run_id>             → run_detail(...)       as JSON  (404 if absent)
+    GET  /api/gates                     → pending_gates(...)    as JSON
+    POST /api/gates/<run_id>/resolve    → resolve_gate(...)     {"choice": "..."}
+    GET  /healthz                       → {"ok": true}
 """
 from __future__ import annotations
 
@@ -27,6 +29,7 @@ from urllib.parse import unquote, urlparse
 
 from requiem.dashboard import projection
 from requiem.dashboard.page import PAGE_HTML
+from requiem.dashboard.resolution import GateResolutionError, resolve_gate
 
 
 def _json_bytes(obj: Any) -> bytes:
@@ -92,6 +95,49 @@ def make_handler(log_dir: Path) -> type[BaseHTTPRequestHandler]:
                 self._json(detail.to_dict())
                 return
             self._not_found()
+
+        # ---- write: gate resolution (phase 2) ----
+
+        def do_POST(self) -> None:  # noqa: N802
+            path = unquote(urlparse(self.path).path)
+            # POST /api/gates/<run_id>/resolve
+            if path.startswith("/api/gates/") and path.endswith("/resolve"):
+                run_id = path[len("/api/gates/"):-len("/resolve")]
+                if not run_id or "/" in run_id or "\\" in run_id:
+                    self._json({"error": "invalid run id"}, status=404)
+                    return
+                body = self._read_json_body()
+                if body is None:
+                    self._json({"error": "body must be JSON"}, status=400)
+                    return
+                choice = body.get("choice")
+                if not isinstance(choice, str) or not choice:
+                    self._json({"error": "missing 'choice'"}, status=400)
+                    return
+                try:
+                    res = resolve_gate(log_dir, run_id, choice)
+                except GateResolutionError as e:
+                    # 404 for a missing run, 409 for a state/choice conflict.
+                    status = 404 if e.reason == "run_not_found" else 409
+                    self._json({"error": str(e), "reason": e.reason}, status=status)
+                    return
+                self._json(res.to_dict())
+                return
+            self._json({"error": "not found"}, status=404)
+
+        def _read_json_body(self) -> dict[str, Any] | None:
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except (TypeError, ValueError):
+                return None
+            if length <= 0 or length > 64 * 1024:  # sane cap for a control message
+                return None
+            raw = self.rfile.read(length)
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return None
+            return obj if isinstance(obj, dict) else None
 
         def do_HEAD(self) -> None:  # noqa: N802
             self.do_GET()

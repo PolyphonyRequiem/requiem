@@ -52,6 +52,13 @@ PAGE_HTML = r"""<!doctype html>
   .gatebar { background:#10242a; border:1px solid var(--gate); border-radius:8px;
              padding:10px 12px; margin:10px 0; }
   .gatebar .opts { color:var(--gate); }
+  .gatebar .resolve { margin-top:8px; display:flex; gap:8px; flex-wrap:wrap; }
+  .rbtn { background:#10242a; color:var(--gate); border:1px solid var(--gate);
+          border-radius:6px; padding:4px 12px; cursor:pointer; font:inherit; }
+  .rbtn:hover { background:var(--gate); color:#08191d; }
+  .rbtn:disabled { opacity:.5; cursor:default; }
+  .gatebar .rhint { color:var(--dim); font-size:12px; margin-top:7px; }
+  .gatebar code { color:var(--accent); }
   .ev { display:grid; grid-template-columns: 30px 150px 1fr 150px; gap:8px;
         padding:3px 0; border-bottom:1px solid #1b2027; font-size:13px; }
   .ev .g { text-align:center; } .ev .k { color:var(--dim); }
@@ -127,7 +134,9 @@ async function openRun(id){
       <div class="sub">${esc(r.workflow||"—")} · final_node: ${esc(r.final_node||"—")} · started ${esc(r.started||"—")}</div>`;
     if(r.corrupt) html += `<div class="corrupt">⚠ log corrupt: ${esc(r.corrupt)}</div>`;
     if(r.gate) html += `<div class="gatebar">🚦 <b>${esc(r.gate.node||"")}</b> — ${esc(r.gate.prompt)}
-      <div class="opts">options: ${(r.gate.options||[]).map(esc).join(" · ")}</div></div>`;
+      <div class="opts">options: ${(r.gate.options||[]).map(esc).join(" · ")}</div>
+      <div class="resolve">${(r.gate.options||[]).map(o=>`<button class="rbtn" data-run="${esc(r.run_id)}" data-choice="${esc(o)}">resolve: ${esc(o)}</button>`).join(" ")}</div>
+      <div class="rhint">Appends a guarded <code>gate_resolved</code> event — then run <code>requiem resume ${esc(r.run_id)}</code> to continue.</div></div>`;
     html += (r.timeline||[]).map(e=>`<div class="ev"><span class="g">${esc(e.glyph)}</span>
       <span class="k">${esc(e.kind)}</span><span class="s">${esc(e.summary)}</span>
       <span class="t">${esc((e.ts||"").slice(11,19))}</span></div>`).join("");
@@ -143,6 +152,31 @@ async function refresh(){
     $("#status").textContent = `${(runs.runs||[]).length} runs · ${(gates.gates||[]).length} gates · ${new Date().toLocaleTimeString()}`;
   }catch(e){ $("#status").textContent = "refresh failed: "+e.message; }
 }
+
+async function resolveGate(runId, choice, btn){
+  if(!confirm(`Resolve gate for ${runId} with "${choice}"?\n\nThis appends a gate_resolved event. Continue the run with: requiem resume ${runId}`)) return;
+  const prev = btn ? btn.textContent : null;
+  if(btn){ btn.disabled = true; btn.textContent = "resolving…"; }
+  try {
+    const r = await fetch(`/api/gates/${encodeURIComponent(runId)}/resolve`, {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({choice})
+    });
+    const data = await r.json().catch(()=>({}));
+    if(!r.ok){ throw new Error(data.error || ("HTTP "+r.status)); }
+    $("#status").textContent = `resolved ${runId} → ${choice} (event #${data.event_id}) · run: requiem resume ${runId}`;
+    await refresh();
+  } catch(e){
+    alert("Resolution refused: "+e.message);
+    if(btn){ btn.disabled = false; btn.textContent = prev; }
+  }
+}
+
+// Delegated: resolve buttons are re-rendered on every openRun().
+$("#detail").addEventListener("click", ev=>{
+  const b = ev.target.closest(".rbtn");
+  if(b) resolveGate(b.dataset.run, b.dataset.choice, b);
+});
 
 $("#refresh").onclick = refresh;
 let timer = setInterval(()=>{ if($("#auto").checked) refresh(); }, 4000);

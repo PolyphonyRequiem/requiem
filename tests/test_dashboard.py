@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from requiem.dashboard import projection
+from requiem.dashboard.resolution import GateResolutionError, resolve_gate
 from requiem.dashboard.server import build_server
 
 
@@ -246,3 +247,170 @@ def test_server_rejects_path_traversal_run_id(running_server):
     with pytest.raises(urllib.error.HTTPError) as ei:
         _get(running_server + "/api/runs/..%5Cevil")
     assert ei.value.code == 404
+
+
+# ---- phase 2: gate resolution (the guarded write path, ADR-0019 §4) -----
+
+
+def test_resolve_invalid_choice_refused_and_no_write(log_dir):
+    _suspended_run(log_dir, "r")
+    before = (log_dir / "r.events.jsonl").read_text(encoding="utf-8")
+    with pytest.raises(GateResolutionError) as ei:
+        resolve_gate(log_dir, "r", "not-an-option")
+    assert ei.value.reason == "invalid_choice"
+    # nothing was appended — the refusal is total.
+    assert (log_dir / "r.events.jsonl").read_text(encoding="utf-8") == before
+
+
+def test_resolve_run_not_found(log_dir):
+    with pytest.raises(GateResolutionError) as ei:
+        resolve_gate(log_dir, "ghost", "approve")
+    assert ei.value.reason == "run_not_found"
+
+
+def test_resolve_not_at_gate_refused(log_dir):
+    _completed_run(log_dir, "done")
+    with pytest.raises(GateResolutionError) as ei:
+        resolve_gate(log_dir, "done", "approve")
+    assert ei.value.reason == "not_at_gate"
+
+
+def test_resolve_valid_choice_appends_and_clears_gate(log_dir):
+    _suspended_run(log_dir, "r")
+    res = resolve_gate(log_dir, "r", "approve")
+    assert res.choice == "approve"
+    assert res.node == "gate"
+    # the run is no longer pending; status folds to Running.
+    assert projection.pending_gates(log_dir) == []
+    detail = projection.run_detail(log_dir, "r")
+    assert detail.gate is None
+    assert detail.status == "Running"
+    # exactly one gate_resolved was appended, with the kernel envelope shape.
+    events = [json.loads(x) for x in
+              (log_dir / "r.events.jsonl").read_text(encoding="utf-8").splitlines() if x]
+    resolved = [e for e in events if e["kind"] == "gate_resolved"]
+    assert len(resolved) == 1
+    assert resolved[0]["payload"]["choice"] == "approve"
+    assert resolved[0]["payload"]["auto"] is False
+    assert resolved[0]["node_id"] == "gate"
+
+
+def test_resolve_double_resolve_refused(log_dir):
+    _suspended_run(log_dir, "r")
+    resolve_gate(log_dir, "r", "approve")
+    with pytest.raises(GateResolutionError) as ei:
+        resolve_gate(log_dir, "r", "abort")
+    assert ei.value.reason == "not_at_gate"
+
+
+# ---- phase 2: server POST endpoint --------------------------------------
+
+
+def _post(url, obj):
+    import urllib.error
+    data = json.dumps(obj).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def test_server_resolve_happy_path(running_server):
+    # srv-gate is suspended on options approve/abort (see _suspended_run).
+    status, body = _post(running_server + "/api/gates/srv-gate/resolve",
+                         {"choice": "approve"})
+    assert status == 200
+    assert body["resolved"] is True
+    assert body["choice"] == "approve"
+    # it now drops out of the pending-gate queue.
+    _, gbody = _get(running_server + "/api/gates")
+    assert json.loads(gbody)["gates"] == []
+
+
+def test_server_resolve_invalid_choice_409(running_server):
+    status, body = _post(running_server + "/api/gates/srv-gate/resolve",
+                         {"choice": "bogus"})
+    assert status == 409
+    assert body["reason"] == "invalid_choice"
+
+
+def test_server_resolve_not_at_gate_409(running_server):
+    status, body = _post(running_server + "/api/gates/srv-run/resolve",
+                         {"choice": "approve"})
+    assert status == 409
+    assert body["reason"] == "not_at_gate"
+
+
+def test_server_resolve_unknown_run_404(running_server):
+    status, body = _post(running_server + "/api/gates/ghost/resolve",
+                         {"choice": "approve"})
+    assert status == 404
+    assert body["reason"] == "run_not_found"
+
+
+def test_server_resolve_missing_choice_400(running_server):
+    status, body = _post(running_server + "/api/gates/srv-gate/resolve", {})
+    assert status == 400
+
+
+# ---- phase 2: the real-kernel integration proof -------------------------
+
+
+async def test_kernel_resume_consumes_dashboard_resolution(log_dir):
+    """The premise of option (A): a real engine resume routes on the choice the
+    dashboard wrote. Without this, the write path would be cosmetic."""
+    from requiem.dsl import AgentRegistry, VerbRegistry, WorkflowBuilder
+    from requiem.kernel import Completed, Engine, Suspended
+    from requiem.outcomes import NeedsHuman, Success
+    from requiem.toolbelt import Toolbelt
+
+    def build():
+        return (WorkflowBuilder("gatewf", module="t", version="1")
+            .entry("start")
+            .script("start", verb="start")
+                .edge("start", on="success", to="gate")
+            .script("gate", verb="gate")
+                .edge("gate", on="needs_human:approve", to="end_ok")
+                .edge("gate", on="needs_human:abort", to="end_no")
+                .edge("gate", on="success", to="end_ok")
+            .terminate("end_ok", disposition="completed")
+            .terminate("end_no", disposition="failed")
+            .humanize({}).build())
+
+    def verbs():
+        v = VerbRegistry()
+
+        @v.register("start")
+        def _s(ctx):
+            return Success(value={})
+
+        @v.register("gate")
+        def _g(ctx):
+            return NeedsHuman(gate="g", prompt="Approve?", options=("approve", "abort"))
+        return v
+
+    def engine():
+        return Engine(workflow=build(), verbs=verbs(), agents=AgentRegistry(),
+                      provider=None, toolbelt=Toolbelt.real(), log_dir=log_dir,
+                      gate_handler=None)
+
+    # 1) no handler ⇒ suspends at the gate
+    out = await engine().run("gw")
+    assert isinstance(out, Suspended)
+
+    # 2) the dashboard resolves it (append-only)
+    resolve_gate(log_dir, "gw", "approve")
+
+    # 3) a fresh engine resumes the same run and routes on the recorded choice
+    out2 = await engine().run("gw")
+    assert isinstance(out2, Completed)
+    assert out2.final_node == "end_ok"
+
+    # 4) the abort branch routes the other way
+    await engine().run("gw2")
+    resolve_gate(log_dir, "gw2", "abort")
+    out3 = await engine().run("gw2")
+    assert out3.final_node == "end_no"
