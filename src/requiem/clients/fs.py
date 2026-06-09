@@ -333,6 +333,43 @@ class FilesystemClient:
         argv.append(str(Path(path)))
         await self._git(*argv)
 
+    async def git_worktree_list(self) -> list[dict[str, str]]:
+        """List linked worktrees via ``git worktree list --porcelain``.
+
+        Returns one dict per worktree with keys ``worktree`` (absolute path),
+        ``branch`` (ref name, may be absent for a detached HEAD), and
+        ``prunable`` (present + truthy when git considers the entry stale — its
+        working dir is gone). Used by the fan-out GC to find orphaned
+        ``.requiem-wt-*`` dirs from a crashed run (ADR-0022).
+        """
+        out = await self._git("worktree", "list", "--porcelain")
+        worktrees: list[dict[str, str]] = []
+        cur: dict[str, str] = {}
+        for line in out.splitlines():
+            if not line.strip():
+                if cur:
+                    worktrees.append(cur)
+                    cur = {}
+                continue
+            if line.startswith("worktree "):
+                cur["worktree"] = line[len("worktree "):].strip()
+            elif line.startswith("branch "):
+                cur["branch"] = line[len("branch "):].strip()
+            elif line.startswith("prunable"):
+                cur["prunable"] = line[len("prunable"):].strip() or "true"
+        if cur:
+            worktrees.append(cur)
+        return worktrees
+
+    async def git_worktree_prune(self) -> None:
+        """Prune stale worktree admin entries (``git worktree prune``).
+
+        Cleans the bookkeeping for worktree dirs that were deleted without
+        ``git worktree remove`` (e.g. after a crash), so a later
+        ``git worktree add`` on the same path doesn't collide.
+        """
+        await self._git("worktree", "prune")
+
     async def git_push(
         self, remote: str, branch: str, *, set_upstream: bool = True
     ) -> None:

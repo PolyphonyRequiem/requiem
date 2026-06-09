@@ -331,6 +331,17 @@ def build_verb_registry(inputs: FanoutInputs) -> VerbRegistry:
         if inputs.parallel:
             # Bounded concurrency: at most `max_parallel` leaves in flight.
             import asyncio
+
+            # GC first: prune stale worktree admin entries from a prior crashed
+            # run so a `git worktree add` on a reused path doesn't collide
+            # (ADR-0022). Best-effort — never block dispatch on cleanup.
+            from requiem.clients.fs import FilesystemClient, FsGitError
+            try:
+                main_fs = toolbelt.fs or FilesystemClient(inputs.repo_path)
+                await main_fs.git_worktree_prune()
+            except FsGitError:
+                pass
+
             sem = asyncio.Semaphore(max(1, inputs.max_parallel))
 
             async def _guarded(leaf):

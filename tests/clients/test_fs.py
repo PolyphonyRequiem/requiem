@@ -320,3 +320,32 @@ async def test_two_worktrees_are_independent(fs: FilesystemClient, repo: Path):
     assert (wt2 / "B.md").exists() and not (wt2 / "A.md").exists()
     assert await f1.git_current_branch() == "impl/9300-a"
     assert await f2.git_current_branch() == "impl/9300-b"
+
+
+async def test_git_worktree_list_enumerates(fs: FilesystemClient, repo: Path):
+    wt = repo.parent / "wt-list"
+    await fs.git_worktree_add(wt, branch="impl/9300-9", from_ref="main")
+    entries = await fs.git_worktree_list()
+    # The main checkout + the new linked worktree.
+    branches = {e.get("branch") for e in entries}
+    assert "refs/heads/main" in branches
+    assert "refs/heads/impl/9300-9" in branches
+
+
+async def test_git_worktree_prune_clears_stale_after_crash(
+    fs: FilesystemClient, repo: Path
+):
+    """A worktree dir deleted without `git worktree remove` (a crash) leaves a
+    prunable admin entry; `git_worktree_prune` clears it so a re-add on the same
+    path doesn't collide (ADR-0022 GC)."""
+    import shutil
+    wt = repo.parent / "wt-crash"
+    await fs.git_worktree_add(wt, branch="impl/9300-c", from_ref="main")
+    shutil.rmtree(wt)  # simulate a crash: dir gone, admin entry stale
+    stale = await fs.git_worktree_list()
+    assert any("prunable" in e for e in stale)
+    await fs.git_worktree_prune()
+    assert not any("prunable" in e for e in await fs.git_worktree_list())
+    # Re-add on the same path now succeeds (no "already registered" collision).
+    await fs.git_worktree_add(wt, branch="impl/9300-c2", from_ref="main")
+    assert wt.exists()
