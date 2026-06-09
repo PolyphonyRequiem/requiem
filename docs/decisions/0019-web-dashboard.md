@@ -1,7 +1,7 @@
-# ADR 0019 — Web dashboard (read-only event-log viewer)
+# ADR 0019 — Web dashboard (event-log viewer + guarded gate resolution)
 
-**Status:** Accepted (2026-06-09) — phase 1 (read-only) implemented; gate
-resolution (write path) deferred to phase 2.
+**Status:** Accepted (2026-06-09) — phase 1 (read-only) **and** phase 2 (guarded
+gate resolution, the write path) both implemented.
 **Date:** 2026-06-09
 **Relates to:** ADR-0001 (single-process architecture), ADR-0002
 (event-log-authoritative persistence), v0 non-negotiable **#8** (human gates in
@@ -71,34 +71,51 @@ Read-only: no route mutates anything. Launched via
 `python -m requiem.dashboard --log-dir .runs --port 8770` (and a
 `requiem-dashboard` console script).
 
-### 4. Gate resolution (write path) is phase 2
+### 4. Gate resolution (write path) — phase 2, implemented (option A: append-and-resume)
 
-The dashboard #8 endgame is *servicing* a gate from the browser (the equivalent
-of `requiem unblock`). That introduces a mutation surface (auth, CSRF-ish
-concerns even on localhost, writing a `gate_resolved`/cancel event into a live
-run's log) and must be designed carefully against INV-EVENT-LOG-AUTHORITATIVE and
-the kernel's resume semantics. **Phase 1 ships read-only** — it already closes
-the "operators can *observe* runs and the gate queue in a browser" half and is
-safe to land without touching the write path. Phase 2 (a `POST /api/gates/<run>`
-that appends a gate-resolution event the next resume consumes) is a follow-up
-ADR amendment.
+The dashboard #8 endgame is *servicing* a gate from the browser. That introduces
+a mutation surface (writing a `gate_resolved` event into a live run's log) and
+had to be designed carefully against INV-EVENT-LOG-AUTHORITATIVE and the kernel's
+resume semantics. Phase 1 shipped read-only; **phase 2 now lands the write path**
+as a guarded, append-only resolution (`requiem.dashboard.resolution`):
+
+- **Append-and-resume, not run-in-process.** `POST /api/gates/<run_id>/resolve`
+  appends exactly one `gate_resolved` event via the kernel's **own**
+  `EventStore` + `EventEmitter`, so the envelope is byte-identical to a
+  resolution the engine itself would write. Continuation is left to a separate
+  `requiem resume <run_id>` — the dashboard never imports or runs an engine
+  (the read-only viewer stays decoupled from execution). This is sound because
+  the kernel's resume fold already routes on a pre-recorded `gate_resolved`
+  (`kernel.py` `_RouteAfterGate`, edge `needs_human:{choice}`); proven
+  end-to-end by `test_kernel_resume_consumes_dashboard_resolution`.
+- **Three guards, fail-closed, no half-writes.** The append is refused (nothing
+  written) unless: the run exists (`run_not_found` → 404), it is genuinely
+  parked at an open gate (`not_at_gate` → 409, which also blocks double-resolve),
+  and the choice is one of the gate's *offered* options (`invalid_choice` → 409).
+  The choice guard matters because the kernel routes on `needs_human:{choice}`;
+  an unoffered choice would `Failed(route.missing)` the run on resume.
+- **Operator-local.** Still bound to `127.0.0.1`; the write endpoint caps the
+  request body and is the single mutating route.
+
+A future enhancement could trigger the resume automatically (a dispatcher watching
+for resolved gates); deliberately out of scope here to keep the viewer decoupled.
 
 ## Consequences
 
 **Positive:** closes the last externally-unblocked #8 surface with **zero** new
 dependencies; the projection layer is pure and reuses the CLI's status semantics,
-so the two can't drift; trivially testable without a browser; the read-only slice
-is safe to land and review on its own.
+so the two can't drift; trivially testable without a browser; both phases landed
+behind clean guards, each reviewable on its own.
 
-**Negative / open:** gate *resolution* from the browser is deferred (phase 2),
-so #8 remains 🟡 (terminal-complete, web-observe-only) until that lands; the
-stdlib `http.server` is single-purpose and not hardened for hostile networks —
-it binds to localhost and is explicitly an operator-local tool, not a
-multi-tenant service; the HTML page is intentionally minimal (no live websocket
-push — the page polls `/api/*`), which is adequate for an operator glance and
-keeps the transport stdlib-only.
+**Negative / open:** the write path appends a resolution but leaves continuation
+to a manual `requiem resume` (no auto-dispatcher yet, by design); the stdlib
+`http.server` is single-purpose and not hardened for hostile networks — it binds
+to localhost and is explicitly an operator-local tool, not a multi-tenant
+service; the HTML page is intentionally minimal (no live websocket push — the
+page polls `/api/*`), which is adequate for an operator glance and keeps the
+transport stdlib-only.
 
 **Why an ADR:** the dependency-discipline decision (stdlib `http.server` over a
-web framework) and the explicit read-only-first / gate-resolution-deferred split
-are choices a future contributor will question ("why isn't this FastAPI?",
-"why can't I click to unblock?") — recorded here with the reasoning.
+web framework) and the phased read-only-then-guarded-write split are choices a
+future contributor will question ("why isn't this FastAPI?", "why does resolving
+a gate not auto-resume?") — recorded here with the reasoning.
