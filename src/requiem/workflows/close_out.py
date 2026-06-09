@@ -468,13 +468,18 @@ def build_verb_registry(
     async def _search_prs_for_item(ctx) -> list:
         """Best-effort gh-search fallback for a PR linked to the item.
 
-        Searches by the implementation branch convention
-        (``head:feature/<item_id>``). A search failure is swallowed — the
-        caller then escalates to a human, which is the same safe destination
-        as before the fallback existed (issue #30).
+        Real twig JSON omits the ``pullRequests`` field (issue #30), so when the
+        relation is absent we search GitHub for the PR ourselves. We search the
+        PR **body** for the standard ADO link syntax ``AB#<item_id>`` — which is
+        branch-topology-agnostic (it survives the B3 move from ``feature/<item>``
+        to ``impl/<root>-<item>`` leaf branches, and matches however the PR was
+        opened). A search failure is swallowed — the caller then escalates to a
+        human, the same safe destination as before the fallback existed.
         """
         gh = _require_gh(ctx)
-        query = f"head:feature/{inputs.item_id}"
+        # `in:body AB#<id>` finds PRs whose description carries the ADO work-item
+        # link. gh's --search passes this straight to GitHub's PR search.
+        query = f"in:body AB#{inputs.item_id}"
         try:
             return await gh.pr_search(inputs.repo, query)
         except GhClientError:

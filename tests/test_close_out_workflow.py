@@ -426,9 +426,9 @@ async def test_pr_not_linked_raises_needs_human(tmp_path: Path):
         and "PR linked" in g["payload"]["prompt"]
         for g in gates
     )
-    # Issue #30: gh WAS searched by the branch convention before escalating.
+    # Issue #30: gh WAS searched by the ADO link syntax before escalating.
     assert len(gh.search_queries) == 1
-    assert gh.search_queries[0]["query"] == "head:feature/88"
+    assert gh.search_queries[0]["query"] == "in:body AB#88"
     assert twig.state_transitions == []
 
 
@@ -470,7 +470,7 @@ async def test_pr_resolved_via_gh_search_fallback(tmp_path: Path):
     rp = completed["resolve_pr"]["value"]
     assert rp["pr_number"] == 515
     assert rp["source"] == "gh_search"
-    assert gh.search_queries[0]["query"] == "head:feature/91"
+    assert gh.search_queries[0]["query"] == "in:body AB#91"
 
 
 # ---- Verifier BadOutput → NeedsHuman, NO auto-retry ----------------
