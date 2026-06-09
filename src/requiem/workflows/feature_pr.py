@@ -13,6 +13,7 @@ Shape (mirrors ``plan_pr.py``'s open-and-handoff)::
 
     start
       → verify_readiness   (script · every expected leaf PR head/base/merged?)
+      → verify_dispositions (script · every in-scope item's requirement satisfied?)
       → open_pr            (script · feature/<root> → main, idempotent)
       → link_pr            (script · twig backlink, best-effort)
       → end_success
@@ -65,6 +66,7 @@ EK_NO_LEAVES = "feature_pr.no_leaves"
 
 GATE_TRUNK_NOT_READY = "trunk_not_ready"
 GATE_PR_WRONG_BASE = "pr_exists_wrong_base"
+GATE_DISPOSITIONS_UNSATISFIED = "requirement_dispositions_unsatisfied"
 
 
 # ---- public dataclasses -------------------------------------------------
@@ -82,6 +84,24 @@ class LeafPr:
     pr_number: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ItemDisposition:
+    """The requirement-disposition of one in-scope work item (ADR-0006 P10).
+
+    INV-DRIVER-GATES-FEATURE-MERGE: the feature→main merge waits not only on
+    every leaf-impl PR landing on the trunk (``verify_readiness``) but also on
+    every in-scope item's *requirement disposition* being satisfied. ``state``
+    is the item's tracker state (e.g. ADO ``Done``/``Closed``/``Active``);
+    ``satisfied`` is requiem's boolean disposition for it. The driver sources
+    these from the committed plan / Twig item states; the gate only evaluates
+    what it is given, fail-closed.
+    """
+
+    item_id: str
+    state: str = ""
+    satisfied: bool = False
+
+
 @dataclass(slots=True)
 class FeaturePrInputs:
     """Everything the feature_pr workflow needs, stamped once at start_run."""
@@ -91,6 +111,11 @@ class FeaturePrInputs:
     leaves: tuple[LeafPr, ...]
     base_branch: str = "main"
     dry_run: bool = True
+    # Requirement-disposition gate (ADR-0006 INV-DRIVER-GATES-FEATURE-MERGE).
+    # Empty ⇒ the gate is a no-op pass (a caller that does not supply
+    # dispositions keeps the pre-gate behaviour); non-empty ⇒ every entry must
+    # be ``satisfied`` or the feature PR is fail-closed to a human.
+    dispositions: tuple[ItemDisposition, ...] = ()
 
     @property
     def trunk_branch(self) -> str:
@@ -114,6 +139,8 @@ class FeaturePrResult:
     leaves_ready: int
     reused_existing: bool
     dry_run: bool
+    dispositions_total: int = 0
+    dispositions_satisfied: int = 0
 
 
 # ---- in-memory fakes (CLI demo + tests duck-type these) -----------------
@@ -275,6 +302,60 @@ def build_verb_registry(inputs: FeaturePrInputs) -> VerbRegistry:
             "dry_run": inputs.dry_run,
         })
 
+    # ---- verify_dispositions (ADR-0006 INV-DRIVER-GATES-FEATURE-MERGE) ----
+    #
+    # Trunk-readiness ("every leaf PR merged") is necessary but not sufficient:
+    # the feature→main merge also waits on every in-scope item's *requirement
+    # disposition* being satisfied (ADR-0006 P10 — "PR-state + requirement
+    # disposition is the canonical signal", INV-NO-CORRUPT-FORWARD makes it a
+    # hard refuse-if-unsatisfied check, not a best-effort merge). The gate
+    # evaluates the disposition set the driver supplies; an empty set is a
+    # deliberate no-op pass (a caller that doesn't track dispositions keeps the
+    # pre-gate behaviour). Runs fully in dry-run (read-only).
+
+    @verbs.register("verify_dispositions")
+    async def _verify_dispositions(ctx):
+        dispositions = inputs.dispositions
+        total = len(dispositions)
+        if total == 0:
+            # No disposition set supplied — nothing to gate on (pass-through).
+            return Success(value={
+                "dispositions_total": 0,
+                "dispositions_satisfied": 0,
+                "dry_run": inputs.dry_run,
+            })
+        satisfied = [d for d in dispositions if d.satisfied]
+        unsatisfied = [d for d in dispositions if not d.satisfied]
+        if unsatisfied:
+            detail = ", ".join(
+                f"{d.item_id}:{d.state or 'unknown'}" for d in unsatisfied
+            )
+            return NeedsHuman(
+                gate=GATE_DISPOSITIONS_UNSATISFIED,
+                prompt=(
+                    f"{len(satisfied)}/{total} in-scope item disposition(s) "
+                    f"satisfied; {len(unsatisfied)} unsatisfied ({detail}). "
+                    "The feature→base merge is gated until every in-scope item's "
+                    "requirement disposition is satisfied (ADR-0006 "
+                    "INV-DRIVER-GATES-FEATURE-MERGE). Resolve the item(s) and "
+                    "re-run, or abort."
+                ),
+                options=("abort", "override"),
+                context={
+                    "dispositions_total": total,
+                    "dispositions_satisfied": len(satisfied),
+                    "unsatisfied": [
+                        {"item_id": d.item_id, "state": d.state}
+                        for d in unsatisfied
+                    ],
+                },
+            )
+        return Success(value={
+            "dispositions_total": total,
+            "dispositions_satisfied": len(satisfied),
+            "dry_run": inputs.dry_run,
+        })
+
     # ---- open_pr (trunk → main, idempotent) ---------------------------
 
     @verbs.register("open_pr")
@@ -379,9 +460,13 @@ def build_workflow() -> Workflow:
             .script("start", verb="start_run")
                 .edge("start", on="success", to="verify_readiness")
             .script("verify_readiness", verb="verify_readiness")
-                .edge("verify_readiness", on="success", to="open_pr")
+                .edge("verify_readiness", on="success", to="verify_dispositions")
                 .edge("verify_readiness", on="needs_human", to="end_human")
                 .edge("verify_readiness", on="permanent_failure", to="end_failed")
+            .script("verify_dispositions", verb="verify_dispositions")
+                .edge("verify_dispositions", on="success", to="open_pr")
+                .edge("verify_dispositions", on="needs_human", to="end_human")
+                .edge("verify_dispositions", on="permanent_failure", to="end_failed")
             .script("open_pr", verb="open_pr")
                 .edge("open_pr", on="success", to="link_pr")
                 .edge("open_pr", on="needs_human", to="end_human")
@@ -392,10 +477,11 @@ def build_workflow() -> Workflow:
                 .edge("link_pr", on="permanent_failure", to="end_success")
             .terminate("end_success", disposition="completed")
             .terminate("end_failed", disposition="failed")
-            .terminate("end_human", disposition="failed")
+            .terminate("end_human", disposition="needs_human")
             .humanize({
                 "start": "Starting feature integration PR",
                 "verify_readiness": "Verified trunk readiness",
+                "verify_dispositions": "Verified requirement dispositions",
                 "open_pr": "Opened feature integration PR",
                 "link_pr": "Linked PR to work item",
                 "end_success": "Feature PR ready for review",
@@ -506,6 +592,7 @@ def feature_pr_result(completed: dict, final_node: str) -> FeaturePrResult:
     else:
         verdict = "failed"
     pr_number = pr.get("pr_number")
+    disp = (completed.get("verify_dispositions") or {}).get("value") or {}
     return FeaturePrResult(
         root_item_id=int(start.get("root_item_id") or 0),
         verdict=verdict,
@@ -517,6 +604,8 @@ def feature_pr_result(completed: dict, final_node: str) -> FeaturePrResult:
         leaves_ready=int(verify.get("leaves_ready") or 0),
         reused_existing=bool(pr.get("reused_existing")),
         dry_run=dry_run,
+        dispositions_total=int(disp.get("dispositions_total") or 0),
+        dispositions_satisfied=int(disp.get("dispositions_satisfied") or 0),
     )
 
 

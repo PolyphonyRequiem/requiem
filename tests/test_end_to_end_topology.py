@@ -27,7 +27,7 @@ from requiem.end_to_end import (
     run_pipeline,
 )
 from requiem.kernel import Completed
-from requiem.workflows.feature_pr import LeafPr
+from requiem.workflows.feature_pr import ItemDisposition, LeafPr
 
 
 def _write_log(log_dir: Path, run_id: str, events: list[tuple[str, dict]]) -> None:
@@ -338,7 +338,14 @@ async def test_executor_pause_skips_leaf_pr(tmp_path):
 
 def _feature_pr_factory(calls: _Calls, *, final: str = "end_success",
                         pr_number: int = 555, leaves_ready: int = 2,
-                        leaves_total: int = 2):
+                        leaves_total: int = 2, dispositions_total: int = 0,
+                        dispositions_satisfied: int = 0, human_at: str = "verify_readiness"):
+    """Stub feature_pr engine.
+
+    ``human_at`` selects which gate stops an ``end_human`` run — ``verify_readiness``
+    (a laggard leaf) or ``verify_dispositions`` (an unsatisfied requirement) — so
+    the driver's not_ready cause-detection can be exercised.
+    """
     def factory(log_dir, *, inputs=None, toolbelt=None, gate_handler=None):
         calls.feature_pr += 1
         calls.feature_pr_inputs = inputs
@@ -353,12 +360,20 @@ def _feature_pr_factory(calls: _Calls, *, final: str = "end_success",
                         "leaves_total": leaves_total,
                         "dry_run": inputs.dry_run,
                     }}),
-                    ("verify_readiness", {"kind": "success", "value": {
-                        "leaves_ready": leaves_ready,
-                    }}),
                 ]
-                # In the real workflow open_pr only runs when readiness passed;
-                # an end_human gate stops at verify_readiness (no open_pr value).
+                # verify_readiness records unless the human gate stopped here.
+                stop_at_readiness = (final == "end_human" and human_at == "verify_readiness")
+                stop_at_disp = (final == "end_human" and human_at == "verify_dispositions")
+                if not stop_at_readiness:
+                    events.append(("verify_readiness", {"kind": "success", "value": {
+                        "leaves_ready": leaves_ready,
+                    }}))
+                    # verify_dispositions records unless it's the stopping gate.
+                    if not stop_at_disp:
+                        events.append(("verify_dispositions", {"kind": "success", "value": {
+                            "dispositions_total": dispositions_total,
+                            "dispositions_satisfied": dispositions_satisfied,
+                        }}))
                 if final == "end_success":
                     events.append(("open_pr", {"kind": "success", "value": {
                         "pr_number": pr_number,
@@ -366,6 +381,17 @@ def _feature_pr_factory(calls: _Calls, *, final: str = "end_success",
                         "reused_existing": False,
                     }}))
                 _write_log(log_dir, run_id, events)
+                # A human gate records a gate_opened event (not a Success); the
+                # driver reads it to learn which node gated. Mirror that here.
+                if final == "end_human":
+                    gate_node = human_at
+                    with (log_dir / f"{run_id}.events.jsonl").open(
+                        "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps({
+                            "kind": "gate_opened", "node_id": gate_node,
+                            "prompt": "stub gate", "options": ["abort"],
+                            "context": {}, "auto": True,
+                        }) + "\n")
                 disp = "completed" if final == "end_success" else "failed"
                 return Completed(run_id, disp, final, {})
         return _E()
@@ -413,8 +439,8 @@ async def test_integrate_not_ready_surfaces_to_human(tmp_path):
     )
     # The drift/laggard path: gate returns needs_human → not_ready, no crash.
     assert result.status == "not_ready"
-    assert result.leaves_ready == 1
-    assert result.leaves_total == 2
+    # The readiness gate fired → the detail names the trunk-not-ready cause.
+    assert "trunk not ready" in result.detail.lower()
     assert result.feature_pr_number is None
 
 
@@ -425,3 +451,79 @@ async def test_integrate_requires_a_map_source(tmp_path):
             700, log_dir=tmp_path, github_repo="Owner/Repo",
             # neither leaves nor leaf_pr_map_path
         )
+
+
+# ---- requirement-disposition gate forwarding (ADR-0006) --------------------
+
+
+async def test_integrate_forwards_dispositions_to_feature_pr(tmp_path):
+    """The driver threads the disposition set into feature_pr's inputs."""
+    map_path = tmp_path / "leaf-pr-map-700.json"
+    map_path.write_text(json.dumps({
+        "item_id": 700,
+        "leaves": [{"leaf_id": "700", "pr_number": 11}],
+    }), encoding="utf-8")
+
+    dispositions = (
+        ItemDisposition("700", state="Done", satisfied=True),
+        ItemDisposition("701", state="Closed", satisfied=True),
+    )
+    calls = _Calls()
+    result = await integrate_pipeline(
+        700, log_dir=tmp_path, github_repo="Owner/Repo",
+        leaf_pr_map_path=map_path, base_branch="main", live=True,
+        dispositions=dispositions,
+        feature_pr_factory=_feature_pr_factory(
+            calls, dispositions_total=2, dispositions_satisfied=2),
+    )
+    assert result.status == "opened"
+    # feature_pr received the exact disposition set the driver was handed.
+    assert calls.feature_pr_inputs.dispositions == dispositions
+    assert result.dispositions_total == 2
+    assert result.dispositions_satisfied == 2
+
+
+async def test_integrate_disposition_block_reports_distinct_cause(tmp_path):
+    """An unsatisfied disposition surfaces a disposition-specific not_ready detail."""
+    map_path = tmp_path / "leaf-pr-map-700.json"
+    map_path.write_text(json.dumps({
+        "item_id": 700,
+        "leaves": [{"leaf_id": "700", "pr_number": 11}],
+    }), encoding="utf-8")
+
+    calls = _Calls()
+    result = await integrate_pipeline(
+        700, log_dir=tmp_path, github_repo="Owner/Repo",
+        leaf_pr_map_path=map_path, base_branch="main", live=True,
+        dispositions=(ItemDisposition("701", state="Active", satisfied=False),),
+        feature_pr_factory=_feature_pr_factory(
+            calls, final="end_human", human_at="verify_dispositions",
+            leaves_ready=1, leaves_total=1,
+            dispositions_total=1, dispositions_satisfied=0),
+    )
+    assert result.status == "not_ready"
+    # The detail names the disposition cause, not a laggard leaf. (The numeric
+    # counts are unavailable in the projection when the gate itself fires — the
+    # gating node records no Success value — so we assert on the cause, not counts.)
+    assert "disposition" in result.detail.lower()
+    assert "trunk not ready" not in result.detail.lower()
+    assert result.feature_pr_number is None
+
+
+async def test_integrate_no_dispositions_is_pass_through(tmp_path):
+    """Default (no dispositions) keeps the pre-gate behaviour — opens the PR."""
+    map_path = tmp_path / "leaf-pr-map-700.json"
+    map_path.write_text(json.dumps({
+        "item_id": 700,
+        "leaves": [{"leaf_id": "700", "pr_number": 11}],
+    }), encoding="utf-8")
+
+    calls = _Calls()
+    result = await integrate_pipeline(
+        700, log_dir=tmp_path, github_repo="Owner/Repo",
+        leaf_pr_map_path=map_path, base_branch="main", live=True,
+        feature_pr_factory=_feature_pr_factory(calls),
+    )
+    assert result.status == "opened"
+    assert calls.feature_pr_inputs.dispositions == ()
+    assert result.dispositions_total == 0

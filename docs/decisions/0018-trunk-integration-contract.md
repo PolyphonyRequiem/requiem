@@ -326,8 +326,12 @@ the leaf-PR-base decision (the rubber-duck's "Q3") is settled (requiem opens,
 leaf→trunk, never self-merge).
 
 **Negative / open:** requiem now opens leaf PRs (more GitHub surface +
-idempotency to get right); requirement-disposition gating is scoped out of the
-first slice and must land before this is "production"; trunk drift is handled
+idempotency to get right); ~~requirement-disposition gating is scoped out of the
+first slice and must land before this is "production"~~ **requirement-disposition
+gating landed 2026-06-09** (`feature_pr.verify_dispositions` —
+INV-DRIVER-GATES-FEATURE-MERGE: the feature→base merge fails closed unless every
+in-scope item's requirement disposition is satisfied; the driver threads the
+`ItemDisposition` set through `integrate_pipeline`); trunk drift is handled
 only by surfacing an unmergeable PR until a `rebase_onto_target` verb is added;
 Option C assumes a GitHub-style `GhClient` — the ADO leaf-PR path (#10,
 ADR-0007) is a separate, still-draft track.

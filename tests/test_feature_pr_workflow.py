@@ -320,3 +320,120 @@ def test_inputs_derive_trunk_and_impl_branches():
     inputs = FeaturePrInputs(root_item_id=ROOT, repo=REPO, leaves=(LeafPr("7", 1),))
     assert inputs.trunk_branch == f"feature/{ROOT}"
     assert inputs.impl_branch_for("7") == f"impl/{ROOT}-7"
+
+
+# ---- requirement-disposition gate (ADR-0006 INV-DRIVER-GATES-FEATURE-MERGE) --
+
+
+def _engine_disp(log_dir, *, leaves, gh, dispositions, twig=None, dry_run=False,
+                 gate_handler=None):
+    """Build a feature_pr engine with an explicit disposition set."""
+    inputs = FeaturePrInputs(
+        root_item_id=ROOT, repo=REPO, leaves=tuple(leaves), base_branch="main",
+        dry_run=dry_run, dispositions=tuple(dispositions),
+    )
+    return fp.build_engine(
+        log_dir, inputs=inputs, toolbelt=_toolbelt(gh=gh, twig=twig),
+        gate_handler=gate_handler,
+    )
+
+
+async def test_empty_dispositions_pass_through(log_dir):
+    """No disposition set supplied ⇒ the gate is a no-op (pre-gate behaviour)."""
+    gh = FakeGh(next_pr_number=7100)
+    twig = FakeTwig()
+    leaves = _two_merged_leaves(gh)
+    engine = _engine_disp(log_dir, leaves=leaves, gh=gh, twig=twig,
+                          dispositions=())
+    result = await engine.run("disp_empty")
+    assert result.final_node == "end_success"
+    res = _result(engine, "disp_empty", result.final_node)
+    assert res.verdict == "opened"
+    assert res.dispositions_total == 0
+    assert res.dispositions_satisfied == 0
+    # PR opened — readiness passed and there was nothing to gate on.
+    assert len(gh.created) == 1
+
+
+async def test_all_dispositions_satisfied_opens_pr(log_dir):
+    gh = FakeGh(next_pr_number=7200)
+    twig = FakeTwig()
+    leaves = _two_merged_leaves(gh)
+    dispositions = [
+        fp.ItemDisposition("1", state="Done", satisfied=True),
+        fp.ItemDisposition("2", state="Closed", satisfied=True),
+    ]
+    engine = _engine_disp(log_dir, leaves=leaves, gh=gh, twig=twig,
+                          dispositions=dispositions)
+    result = await engine.run("disp_ok")
+    assert result.final_node == "end_success"
+    res = _result(engine, "disp_ok", result.final_node)
+    assert res.verdict == "opened"
+    assert res.dispositions_total == 2
+    assert res.dispositions_satisfied == 2
+    assert len(gh.created) == 1
+
+
+async def test_unsatisfied_disposition_gates_to_human_no_pr(log_dir):
+    """A single unsatisfied in-scope item fails the merge closed — no PR opens."""
+    gh = FakeGh(next_pr_number=7300)
+    twig = FakeTwig()
+    leaves = _two_merged_leaves(gh)  # leaves are all merged (readiness passes)
+    dispositions = [
+        fp.ItemDisposition("1", state="Done", satisfied=True),
+        fp.ItemDisposition("2", state="Active", satisfied=False),  # laggard
+    ]
+    engine = _engine_disp(log_dir, leaves=leaves, gh=gh, twig=twig,
+                          dispositions=dispositions)
+    result = await engine.run("disp_gate")
+    # Fail-closed: readiness passed, but a disposition is unsatisfied.
+    assert result.final_node == "end_human"
+    res = _result(engine, "disp_gate", result.final_node)
+    assert res.verdict == "needs_human"
+    # No integration PR opened over an unsatisfied requirement set.
+    assert gh.created == []
+
+
+async def test_disposition_gate_runs_after_readiness(log_dir):
+    """If readiness fails first, the disposition gate never runs (ordering)."""
+    gh = FakeGh(next_pr_number=7400)
+    # One leaf NOT merged ⇒ verify_readiness gates before verify_dispositions.
+    gh.by_number[201] = _leaf_pr(ROOT, "1", 201, merged=True)
+    gh.by_number[202] = _leaf_pr(ROOT, "2", 202, merged=False)
+    leaves = [LeafPr("1", 201), LeafPr("2", 202)]
+    dispositions = [fp.ItemDisposition("1", state="Active", satisfied=False)]
+    engine = _engine_disp(log_dir, leaves=leaves, gh=gh, dispositions=dispositions)
+    result = await engine.run("disp_order")
+    assert result.final_node == "end_human"
+    # The readiness gate fired; the disposition node never recorded a value.
+    completed = completed_from_log(engine.log_path("disp_order"))
+    assert "verify_readiness" in completed
+    assert "verify_dispositions" not in completed
+
+
+async def test_disposition_gate_honoured_in_dry_run(log_dir):
+    """The gate is enforced even in dry-run (it's read-only but still gates)."""
+    gh = FakeGh()
+    leaves = _two_merged_leaves(gh)
+    dispositions = [fp.ItemDisposition("9", state="Active", satisfied=False)]
+    engine = _engine_disp(log_dir, leaves=leaves, gh=gh, dispositions=dispositions,
+                          dry_run=True)
+    result = await engine.run("disp_dry")
+    assert result.final_node == "end_human"
+    assert gh.created == []
+
+
+async def test_end_human_reports_needs_human_disposition(log_dir):
+    """Regression: the human-handoff terminal reports needs_human, not failed.
+
+    Mirrors close_out issue #29 — a needs-human gate must not masquerade as a
+    failed run on the CLI topline.
+    """
+    gh = FakeGh()
+    leaves = _two_merged_leaves(gh)
+    dispositions = [fp.ItemDisposition("1", state="Active", satisfied=False)]
+    engine = _engine_disp(log_dir, leaves=leaves, gh=gh, dispositions=dispositions)
+    result = await engine.run("disp_needs_human")
+    assert result.final_node == "end_human"
+    # The kernel-level disposition (drives the CLI topline) is needs_human.
+    assert result.disposition == "needs_human"
