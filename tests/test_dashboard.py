@@ -127,6 +127,42 @@ def test_run_detail_humanizes_timeline(log_dir):
     assert any("run started" in e.summary for e in detail.timeline)
 
 
+def test_run_detail_surfaces_process_config_policy(log_dir):
+    """#1: the start_run ProcessConfig snapshot is projected as `policy` so the
+    dashboard can show the tier policy that classified the run's work."""
+    _write_run(log_dir, "withpolicy", [
+        {"kind": "run_started", "payload": {"workflow": "planning"}},
+        {"kind": "node_entered", "node_id": "start", "payload": {"attempt": 1}},
+        {"kind": "verb_completed", "node_id": "start", "payload": {"outcome": {
+            "kind": "success",
+            "value": {"process_config": {
+                "root_parent_types": ["Epic", "Feature"],
+                "decomposable_types": ["Feature", "Epic"],
+                "implementable_types": ["Task", "Bug"],
+                "type_aliases": {"Story": "Feature"},
+                "source": ".requiem-config/process.yaml",
+                "sha256": "abc123def456",
+            }},
+        }}},
+    ])
+    detail = projection.run_detail(log_dir, "withpolicy")
+    assert detail is not None
+    assert detail.policy is not None
+    assert detail.policy["root_parent_types"] == ["Epic", "Feature"]
+    assert detail.policy["implementable_types"] == ["Task", "Bug"]
+    assert detail.policy["type_aliases"] == {"Story": "Feature"}
+    # to_dict (the API shape) carries it too.
+    assert detail.to_dict()["policy"]["sha256"] == "abc123def456"
+
+
+def test_run_detail_no_policy_when_absent(log_dir):
+    """A run without a process_config snapshot has policy=None (not an error)."""
+    _completed_run(log_dir, "nopolicy")
+    detail = projection.run_detail(log_dir, "nopolicy")
+    assert detail is not None
+    assert detail.policy is None
+
+
 def test_run_detail_surfaces_open_gate(log_dir):
     _suspended_run(log_dir, "g")
     detail = projection.run_detail(log_dir, "g")
