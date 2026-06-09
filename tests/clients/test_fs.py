@@ -260,3 +260,63 @@ def test_all_errors_inherit_from_fsclienterror():
         FsNotAGitRepoError,
     ):
         assert issubclass(cls, FsClientError)
+
+
+# ---- worktree primitive (ADR-0022, parity #5) -----------------------
+
+
+async def test_git_worktree_add_creates_isolated_branch(fs: FilesystemClient, repo: Path):
+    wt = repo.parent / "wt-leaf"
+    await fs.git_worktree_add(wt, branch="impl/9300-1", from_ref="main")
+    assert wt.exists()
+    # A linked worktree's `.git` is a FILE (gitdir pointer), not a directory.
+    assert (wt / ".git").is_file()
+    # The worktree is on its own branch; the main checkout is untouched.
+    leaf_fs = FilesystemClient(wt)
+    assert await leaf_fs.git_current_branch() == "impl/9300-1"
+    assert await fs.git_current_branch() == "main"
+
+
+async def test_worktree_bound_client_runs_git_ops(fs: FilesystemClient, repo: Path):
+    """A FilesystemClient bound to a worktree (`.git` file) runs git ops — the
+    `_is_git_tree` fix. Commits in the worktree don't touch the main tree."""
+    wt = repo.parent / "wt-ops"
+    await fs.git_worktree_add(wt, branch="impl/9300-2", from_ref="main")
+    leaf_fs = FilesystemClient(wt)
+    leaf_fs.write_text(wt / "LEAF.md", "leaf\n")
+    await leaf_fs.git_commit("leaf commit", [Path("LEAF.md")])
+    # The file + commit live in the worktree only.
+    assert (wt / "LEAF.md").exists()
+    assert not (repo / "LEAF.md").exists()
+    assert await leaf_fs.git_is_clean()
+
+
+async def test_git_worktree_remove(fs: FilesystemClient, repo: Path):
+    wt = repo.parent / "wt-rm"
+    await fs.git_worktree_add(wt, branch="impl/9300-3", from_ref="main")
+    assert wt.exists()
+    await fs.git_worktree_remove(wt, force=True)
+    assert not wt.exists()
+
+
+async def test_two_worktrees_are_independent(fs: FilesystemClient, repo: Path):
+    """Two worktrees added concurrently have independent branches + files —
+    the isolation parity #5 relies on for parallel dispatch."""
+    import asyncio
+    wt1 = repo.parent / "wt-a"
+    wt2 = repo.parent / "wt-b"
+    await asyncio.gather(
+        fs.git_worktree_add(wt1, branch="impl/9300-a", from_ref="main"),
+        fs.git_worktree_add(wt2, branch="impl/9300-b", from_ref="main"),
+    )
+    f1, f2 = FilesystemClient(wt1), FilesystemClient(wt2)
+    f1.write_text(wt1 / "A.md", "a\n")
+    f2.write_text(wt2 / "B.md", "b\n")
+    await asyncio.gather(
+        f1.git_commit("a", [Path("A.md")]),
+        f2.git_commit("b", [Path("B.md")]),
+    )
+    assert (wt1 / "A.md").exists() and not (wt1 / "B.md").exists()
+    assert (wt2 / "B.md").exists() and not (wt2 / "A.md").exists()
+    assert await f1.git_current_branch() == "impl/9300-a"
+    assert await f2.git_current_branch() == "impl/9300-b"

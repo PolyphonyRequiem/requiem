@@ -76,6 +76,11 @@ class FanoutInputs:
     log_dir: Path
     base_branch: str = "main"
     dry_run: bool = True
+    # Parallel dispatch with per-leaf git worktree isolation (ADR-0022, #5).
+    # When False (default) leaves run sequentially over the shared repo. When
+    # True, each leaf gets its own worktree and leaves run concurrently.
+    parallel: bool = False
+    max_parallel: int = 4
     # Explicit leaves (tests / inline) take priority; otherwise resolve from the
     # committed plan artifacts.
     leaves: tuple[FanoutLeaf, ...] = ()
@@ -84,6 +89,11 @@ class FanoutInputs:
 
     def child_run_id(self, real_id: int) -> str:
         return f"fanout-{self.root_item_id}__leaf-{real_id}"
+
+    def worktree_path(self, real_id: int) -> Path:
+        """Per-leaf worktree dir (parallel mode). Sibling of the repo so it isn't
+        nested inside the main working tree."""
+        return self.repo_path.parent / f".requiem-wt-{self.root_item_id}-{real_id}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,69 +224,124 @@ def build_verb_registry(inputs: FanoutInputs) -> VerbRegistry:
             )
         return Success(value={"leaves": [_leaf_to_dict(leaf) for leaf in leaves]})
 
+    async def _dispatch_one(leaf: FanoutLeaf, toolbelt: Toolbelt) -> LeafOutcome:
+        """Build + run one leaf's implementation engine, returning its outcome.
+
+        In parallel mode the leaf runs in its own git worktree (ADR-0022) so
+        concurrent leaves don't clobber each other's checkout/index. The branch
+        is created *with* the worktree (`-b impl/<root>-<leaf>`), so
+        `implementation.create_branch` finds it already current.
+        """
+        from dataclasses import replace as _dc_replace
+
+        from requiem.clients.fs import FilesystemClient, FsGitError
+
+        run_id = inputs.child_run_id(leaf.real_id)
+        log_path = inputs.log_dir / f"{run_id}.events.jsonl"
+
+        # Idempotent re-entry: skip a leaf whose child run already reached a
+        # terminal disposition on a prior orchestrator run.
+        prior = _terminal_disposition(log_path)
+        if prior is not None:
+            return LeafOutcome(
+                real_id=leaf.real_id, disposition=prior,
+                final_node="(prior run)", child_run_id=run_id, skipped=True,
+            )
+
+        repo_path = inputs.repo_path
+        worktree: Path | None = None
+        if inputs.parallel:
+            worktree = inputs.worktree_path(leaf.real_id)
+            branch = f"impl/{inputs.root_item_id}-{leaf.real_id}"
+            # Reuse an existing worktree dir on re-entry (a second `worktree add`
+            # on the same path errors). Otherwise create it on the leaf branch.
+            if not worktree.exists():
+                main_fs = toolbelt.fs or FilesystemClient(repo_path)
+                try:
+                    await main_fs.git_worktree_add(
+                        worktree, branch=branch, from_ref=inputs.base_branch,
+                    )
+                except FsGitError as e:
+                    return LeafOutcome(
+                        real_id=leaf.real_id, disposition="failed",
+                        final_node=f"worktree_add_failed:{e}",
+                        child_run_id=run_id,
+                    )
+            repo_path = worktree
+
+        child_inputs = impl_mod.ImplementationInputs(
+            item_id=leaf.real_id,
+            repo=inputs.repo,
+            repo_path=repo_path,
+            base_branch=inputs.base_branch,
+            dry_run=inputs.dry_run,
+            root=inputs.root_item_id,   # ADR-0006 (B3): impl/<root>-<leaf>
+        )
+        # Per-leaf toolbelt: serve THIS leaf's already-resolved plan via a
+        # _LeafTwig (no live ADO re-fetch) and bind fs to the leaf's working
+        # tree (the worktree in parallel mode, else the shared repo). We start
+        # from the orchestrator's toolbelt (so gh/git are the real,
+        # seam-propagated clients) and swap twig + fs for the leaf.
+        leaf_twig = _LeafTwig(real_id=leaf.real_id, title=leaf.title, body=leaf.body)
+        leaf_toolbelt = _dc_replace(
+            toolbelt,
+            twig=leaf_twig,  # type: ignore[arg-type]
+            fs=FilesystemClient(repo_path),
+        )
+        # The ADR-0020 seam (installed by THIS orchestrator's build_engine, and
+        # safe under asyncio.gather — a parent-set contextvar propagates into
+        # gathered children) lets the child inherit our real provider. The
+        # per-leaf toolbelt is passed explicitly so a leaf is never built over a
+        # silent fake.
+        child = impl_mod.build_engine(
+            inputs.log_dir, inputs=child_inputs, toolbelt=leaf_toolbelt,
+        )
+        result = await child.run(run_id)
+
+        if isinstance(result, Completed):
+            disp, final = result.disposition, result.final_node
+        elif isinstance(result, Suspended):
+            disp, final = "needs_human", result.node_id
+        elif isinstance(result, Failed):
+            disp, final = "failed", result.node_id
+        else:  # defensive
+            disp, final = "error", "(unknown)"
+
+        # Best-effort worktree cleanup on a landed leaf; leave it on disk for a
+        # surrendered/failed leaf so the human can inspect the working tree
+        # (mirrors implementation's "branch left on disk" handoff contract).
+        if worktree is not None and disp == "completed":
+            try:
+                main_fs = toolbelt.fs or FilesystemClient(inputs.repo_path)
+                await main_fs.git_worktree_remove(worktree, force=True)
+            except FsGitError:
+                pass
+
+        return LeafOutcome(
+            real_id=leaf.real_id, disposition=disp,
+            final_node=final, child_run_id=run_id,
+        )
+
     @verbs.register("dispatch_leaves")
     async def _dispatch_leaves(ctx):
         resolved = (ctx.completed.get("resolve_leaves") or {}).get("value") or {}
         leaves = [_leaf_from_dict(d) for d in resolved.get("leaves", [])]
         toolbelt: Toolbelt = ctx.toolbelt
 
-        outcomes: list[LeafOutcome] = []
-        for leaf in leaves:
-            run_id = inputs.child_run_id(leaf.real_id)
-            log_path = inputs.log_dir / f"{run_id}.events.jsonl"
+        if inputs.parallel:
+            # Bounded concurrency: at most `max_parallel` leaves in flight.
+            import asyncio
+            sem = asyncio.Semaphore(max(1, inputs.max_parallel))
 
-            # Idempotent re-entry: skip a leaf whose child run already reached a
-            # terminal disposition on a prior orchestrator run.
-            prior = _terminal_disposition(log_path)
-            if prior is not None:
-                outcomes.append(LeafOutcome(
-                    real_id=leaf.real_id, disposition=prior,
-                    final_node="(prior run)", child_run_id=run_id, skipped=True,
-                ))
-                continue
+            async def _guarded(leaf):
+                async with sem:
+                    return await _dispatch_one(leaf, toolbelt)
 
-            child_inputs = impl_mod.ImplementationInputs(
-                item_id=leaf.real_id,
-                repo=inputs.repo,
-                repo_path=inputs.repo_path,
-                base_branch=inputs.base_branch,
-                dry_run=inputs.dry_run,
-                root=inputs.root_item_id,   # ADR-0006 (B3): impl/<root>-<leaf>
-            )
-            # Per-leaf toolbelt: serve THIS leaf's already-resolved plan via a
-            # _LeafTwig (no live ADO re-fetch) and bind fs to the repo. We start
-            # from the orchestrator's toolbelt (so gh/git are the real,
-            # seam-propagated clients) and swap twig + fs for the leaf.
-            from dataclasses import replace as _dc_replace
-
-            from requiem.clients.fs import FilesystemClient
-            leaf_twig = _LeafTwig(real_id=leaf.real_id, title=leaf.title, body=leaf.body)
-            leaf_toolbelt = _dc_replace(
-                toolbelt,
-                twig=leaf_twig,  # type: ignore[arg-type]
-                fs=FilesystemClient(inputs.repo_path),
-            )
-            # The ADR-0020 seam (installed by the kernel from THIS engine before
-            # any child build) also lets the child inherit our real provider. We
-            # pass the per-leaf toolbelt explicitly so a leaf is never built over
-            # a silent fake.
-            child = impl_mod.build_engine(
-                inputs.log_dir, inputs=child_inputs, toolbelt=leaf_toolbelt,
-            )
-            result = await child.run(run_id)
-
-            if isinstance(result, Completed):
-                disp, final = result.disposition, result.final_node
-            elif isinstance(result, Suspended):
-                disp, final = "needs_human", result.node_id
-            elif isinstance(result, Failed):
-                disp, final = "failed", result.node_id
-            else:  # defensive
-                disp, final = "error", "(unknown)"
-            outcomes.append(LeafOutcome(
-                real_id=leaf.real_id, disposition=disp,
-                final_node=final, child_run_id=run_id,
-            ))
+            outcomes = list(await asyncio.gather(*(_guarded(leaf) for leaf in leaves)))
+        else:
+            outcomes = []
+            for leaf in leaves:
+                outcomes.append(await _dispatch_one(leaf, toolbelt))
 
         landed = sum(1 for o in outcomes if o.disposition == "completed")
         needs_human = sum(1 for o in outcomes if o.disposition == "needs_human")
@@ -296,6 +361,7 @@ def build_verb_registry(inputs: FanoutInputs) -> VerbRegistry:
                 for o in outcomes
             ],
             "dry_run": inputs.dry_run,
+            "parallel": inputs.parallel,
         })
 
     return verbs
