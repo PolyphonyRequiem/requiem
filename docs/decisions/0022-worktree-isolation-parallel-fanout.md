@@ -92,6 +92,15 @@ same path errors). Worktree creation is therefore guarded by a dir-exists check.
 - **Worktree GC of abandoned leaves** beyond best-effort remove — a `requiem
   worktree prune` housekeeping verb is a follow-up.
 
+**Update (2026-06-09): worktree GC landed.** `fs.py` gained
+`git_worktree_list()` (porcelain enumeration, surfaces `prunable`) and
+`git_worktree_prune()` (clears stale admin entries from a crashed run). `fanout`'s
+parallel `dispatch_leaves` now prunes once before dispatch, so a reused
+`.requiem-wt-*` path from a prior crash doesn't collide on `git worktree add`.
+(`tests/clients/test_fs.py` list + prune-after-crash cases.) A standalone
+`requiem worktree prune` CLI verb is still a possible follow-up; the in-fan-out
+GC covers the operational gap.
+
 ## Consequences
 
 **Positive:** closes #5 — true parallel dispatch with real isolation, built on the
