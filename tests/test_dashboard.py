@@ -450,3 +450,100 @@ async def test_kernel_resume_consumes_dashboard_resolution(log_dir):
     resolve_gate(log_dir, "gw2", "abort")
     out3 = await engine().run("gw2")
     assert out3.final_node == "end_no"
+
+
+# ---- opt-in auto-resume (ADR-0019 ergonomic; default OFF) ---------------
+
+
+def test_resolve_workflow_module_reads_from_log(log_dir):
+    from requiem.dashboard.auto_resume import resolve_workflow_module
+    _suspended_run(log_dir, "wfmod")
+    assert resolve_workflow_module(log_dir, "wfmod") == "needs-human-wf"
+    assert resolve_workflow_module(log_dir, "nope") is None
+
+
+def test_spawn_resume_builds_resume_argv(log_dir, monkeypatch):
+    """spawn_resume fires `requiem resume <module> <run_id>` (mocked Popen)."""
+    from requiem.dashboard import auto_resume
+    _suspended_run(log_dir, "sp")
+
+    captured = {}
+
+    class _FakePopen:
+        def __init__(self, argv, **kw):
+            captured["argv"] = argv
+            captured["kw"] = kw
+
+    monkeypatch.setattr(auto_resume.subprocess, "Popen", _FakePopen)
+    auto_resume.spawn_resume(log_dir, "sp")
+    argv = captured["argv"]
+    assert "requiem.cli.main" in argv
+    assert "resume" in argv
+    assert "needs-human-wf" in argv     # the workflow module
+    assert "sp" in argv                 # the run id
+    assert str(log_dir) in argv
+
+
+def test_spawn_resume_raises_without_workflow_module(log_dir, monkeypatch):
+    from requiem.dashboard import auto_resume
+    # A run whose log has no workflow identity.
+    _write_run(log_dir, "noident", [
+        {"kind": "gate_opened", "node_id": "g",
+         "payload": {"prompt": "?", "options": ["approve"]}},
+    ])
+    monkeypatch.setattr(auto_resume.subprocess, "Popen",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("spawned")))
+    import pytest
+    with pytest.raises(auto_resume.AutoResumeError):
+        auto_resume.spawn_resume(log_dir, "noident")
+
+
+def test_server_default_does_not_auto_resume(log_dir, monkeypatch):
+    """Default server (auto_resume off) appends the decision but never spawns."""
+    import urllib.request
+    from requiem.dashboard import auto_resume
+    monkeypatch.setattr(auto_resume.subprocess, "Popen",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("spawned")))
+    _suspended_run(log_dir, "noauto")
+    httpd = build_server(log_dir, host="127.0.0.1", port=0)  # default: off
+    import threading
+    t = threading.Thread(target=httpd.handle_request, daemon=True)
+    t.start()
+    port = httpd.socket.getsockname()[1]
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/gates/noauto/resolve",
+        data=json.dumps({"choice": "approve"}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req) as resp:
+        payload = json.loads(resp.read())
+    httpd.server_close()
+    assert payload["auto_resume"] == "disabled"
+
+
+def test_server_auto_resume_spawns_on_resolve(log_dir, monkeypatch):
+    """With auto_resume=True a successful resolve spawns requiem resume."""
+    import urllib.request
+    from requiem.dashboard import auto_resume
+    spawned = {}
+
+    class _FakePopen:
+        def __init__(self, argv, **kw):
+            spawned["argv"] = argv
+
+    monkeypatch.setattr(auto_resume.subprocess, "Popen", _FakePopen)
+    _suspended_run(log_dir, "withauto")
+    httpd = build_server(log_dir, host="127.0.0.1", port=0, auto_resume=True)
+    import threading
+    t = threading.Thread(target=httpd.handle_request, daemon=True)
+    t.start()
+    port = httpd.socket.getsockname()[1]
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/gates/withauto/resolve",
+        data=json.dumps({"choice": "approve"}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req) as resp:
+        payload = json.loads(resp.read())
+    httpd.server_close()
+    assert payload["auto_resume"] == "spawned"
+    assert "resume" in spawned["argv"]
+    assert "withauto" in spawned["argv"]
