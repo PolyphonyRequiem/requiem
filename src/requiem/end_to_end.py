@@ -26,6 +26,7 @@ spawn (the executor's own dispatch dry-run).
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -35,8 +36,12 @@ from requiem.kernel import Completed, Engine
 from requiem.persistence import replay
 from requiem.toolbelt import Toolbelt
 from requiem.workflows import commit_plan as commit_plan_mod
+from requiem.workflows import feature_pr as feature_pr_mod
 from requiem.workflows import kanban_executor as executor_mod
+from requiem.workflows import leaf_pr as leaf_pr_mod
 from requiem.workflows import planning as planning_mod
+from requiem.workflows import trunk_bootstrap as trunk_bootstrap_mod
+from requiem.workflows.feature_pr import LeafPr
 from requiem.workflows.kanban_executor import ExecInputs, LeafSpec
 
 # Engine factories are injected (defaulting to the real ones) so the pipeline
@@ -44,6 +49,11 @@ from requiem.workflows.kanban_executor import ExecInputs, LeafSpec
 PlanningFactory = Callable[..., Engine]
 CommitFactory = Callable[..., Engine]
 ExecutorFactory = Callable[..., Engine]
+# ADR-0018 step 4: the three trunk-topology workflows the driver owns. Injected
+# the same way (real build_engine by default) so the wiring is stub-testable.
+TrunkBootstrapFactory = Callable[..., Engine]
+LeafPrFactory = Callable[..., Engine]
+FeaturePrFactory = Callable[..., Engine]
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +76,18 @@ class PipelineResult:
     plan_artifact: str | None = None
     committed_path: str | None = None
     executor_final_node: str | None = None
+    # -- ADR-0018 step 4: trunk-topology projections (populated only when a
+    #    github_repo is threaded; all None/empty on the legacy creds-light path) --
+    github_repo: str | None = None
+    base_branch: str | None = None
+    trunk_branch: str | None = None
+    trunk_verdict: str | None = None          # created | exists | previewed | failed
+    leaf_pr_verdict: str | None = None        # opened | previewed | needs_human | failed
+    leaf_pr_map: tuple[tuple[str, int | None], ...] = ()  # (leaf_id, pr_number)
+    leaf_pr_map_path: str | None = None       # persisted {leaf_id: pr_number} artifact
+    feature_pr_verdict: str | None = None     # opened | previewed | needs_human | failed
+    feature_pr_number: int | None = None
+    feature_pr_url: str | None = None
 
 
 def _completed_map(log_dir: Path, run_id: str) -> dict[str, dict]:
@@ -86,6 +108,88 @@ def _plan_record(completed: dict[str, dict]) -> dict[str, Any] | None:
     return None
 
 
+# ---- ADR-0018 step 4: trunk-topology helpers -------------------------------
+#
+# These run only when the driver is given a `github_repo` ("Owner/Repo"). On the
+# legacy creds-light path (no github_repo) they are never reached, so the
+# executor-only pipeline behaves exactly as before. Each honours the driver's
+# `live` flag by threading it as the workflow's `dry_run = not live`, keeping a
+# dry run genuinely side-effect-free (no ref create, no PR open).
+
+
+def _gh_toolbelt(twig: Any | None, gh: Any | None) -> Toolbelt:
+    """A toolbelt carrying a real (or injected) gh client for the topology steps.
+
+    The phase-3 executor toolbelt deliberately omits `gh` (it only coordinates a
+    remote board). The trunk workflows need `toolbelt.gh`, so we build a small
+    real toolbelt and let an injected `gh`/`twig` override it for tests.
+    """
+    real = Toolbelt.real()
+    return Toolbelt(
+        git=real.git,
+        files=real.files,
+        gh=gh if gh is not None else real.gh,
+        twig=twig if twig is not None else real.twig,
+        kanban=real.kanban,
+    )
+
+
+async def _resolve_base_branch(
+    github_repo: str, gh: Any | None, fallback: str = "main",
+) -> str:
+    """Q2: resolve the repo's real default branch instead of hardcoding `main`.
+
+    Uses the narrow `gh.api()` read escape hatch (no new GhClient mutation
+    surface — the branch-ref pair stays the only added methods). Falls back to
+    `fallback` if the client is absent or the probe fails for any reason: the
+    base is re-validated fail-closed by trunk_bootstrap's `branch_sha` anyway,
+    so a wrong guess surfaces there rather than corrupting forward.
+    """
+    client = gh if gh is not None else Toolbelt.real().gh
+    if client is None:
+        return fallback
+    try:
+        payload = await client.api(f"repos/{github_repo}")
+    except Exception:
+        return fallback
+    default = payload.get("default_branch") if isinstance(payload, dict) else None
+    return str(default) if default else fallback
+
+
+def _persist_leaf_pr_map(
+    log_dir: Path, item_id: int, leaves: tuple[LeafPr, ...],
+) -> Path:
+    """Persist the authoritative {leaf_id: pr_number} map as a stage artifact.
+
+    The briefing + ADR-0018 step 2 call this out explicitly: a default
+    `gh pr list` is open-only and cannot re-derive merged leaf PR numbers, so
+    feature_pr's input must come from this persisted map, not a re-query. We
+    follow the per-stage artifact pattern the rest of the driver already uses.
+    """
+    path = log_dir / f"leaf-pr-map-{item_id}.json"
+    payload = {
+        "item_id": item_id,
+        "leaves": [
+            {"leaf_id": lp.leaf_id, "pr_number": lp.pr_number} for lp in leaves
+        ],
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
+
+
+def load_leaf_pr_map(path: Path) -> tuple[LeafPr, ...]:
+    """Re-hydrate the persisted leaf-PR map into feature_pr's input element type.
+
+    The inverse of :func:`_persist_leaf_pr_map`; used by :func:`integrate_pipeline`
+    to feed the trunk-readiness gate after the human has merged the leaf PRs.
+    """
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    return tuple(
+        LeafPr(leaf_id=str(e["leaf_id"]), pr_number=e.get("pr_number"))
+        for e in (payload.get("leaves") or [])
+    )
+
+
 async def run_pipeline(
     item_id: int,
     *,
@@ -95,9 +199,12 @@ async def run_pipeline(
     commit: bool = False,
     live: bool = False,
     skills: tuple[str, ...] = (),
+    github_repo: str | None = None,
+    base_branch: str | None = None,
     twig: Any | None = None,
     provider: Any | None = None,
     kanban: Any | None = None,
+    gh: Any | None = None,
     gate_handler: Any | None = None,
     process_config: Any | None = None,
     poll_interval_s: float = 5.0,
@@ -105,6 +212,8 @@ async def run_pipeline(
     planning_factory: PlanningFactory = planning_mod.build_engine,
     commit_factory: CommitFactory = commit_plan_mod.build_engine,
     executor_factory: ExecutorFactory = executor_mod.build_engine,
+    trunk_bootstrap_factory: TrunkBootstrapFactory = trunk_bootstrap_mod.build_engine,
+    leaf_pr_factory: LeafPrFactory = leaf_pr_mod.build_engine,
 ) -> PipelineResult:
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -179,6 +288,50 @@ async def run_pipeline(
             poll_interval_s=poll_interval_s, max_polls=max_polls, skills=skills,
         )
 
+    # -- Phase 2.5: trunk bootstrap (ADR-0018 step 4 — BEFORE dispatch) -
+    #
+    # The integration trunk feature/<root> must exist *before* the leaves are
+    # dispatched, because requiem opens each leaf PR with base=feature/<root>
+    # right after delivery. This runs only when a github_repo is threaded; the
+    # creds-light, executor-only path (no github_repo) skips topology entirely
+    # and behaves exactly as before. `live=False` ⇒ dry_run ⇒ read-only probe,
+    # no ref create.
+    resolved_base: str | None = None
+    trunk_verdict: str | None = None
+    trunk_branch: str | None = None
+    if github_repo is not None:
+        resolved_base = base_branch or await _resolve_base_branch(github_repo, gh)
+        boot_inputs = trunk_bootstrap_mod.TrunkBootstrapInputs(
+            root_item_id=item_id, repo=github_repo,
+            base_branch=resolved_base, dry_run=not live,
+        )
+        boot_run = f"trunk-{item_id}"
+        boot_engine = trunk_bootstrap_factory(
+            log_dir, inputs=boot_inputs, toolbelt=_gh_toolbelt(twig, gh),
+            **({"gate_handler": gate_handler} if gate_handler is not None else {}),
+        )
+        boot_outcome = await boot_engine.run(boot_run)
+        boot_final = (
+            boot_outcome.final_node if isinstance(boot_outcome, Completed) else None
+        )
+        boot_result = trunk_bootstrap_mod.trunk_bootstrap_result(
+            _completed_map(log_dir, boot_run), boot_final or "",
+        )
+        trunk_verdict = boot_result.verdict
+        trunk_branch = boot_result.trunk_branch
+        if boot_final != "end_success":
+            # Fail closed: never fan out onto a trunk we could not establish.
+            return PipelineResult(
+                item_id=item_id, stage="trunk_bootstrap", status="paused",
+                detail=(f"trunk bootstrap did not succeed "
+                        f"(verdict={trunk_verdict!r}, node={boot_final!r}); "
+                        "resolve before dispatching leaves."),
+                decomposable=decomposable, plan_artifact=plan_artifact,
+                committed_path=str(committed_path) if committed_path else None,
+                github_repo=github_repo, base_branch=resolved_base,
+                trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
+            )
+
     # -- Phase 3: dispatch ---------------------------------------------
     real = Toolbelt.real()
     exec_toolbelt = Toolbelt(
@@ -193,21 +346,198 @@ async def run_pipeline(
     exec_outcome = await exec_engine.run(exec_run)
     exec_completed = _completed_map(log_dir, exec_run)
     leaf_ids = tuple(
-        l["leaf_id"]
-        for l in (exec_completed.get("resolve_leaves", {}).get("value", {})
-                  .get("leaves") or [])
+        leaf["leaf_id"]
+        for leaf in (exec_completed.get("resolve_leaves", {}).get("value", {})
+                     .get("leaves") or [])
     )
     final_node = exec_outcome.final_node if isinstance(exec_outcome, Completed) else None
     delivered = final_node == "end"
+
+    if not delivered:
+        return PipelineResult(
+            item_id=item_id, stage="executor", status="paused",
+            detail=f"executor stopped at {final_node!r}",
+            decomposable=decomposable, leaf_ids=leaf_ids,
+            plan_artifact=plan_artifact,
+            committed_path=str(committed_path) if committed_path else None,
+            executor_final_node=final_node,
+            github_repo=github_repo, base_branch=resolved_base,
+            trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
+        )
+
+    # -- Phase 4: leaf PRs (ADR-0018 step 4 — AFTER delivery) ----------
+    #
+    # The worker has pushed each impl/<root>-<item> branch; now requiem opens
+    # (or reuses) the leaf PR base=feature/<root>. This sidesteps Hermes' missing
+    # `--base`: requiem owns the PR. The {leaf_id: pr_number} map is PERSISTED —
+    # a default `gh pr list` is open-only and can't re-derive merged numbers, so
+    # feature_pr (a separate invocation, after the human merges) reads the
+    # artifact, never a re-query. Skipped on the creds-light path.
+    leaf_pr_verdict: str | None = None
+    leaf_pr_leaves: tuple[LeafPr, ...] = ()
+    leaf_pr_map_path: Path | None = None
+    if github_repo is not None:
+        lp_inputs = leaf_pr_mod.LeafPrInputs(
+            root_item_id=item_id, repo=github_repo,
+            leaf_ids=leaf_ids, dry_run=not live,
+        )
+        lp_run = f"leafpr-{item_id}"
+        lp_engine = leaf_pr_factory(
+            log_dir, inputs=lp_inputs, toolbelt=_gh_toolbelt(twig, gh),
+            **({"gate_handler": gate_handler} if gate_handler is not None else {}),
+        )
+        lp_outcome = await lp_engine.run(lp_run)
+        lp_final = lp_outcome.final_node if isinstance(lp_outcome, Completed) else None
+        lp_result = leaf_pr_mod.leaf_pr_result(
+            _completed_map(log_dir, lp_run), lp_final or "",
+        )
+        leaf_pr_verdict = lp_result.verdict
+        leaf_pr_leaves = lp_result.leaves
+        # Persist the authoritative map for the (later) feature_pr invocation.
+        leaf_pr_map_path = _persist_leaf_pr_map(log_dir, item_id, leaf_pr_leaves)
+        if lp_final != "end_success":
+            return PipelineResult(
+                item_id=item_id, stage="leaf_pr", status="paused",
+                detail=(f"leaf PRs did not all open "
+                        f"(verdict={leaf_pr_verdict!r}, node={lp_final!r}); "
+                        "resolve the offending leaf and re-run."),
+                decomposable=decomposable, leaf_ids=leaf_ids,
+                plan_artifact=plan_artifact,
+                committed_path=str(committed_path) if committed_path else None,
+                executor_final_node=final_node,
+                github_repo=github_repo, base_branch=resolved_base,
+                trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
+                leaf_pr_verdict=leaf_pr_verdict,
+                leaf_pr_map=tuple((lp.leaf_id, lp.pr_number) for lp in leaf_pr_leaves),
+                leaf_pr_map_path=str(leaf_pr_map_path),
+            )
+
+    detail = "all implementable leaves dispatched"
+    if github_repo is not None:
+        detail = (
+            f"leaves dispatched + leaf PRs {leaf_pr_verdict} onto "
+            f"{trunk_branch}; merge them, then run integrate_pipeline for the "
+            "trunk→base PR."
+        )
     return PipelineResult(
         item_id=item_id, stage="executor",
-        status="delivered" if delivered else "paused",
-        detail=("all implementable leaves dispatched"
-                if delivered else f"executor stopped at {final_node!r}"),
+        status="delivered",
+        detail=detail,
         decomposable=decomposable, leaf_ids=leaf_ids,
         plan_artifact=plan_artifact,
         committed_path=str(committed_path) if committed_path else None,
         executor_final_node=final_node,
+        github_repo=github_repo, base_branch=resolved_base,
+        trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
+        leaf_pr_verdict=leaf_pr_verdict,
+        leaf_pr_map=tuple((lp.leaf_id, lp.pr_number) for lp in leaf_pr_leaves),
+        leaf_pr_map_path=str(leaf_pr_map_path) if leaf_pr_map_path else None,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class IntegrationResult:
+    """Outcome of the trunk→base integration leg (ADR-0018 step 4, phase 5).
+
+    Run *after* a human / pr_lifecycle has merged the leaf PRs into the trunk.
+    ``status`` is ``opened`` (trunk→base PR opened/reused), ``previewed`` (dry
+    run), ``not_ready`` (the readiness gate found a leaf not yet merged — drift
+    or laggard), or ``failed``.
+    """
+
+    item_id: int
+    status: str
+    detail: str
+    github_repo: str
+    base_branch: str
+    trunk_branch: str
+    feature_pr_verdict: str | None = None
+    feature_pr_number: int | None = None
+    feature_pr_url: str | None = None
+    leaves_total: int = 0
+    leaves_ready: int = 0
+
+
+async def integrate_pipeline(
+    item_id: int,
+    *,
+    log_dir: Path,
+    github_repo: str,
+    leaf_pr_map_path: Path | None = None,
+    leaves: tuple[LeafPr, ...] | None = None,
+    base_branch: str | None = None,
+    live: bool = False,
+    twig: Any | None = None,
+    gh: Any | None = None,
+    gate_handler: Any | None = None,
+    feature_pr_factory: FeaturePrFactory = feature_pr_mod.build_engine,
+) -> IntegrationResult:
+    """Phase 5 (ADR-0018 step 4): open the trunk→base PR once leaves are merged.
+
+    This is a SEPARATE invocation from :func:`run_pipeline` because feature_pr's
+    readiness gate requires every leaf PR to be ``merged==true`` — a state only
+    a human / pr_lifecycle can produce, between the two calls (requiem has no
+    ``pr_merge``; INV: no self-merge). The expected-leaf set is read from the
+    PERSISTED leaf-PR map (``leaf_pr_map_path``), never re-queried, because a
+    default ``gh pr list`` is open-only and can't see merged numbers.
+
+    Drift policy (ratified ADR-0018, confirmed live 2026-06-09): feature_pr only
+    *opens* the trunk→base PR; an unmergeable (drifted) PR is surfaced to the
+    human by pr_lifecycle. No auto-rebase here.
+    """
+    log_dir.mkdir(parents=True, exist_ok=True)
+    if leaves is None:
+        if leaf_pr_map_path is None:
+            raise ValueError(
+                "integrate_pipeline needs either `leaves` or `leaf_pr_map_path` "
+                "(the persisted {leaf_id: pr_number} map from run_pipeline)"
+            )
+        leaves = load_leaf_pr_map(Path(leaf_pr_map_path))
+
+    resolved_base = base_branch or await _resolve_base_branch(github_repo, gh)
+    fp_inputs = feature_pr_mod.FeaturePrInputs(
+        root_item_id=item_id, repo=github_repo, leaves=leaves,
+        base_branch=resolved_base, dry_run=not live,
+    )
+    fp_run = f"featurepr-{item_id}"
+    fp_engine = feature_pr_factory(
+        log_dir, inputs=fp_inputs, toolbelt=_gh_toolbelt(twig, gh),
+        **({"gate_handler": gate_handler} if gate_handler is not None else {}),
+    )
+    fp_outcome = await fp_engine.run(fp_run)
+    fp_final = fp_outcome.final_node if isinstance(fp_outcome, Completed) else None
+    fp_result = feature_pr_mod.feature_pr_result(
+        _completed_map(log_dir, fp_run), fp_final or "",
+    )
+
+    if fp_final == "end_success":
+        status = "previewed" if fp_result.dry_run else "opened"
+        detail = (
+            f"would open {fp_result.trunk_branch} → {resolved_base}"
+            if fp_result.dry_run
+            else f"integration PR #{fp_result.pr_number} opened "
+                 f"({fp_result.trunk_branch} → {resolved_base})"
+        )
+    elif fp_final == "end_human":
+        status = "not_ready"
+        detail = (
+            f"trunk not ready: {fp_result.leaves_ready}/{fp_result.leaves_total} "
+            "expected leaf PRs merged into the trunk. Merge the laggards (or "
+            "resolve a drifted/unmergeable leaf PR) and re-run."
+        )
+    else:
+        status = "failed"
+        detail = f"feature_pr failed (node={fp_final!r})"
+
+    return IntegrationResult(
+        item_id=item_id, status=status, detail=detail,
+        github_repo=github_repo, base_branch=resolved_base,
+        trunk_branch=fp_result.trunk_branch,
+        feature_pr_verdict=fp_result.verdict,
+        feature_pr_number=fp_result.pr_number,
+        feature_pr_url=fp_result.pr_url,
+        leaves_total=fp_result.leaves_total,
+        leaves_ready=fp_result.leaves_ready,
     )
 
 
@@ -238,8 +568,42 @@ def _build_arg_parser():
     p.add_argument("--repo", type=Path, default=Path("."),
                    help="Repo root to discover .requiem-config/process.yaml from "
                         "(drives the type-agnostic tier policy; default: cwd).")
+    p.add_argument("--github-repo", default=None,
+                   help="GitHub repo identity 'Owner/Repo' for trunk topology "
+                        "(ADR-0018 step 4). When set, the driver bootstraps "
+                        "feature/<root> before dispatch and opens leaf PRs after "
+                        "delivery. Omit to run the legacy executor-only pipeline.")
+    p.add_argument("--base-branch", default=None,
+                   help="Override the trunk's base branch. Default: resolve the "
+                        "GitHub repo's real default branch (Q2).")
     p.add_argument("--poll-interval", type=float, default=5.0)
     p.add_argument("--max-polls", type=int, default=120)
+    return p
+
+
+def _build_integrate_arg_parser():
+    import argparse
+
+    p = argparse.ArgumentParser(
+        prog="requiem-integrate",
+        description="ADR-0018 step 4 phase 5: open the trunk→base integration PR "
+                    "AFTER the leaf PRs have been merged into feature/<root>. "
+                    "Reads the persisted {leaf_id: pr_number} map from run_pipeline.",
+    )
+    p.add_argument("--item", type=int, required=True,
+                   help="Root ADO work-item id (the run root).")
+    p.add_argument("--github-repo", required=True,
+                   help="GitHub repo identity 'Owner/Repo'.")
+    p.add_argument("--leaf-pr-map", type=Path, default=None,
+                   help="Path to the persisted leaf-PR map "
+                        "(default: <log-dir>/leaf-pr-map-<item>.json).")
+    p.add_argument("--base-branch", default=None,
+                   help="Override the base branch (default: resolve the repo's "
+                        "real default branch).")
+    p.add_argument("--live", action="store_true",
+                   help="Actually open the trunk→base PR (default: dry-run preview).")
+    p.add_argument("--log-dir", type=Path, default=Path(".runs"),
+                   help="Durable run-log directory (default: .runs).")
     return p
 
 
@@ -268,6 +632,8 @@ def main(argv: list[str] | None = None) -> int:
         assignee=args.assignee,
         commit=args.commit,
         live=args.live,
+        github_repo=args.github_repo,
+        base_branch=args.base_branch,
         twig=TwigClient(),
         provider=default_provider(),
         kanban=KanbanClient(),
@@ -283,7 +649,49 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  plan:   {result.plan_artifact}")
     if result.committed_path:
         print(f"  seeded: {result.committed_path}")
+    if result.trunk_branch:
+        print(f"  trunk:  {result.trunk_branch} ({result.trunk_verdict}) "
+              f"off {result.base_branch}")
+    if result.leaf_pr_map:
+        rendered = ", ".join(
+            f"{lid}#{n}" if n is not None else f"{lid}#?" for lid, n in result.leaf_pr_map
+        )
+        print(f"  leafPR: {result.leaf_pr_verdict} — {rendered}")
+    if result.leaf_pr_map_path:
+        print(f"  map:    {result.leaf_pr_map_path}")
     return 0 if result.status in ("delivered", "planned") else 1
+
+
+def integrate_main(argv: list[str] | None = None) -> int:
+    """Entrypoint for the trunk→base integration leg (phase 5)."""
+    import asyncio
+
+    from requiem.clients.twig import TwigClient
+
+    args = _build_integrate_arg_parser().parse_args(argv)
+    map_path = args.leaf_pr_map or (args.log_dir / f"leaf-pr-map-{args.item}.json")
+    if not Path(map_path).exists():
+        print(f"leaf-PR map not found: {map_path}\n"
+              "Run the dispatch pipeline first (it persists the map), or pass "
+              "--leaf-pr-map explicitly.")
+        return 2
+
+    result = asyncio.run(integrate_pipeline(
+        args.item,
+        log_dir=args.log_dir,
+        github_repo=args.github_repo,
+        leaf_pr_map_path=Path(map_path),
+        base_branch=args.base_branch,
+        live=args.live,
+        twig=TwigClient(),
+    ))
+
+    print(f"[integrate] {result.status}: {result.detail}")
+    if result.feature_pr_url:
+        print(f"  PR:     {result.feature_pr_url}")
+    print(f"  trunk:  {result.trunk_branch} → {result.base_branch}")
+    print(f"  ready:  {result.leaves_ready}/{result.leaves_total} leaves merged")
+    return 0 if result.status in ("opened", "previewed") else 1
 
 
 if __name__ == "__main__":  # pragma: no cover
