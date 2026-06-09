@@ -13,7 +13,8 @@ Pipeline
     start
       → fetch_plan                  (script · twig.show + read plan)
       → assert_clean_workspace      (script · fs.git_is_clean)
-      → create_branch               (script · feature/<item_id>, idempotent)
+      → create_branch               (script · impl/<root>-<item> when a root is
+                                       set, else legacy feature/<item_id>; idempotent)
       → invoke_coder                (agent  · CoderOutput)
           ├─ success           → apply_changes
           ├─ bad_output        → end_handoff (NeedsHuman)
@@ -81,6 +82,7 @@ from pydantic import BaseModel, Field
 
 from requiem.agent import AgentSpec, FakeProvider
 from requiem import seam as _seam
+from requiem import branch_model
 from requiem.clients.fs import FilesystemClient, FsClientError, FsGitError
 from requiem.clients.gh import GhClient, GhClientError
 from requiem.clients.twig import (
@@ -334,6 +336,12 @@ class ImplementationInputs:
     coder_agent_id: str = "coder"
     test_command: str | None = None
     dry_run: bool = False
+    root: int | str | None = None
+    """The merge-group root (ADR-0006). When set, the implementation branch is
+    ``impl/<root>-<item_id>`` (the ratified Option-D topology consumed by
+    ``feature_pr``/``leaf_pr``). When ``None`` (a standalone/legacy run) the
+    branch falls back to ``feature/<item_id>`` — the pre-ADR-0006 Option-B shape.
+    """
 
 
 # ---- test runner (deliberately not a Toolbelt client for v0) ----------
@@ -392,7 +400,15 @@ def build_verb_registry(
 ) -> VerbRegistry:
     verbs = VerbRegistry()
 
-    branch_name = f"feature/{inputs.item_id}"
+    # ADR-0006 (B3): when a merge-group root is supplied, the implementation
+    # branch follows the ratified Option-D topology `impl/<root>-<item>` (the
+    # shape `feature_pr`/`leaf_pr` expect). Without a root this is a standalone
+    # run and we keep the legacy `feature/<item_id>` (Option-B) shape. The
+    # branch_model constructors are the single source of truth for names.
+    if inputs.root is not None:
+        branch_name = branch_model.impl_branch(inputs.root, inputs.item_id)
+    else:
+        branch_name = f"feature/{inputs.item_id}"
 
     # ---- helpers (closure-shared so verbs read consistent state) -----
 

@@ -182,6 +182,7 @@ def _make_inputs(
     item_id: int = 12345,
     test_command: str | None = "pytest -q",
     dry_run: bool = False,
+    root: int | str | None = None,
 ) -> ImplementationInputs:
     return ImplementationInputs(
         item_id=item_id,
@@ -190,6 +191,7 @@ def _make_inputs(
         base_branch="main",
         test_command=test_command,
         dry_run=dry_run,
+        root=root,
     )
 
 
@@ -380,6 +382,44 @@ async def test_happy_path_pr_created(repo_path: Path, tmp_path: Path) -> None:
     assert impl_result.pr_number == 42
     assert impl_result.tests_passed is True
     assert impl_result.branch_name == "feature/12345"
+
+
+# ---- B3: merge-group topology branch (ADR-0006 / ADR-0020) ----
+
+
+async def test_root_yields_impl_topology_branch(repo_path: Path, tmp_path: Path) -> None:
+    """With a merge-group root, the impl branch is ``impl/<root>-<item>`` (the
+    ratified ADR-0006 Option-D shape `feature_pr`/`leaf_pr` expect), not the
+    legacy ``feature/<item_id>``."""
+    _make_pushable(repo_path)
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh(pr_number=77)
+    provider = FakeProvider(scripts={
+        "coder": [_coder_creates("MARKER.md")],
+    })
+    inputs = _make_inputs(repo_path, item_id=12345, root=9300)
+    engine = _make_engine(
+        repo_path, tmp_path / "logs",
+        provider=provider, twig=twig, gh=gh,
+        test_runner=_passing_runner, inputs=inputs,
+    )
+
+    result = await engine.run("topo")
+    assert isinstance(result, Completed), result
+    assert result.final_node == "end_handoff"
+
+    # The leaf PR is opened from impl/9300-12345 (Option-D), not feature/12345.
+    assert len(gh.created_calls) == 1
+    assert gh.created_calls[0]["head"] == "impl/9300-12345"
+    assert gh.created_calls[0]["base"] == "main"
+
+    completed = {
+        e["node_id"]: e["payload"]["outcome"]
+        for e in replay(engine.log_path("topo"))
+        if e["kind"] == "verb_completed"
+    }
+    impl_result = ImplementationResult.from_completed(completed)
+    assert impl_result.branch_name == "impl/9300-12345"
 
 
 # ---- no changes ----
