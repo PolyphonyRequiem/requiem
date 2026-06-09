@@ -1,6 +1,7 @@
 # ADR 0020 — In-process child-seam propagation (ADR-0013 blocker B1)
 
-**Status:** Proposed (2026-06-09) — design for review. NOT yet implemented.
+**Status:** Accepted + **implemented** (2026-06-09). Shipped the non-breaking
+variant — see "Implementation notes" below.
 **Date:** 2026-06-09
 **Relates to:** ADR-0013 (fan-out executor — names B1 as the critical-path
 blocker), ADR-0014 (external kanban executor — *sidesteps* B1 but does not close
@@ -140,6 +141,43 @@ mirrors the explicit guarantee planning already documents at planning.py:156-163
 
 Recommended order stays as the audit states: **B1 (this ADR) → B3 → B2 +
 executor**.
+
+## Implementation notes (what actually shipped, 2026-06-09)
+
+Shipped the **non-breaking variant** of §1–§2:
+
+- **`requiem/seam.py`** — the shared seam module: `active_provider` /
+  `active_toolbelt` / `active_gate_handler` contextvars, plus `set_seams(...)`
+  (task-lifetime install, non-None-overwrites-only) and an `install(...)`
+  context manager (scoped, restores prior tokens). Light imports (TYPE_CHECKING
+  only) so the kernel can import it without a cycle.
+- **Kernel** — `_invoke_subworkflow` calls `_seam.set_seams(provider=self.provider,
+  toolbelt=self.toolbelt, gate_handler=self.gate_handler)` immediately before
+  constructing the child engine. In-process only; recorded inputs stay
+  authoritative on resume (INV-RESTART) — no log-schema change.
+- **`implementation.build_engine`** — resolves each seam as **explicit arg →
+  active seam → demo fallback**. This is the key softening vs. the original
+  proposal: rather than *remove* the silent demo (a hard break for every demo
+  caller), the demo stays as the final fallback, so a bare call with no seam
+  installed is byte-for-byte unchanged. The footgun closes because a *dispatched*
+  child now finds the parent's real seam *before* reaching the demo fallback.
+- **`demo=True` opt-in** — `build_engine(..., demo=True)` forces the demo seams
+  and never consults the contextvar, for harnesses that must stay hermetic even
+  under a real-seam parent. The `full_sdlc` implementation shim (a deliberate
+  self-contained demo) passes `demo=True` so it keeps faking gh/twig instead of
+  inheriting the orchestrator's `Toolbelt.real()`. This replaces the original
+  "make the demo opt-in everywhere" break with a targeted, opt-in flag.
+- **Tests** — `tests/test_seam_propagation.py` (8): the seam module
+  (get/set/install-restore), `build_engine` resolution (no-seam→demo,
+  seam-inherited, explicit-wins, `demo=True`-forces-demo), and an end-to-end
+  kernel test (a parent carrying a sentinel provider dispatches a child that
+  reads the seam). Full planning/subworkflow/implementation/full_sdlc/kernel/
+  resume suites stay green.
+
+**Deferred:** consolidating `planning.py`'s own (older, separate) seam contextvars
+into `requiem.seam` — planning works and is tested; folding it in is a follow-up
+to avoid widening this change. B2 (handoff classifier) and B3 (branch model)
+remain as noted.
 
 ## Consequences
 

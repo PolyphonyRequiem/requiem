@@ -80,6 +80,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from requiem.agent import AgentSpec, FakeProvider
+from requiem import seam as _seam
 from requiem.clients.fs import FilesystemClient, FsClientError, FsGitError
 from requiem.clients.gh import GhClient, GhClientError
 from requiem.clients.twig import (
@@ -1386,20 +1387,38 @@ def build_engine(
     toolbelt: Toolbelt | None = None,
     test_runner=None,
     gate_handler=None,
+    demo: bool = False,
 ) -> Engine:
     """Construct a runnable Engine for the implementation workflow.
 
-    Parameters mirror the brief. When called by the CLI with no extras,
-    we synthesize a self-contained demo: a throwaway git repo under
-    ``log_dir/demo_repo``, in-memory twig/gh clients, the happy-path
-    FakeProvider, and ``dry_run=True`` so no PR is opened. Programmatic
-    callers (tests, the eventual real production wiring) supply their
-    own ``inputs``, ``toolbelt``, and ``provider``.
+    When called with no extras we synthesize a self-contained demo: a throwaway
+    git repo under ``log_dir/demo_repo``, in-memory twig/gh clients, the
+    happy-path FakeProvider, and ``dry_run=True`` so no PR is opened. Programmatic
+    callers (tests, the eventual real production wiring) supply their own
+    ``inputs``, ``toolbelt``, and ``provider``.
+
+    Seam resolution (ADR-0020 / B1): each runtime seam resolves as **explicit arg
+    → active seam (installed by the kernel from a dispatching parent) → demo
+    fallback**. So a dispatched child inherits the parent's real provider/toolbelt
+    instead of silently faking them. Pass ``demo=True`` to FORCE the canned demo
+    seams and ignore any installed seam — used by self-contained demo harnesses
+    (e.g. the ``full_sdlc`` shim) that must stay hermetic even when dispatched
+    under a parent that carries real seams.
     """
     if inputs is None:
         inputs = _make_demo_inputs(log_dir)
+    # ADR 0020 (B1): resolve each runtime seam as explicit arg → active seam
+    # (installed by the kernel from the dispatching parent) → demo fallback. A
+    # dispatched child thus inherits the parent's real provider/toolbelt instead
+    # of silently faking them; an explicit arg still wins; a bare demo call (no
+    # seam installed) still gets its canned fake. ``demo=True`` forces the demo
+    # path and never consults the seam (hermetic-demo opt-in).
+    if provider is None and not demo:
+        provider = _seam.get_provider()
     if provider is None:
         provider = happy_path_provider()
+    if toolbelt is None and not demo:
+        toolbelt = _seam.get_toolbelt()
     if toolbelt is None:
         toolbelt = Toolbelt(
             git=RealGitClient(),
@@ -1408,6 +1427,8 @@ def build_engine(
             fs=FilesystemClient(inputs.repo_path),
             twig=_DemoTwigClient(),  # type: ignore[arg-type]
         )
+    if gate_handler is None and not demo:
+        gate_handler = _seam.get_gate_handler()
     runner = test_runner or _default_test_runner
     return Engine(
         workflow=build_workflow(),

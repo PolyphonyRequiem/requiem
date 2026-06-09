@@ -57,6 +57,7 @@ from requiem.outcomes import (
 )
 from requiem.persistence import EventStore, replay
 from requiem.toolbelt import Toolbelt
+from requiem import seam as _seam
 
 
 # ---- run results ------------------------------------------------------
@@ -553,6 +554,18 @@ class Engine:
                 # Keep the last in case of duplicate (defensive — first-write
                 # wins is the contract, but resume re-emit guards prevent
                 # duplicates anyway).
+
+        # ADR 0020 (B1): install THIS (parent) engine's live runtime seams so an
+        # in-process child's `build_engine` can inherit them instead of silently
+        # synthesizing demo fakes over real git. The seam is in-process only;
+        # recorded inputs remain authoritative across a restart (INV-RESTART).
+        # Only non-None seams overwrite, and a child that is handed explicit
+        # provider/toolbelt/gate_handler still wins over the seam.
+        _seam.set_seams(
+            provider=self.provider,
+            toolbelt=self.toolbelt,
+            gate_handler=self.gate_handler,
+        )
 
         try:
             sig = inspect.signature(factory)

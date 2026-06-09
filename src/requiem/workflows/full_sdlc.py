@@ -240,7 +240,7 @@ def _register_implementation_shim() -> None:
         )
         _ensure_demo_repo(log_dir / "demo_repo")
         return _install_observer(
-            implementation.build_engine(log_dir, inputs=impl_inputs)
+            implementation.build_engine(log_dir, inputs=impl_inputs, demo=True)
         )
 
     mod.build_engine = build_engine  # type: ignore[attr-defined]
