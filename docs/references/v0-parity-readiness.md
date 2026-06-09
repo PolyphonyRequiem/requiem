@@ -12,24 +12,29 @@ v0 cutover readiness.
 ## 1. Executive Verdict
 
 **Verdict: NO-GO for v0 as defined by §9 of the parity inventory (the ten
-non-negotiables).** Requiem is structurally healthy and the load-bearing
-invariants are demonstrably enforced — the architecture has paid off — but
-**five of the ten non-negotiables have material gaps** that no amount of
-polish on the existing surface can close. Specifically: merge-group
-implementation topology, per-item worktree isolation, the tree-walking root
-orchestrator with batch dispatch, ADO PR lifecycle, and the web dashboard are
-all absent. The seventh non-negotiable (recursive planning *with child
-seeding and PR lifecycle*) is partial — the recursion is real and tested, but
-the workflow neither seeds children into ADO via `twig` nor opens a plan PR.
+non-negotiables)** — though the gap has narrowed materially since the original
+audit. Requiem is structurally healthy and the load-bearing invariants are
+demonstrably enforced — the architecture has paid off — but **four of the ten
+non-negotiables still have material gaps** that no amount of polish on the
+existing surface can close. Specifically: per-item worktree isolation, the
+tree-walking root orchestrator with in-process batch dispatch, ADO PR lifecycle,
+and the web dashboard remain absent or blocked.
 
-If, however, the operator chooses to **re-scope v0** to the demoable
-single-root linear pipeline (dispatch → planning → implementation → GitHub PR
-lifecycle → close-out) on GitHub-only, with a terminal-only UX, then the
-verdict flips to **GO with caveats** — that slice does work end-to-end, is
-covered by 526 collected tests (376 pass / 150 skipped / 0 fail at HEAD
-`495609e` — verified by `pytest -q` in the audit worktree), and survived
-Tchaikovsky's real-ADO bug-bash (one blocker fixed, three rough edges filed
-as issues #29/#30/#31).
+**Update (2026-06-09):** the seventh non-negotiable — merge-group implementation
+topology — has since been **built end-to-end**: `branch_model` + `trunk_bootstrap`
++ `leaf_pr` + `feature_pr` + the `end_to_end` driver wiring (PR #61) + the
+requirement-disposition gate (PR #62), all live-validated on a scratch GitHub
+repo. What remains for #7 is the live **ADO** worker loop, which is
+credential-gated, not a code gap. The sixth non-negotiable (recursive planning
+*with child seeding and PR lifecycle*) is likewise closed — child seeding into
+ADO (`commit_plan`, PR #59) and the plan PR (`plan_pr`, PR #60) both landed. The
+Tchaikovsky rough edges (#29/#30/#31) are all closed.
+
+If the operator chooses to **re-scope v0** to the demoable single-root linear
+pipeline (dispatch → planning → implementation → GitHub PR lifecycle →
+close-out) on GitHub-only, with a terminal-only UX, then the verdict flips to
+**GO with caveats** — that slice works end-to-end and is covered by the test
+suite (run targeted; a bare full `pytest` hangs).
 
 The strong news: every Phase-A architectural bet held up under audit. The
 event log is authoritative; sub-workflow log isolation is enforced by
@@ -168,7 +173,7 @@ whether those decisions are encoded *somewhere* in Requiem.
 | 9 | Durable seed manifest for partial-seed recovery | ✅ at-parity | `root_dispatch.write_manifest` is idempotent read-or-create; INV-RESTART covers re-entry |
 | 10 | Platform-specific PR lifecycles (GitHub and ADO) | 🟡 partial | GitHub ✅ (`pr_lifecycle.py`). ADO ❌ (no `ado_pr` module) |
 
-**Scorecard:** 2 ✅ at-parity, 1 🔵 better, 6 🟡 partial, 1 ❌ missing. **Three of ten** non-negotiables have material work remaining (#8 web dashboard ❌; #7 merge-group, #1 process-config, #3 twig write-side, #5/#10 still partial). (#6 closed by PRs #59 + #60; #1 advanced to partial by ADR-0015 and further by the planning tier-policy wiring — `decomposable_types`/`implementable_types` now drive `branch_decomposable`; #7 advanced ❌→🟡 by `branch_model.py`, the Option-D topology authority, and the full ADR-0018 build sequence — `trunk_bootstrap` + `leaf_pr` + `feature_pr` + driver wiring (step 4, live-validated 2026-06-09) — now lands; the lone #7 remainder is the requirement-disposition gate.)
+**Scorecard:** 2 ✅ at-parity, 1 🔵 better, 6 🟡 partial, 1 ❌ missing. **Three of ten** non-negotiables have material work remaining (#8 web dashboard ❌; #1 process-config, #3 twig write-side, #5/#10 still partial). #7 merge-group: the full build sequence now lands (see below) — only the live ADO worker loop (creds-gated, not code) remains. (#6 closed by PRs #59 + #60; #1 advanced to partial by ADR-0015 and further by the planning tier-policy wiring — `decomposable_types`/`implementable_types` now drive `branch_decomposable`; #7 advanced ❌→🟡 by `branch_model.py`, the Option-D topology authority, and the full ADR-0018 build sequence — `trunk_bootstrap` + `leaf_pr` + `feature_pr` + driver wiring (step 4, live-validated 2026-06-09, PR #61) + the requirement-disposition gate (ADR-0006 INV-DRIVER-GATES-FEATURE-MERGE, PR #62) — is now complete.)
 
 ### 2.10 Fan-out executor — the critical-path blocker (ADR-0013)
 
