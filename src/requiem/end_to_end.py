@@ -36,6 +36,7 @@ from requiem.kernel import Completed, Engine
 from requiem.persistence import replay
 from requiem.toolbelt import Toolbelt
 from requiem.workflows import commit_plan as commit_plan_mod
+from requiem.workflows import fanout as fanout_mod
 from requiem.workflows import feature_pr as feature_pr_mod
 from requiem.workflows import kanban_executor as executor_mod
 from requiem.workflows import leaf_pr as leaf_pr_mod
@@ -88,6 +89,10 @@ class PipelineResult:
     feature_pr_verdict: str | None = None     # opened | previewed | needs_human | failed
     feature_pr_number: int | None = None
     feature_pr_url: str | None = None
+    # In-process fan-out backend (ADR-0021) roll-up.
+    fanout_verdict: str | None = None         # all_landed | previewed | needs_human | failed | no_leaves
+    fanout_leaves_total: int = 0
+    fanout_leaves_landed: int = 0
 
 
 def _completed_map(log_dir: Path, run_id: str) -> dict[str, dict]:
@@ -192,6 +197,133 @@ def _persist_leaf_pr_map(
     return path
 
 
+async def _dispatch_in_process(
+    *,
+    item_id: int,
+    log_dir: Path,
+    decomposable: bool,
+    plan_artifact: Any,
+    committed_path: Path | None,
+    plan_record: dict,
+    repo_path: Path | None,
+    github_repo: str | None,
+    base_branch: str | None,
+    twig: Any,
+    gh: Any,
+    provider: Any,
+    gate_handler: Any,
+    live: bool,
+    fanout_parallel: bool,
+    trunk_branch: str | None,
+    trunk_verdict: str | None,
+    fanout_factory: Any,
+) -> "PipelineResult":
+    """Phase 3 (in-process backend): dispatch leaves via requiem.workflows.fanout.
+
+    A sibling to the kanban_executor path. Requires ``repo_path`` (the working
+    tree the children mutate). Resolves the leaf source the same way the executor
+    path does — inline single leaf for an atomic root, else the committed plan
+    artifacts — then runs the in-process fan-out and rolls its outcome up into a
+    ``PipelineResult``. ``live=False`` ⇒ ``dry_run`` ⇒ no PRs, no pushes.
+    """
+    if repo_path is None:
+        return PipelineResult(
+            item_id=item_id, stage="dispatch", status="paused",
+            detail="dispatch_backend='fanout' needs repo_path (the working tree "
+                   "the in-process implementation children mutate).",
+            decomposable=decomposable, plan_artifact=plan_artifact,
+            committed_path=str(committed_path) if committed_path else None,
+        )
+
+    # Resolve the leaf source: an atomic root is one inline leaf; a decomposable
+    # root reads the committed plan tree's real-id leaves.
+    inline_leaves: tuple[fanout_mod.FanoutLeaf, ...] = ()
+    if not decomposable:
+        inline_leaves = (fanout_mod.FanoutLeaf(
+            real_id=item_id,
+            title=str(plan_record.get("item_title") or f"item {item_id}"),
+            body=str(plan_record.get("summary") or ""),
+        ),)
+
+    fo_inputs = fanout_mod.FanoutInputs(
+        root_item_id=item_id,
+        repo=github_repo or str(item_id),
+        repo_path=repo_path,
+        log_dir=log_dir,
+        base_branch=base_branch or "main",
+        dry_run=not live,
+        parallel=fanout_parallel,
+        leaves=inline_leaves,
+        plan_tree_path=Path(plan_artifact) if (decomposable and plan_artifact) else None,
+        committed_path=committed_path if decomposable else None,
+    )
+    fo_run = f"fanout-{item_id}"
+    fo_engine = fanout_factory(
+        log_dir, inputs=fo_inputs,
+        toolbelt=_gh_toolbelt(twig, gh), provider=provider,
+        **({"gate_handler": gate_handler} if gate_handler is not None else {}),
+    )
+    fo_outcome = await fo_engine.run(fo_run)
+    fo_final = fo_outcome.final_node if isinstance(fo_outcome, Completed) else None
+    fo_result = fanout_mod.fanout_result(_completed_map(log_dir, fo_run), fo_final or "")
+    leaf_ids = tuple(str(o.real_id) for o in fo_result.outcomes)
+
+    if fo_final != "end_success":
+        return PipelineResult(
+            item_id=item_id, stage="fanout", status="paused",
+            detail=(f"in-process fan-out did not complete cleanly "
+                    f"(verdict={fo_result.verdict!r}, node={fo_final!r}); "
+                    "inspect the per-leaf child logs."),
+            decomposable=decomposable, leaf_ids=leaf_ids,
+            plan_artifact=plan_artifact,
+            committed_path=str(committed_path) if committed_path else None,
+            executor_final_node=fo_final,
+            github_repo=github_repo, base_branch=base_branch,
+            trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
+            fanout_verdict=fo_result.verdict,
+            fanout_leaves_total=fo_result.leaves_total,
+            fanout_leaves_landed=fo_result.leaves_landed,
+        )
+
+    # A surrendered/failed leaf means the fan-out is not cleanly delivered even
+    # though the orchestrator itself reached end_success — surface to a human.
+    if fo_result.leaves_needs_human > 0 or fo_result.leaves_failed > 0:
+        return PipelineResult(
+            item_id=item_id, stage="fanout", status="paused",
+            detail=(f"in-process fan-out: {fo_result.leaves_landed}/"
+                    f"{fo_result.leaves_total} leaves landed; "
+                    f"{fo_result.leaves_needs_human} need a human, "
+                    f"{fo_result.leaves_failed} failed."),
+            decomposable=decomposable, leaf_ids=leaf_ids,
+            plan_artifact=plan_artifact,
+            committed_path=str(committed_path) if committed_path else None,
+            executor_final_node=fo_final,
+            github_repo=github_repo, base_branch=base_branch,
+            trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
+            fanout_verdict=fo_result.verdict,
+            fanout_leaves_total=fo_result.leaves_total,
+            fanout_leaves_landed=fo_result.leaves_landed,
+        )
+
+    # All leaves landed. The in-process implementation children already opened
+    # their own leaf PRs (impl/<root>-<leaf> → base), so unlike the kanban path
+    # there is no separate leaf-PR leg here. Report delivery.
+    return PipelineResult(
+        item_id=item_id, stage="fanout", status="delivered",
+        detail=(f"in-process fan-out delivered {fo_result.leaves_landed} "
+                f"leaf/leaves" + (" (previewed; dry-run)" if not live else "")),
+        decomposable=decomposable, leaf_ids=leaf_ids,
+        plan_artifact=plan_artifact,
+        committed_path=str(committed_path) if committed_path else None,
+        executor_final_node=fo_final,
+        github_repo=github_repo, base_branch=base_branch,
+        trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
+        fanout_verdict=fo_result.verdict,
+        fanout_leaves_total=fo_result.leaves_total,
+        fanout_leaves_landed=fo_result.leaves_landed,
+    )
+
+
 def load_leaf_pr_map(path: Path) -> tuple[LeafPr, ...]:
     """Re-hydrate the persisted leaf-PR map into feature_pr's input element type.
 
@@ -224,11 +356,15 @@ async def run_pipeline(
     process_config: Any | None = None,
     poll_interval_s: float = 5.0,
     max_polls: int = 120,
+    dispatch_backend: str = "kanban",
+    repo_path: Path | None = None,
+    fanout_parallel: bool = False,
     planning_factory: PlanningFactory = planning_mod.build_engine,
     commit_factory: CommitFactory = commit_plan_mod.build_engine,
     executor_factory: ExecutorFactory = executor_mod.build_engine,
     trunk_bootstrap_factory: TrunkBootstrapFactory = trunk_bootstrap_mod.build_engine,
     leaf_pr_factory: LeafPrFactory = leaf_pr_mod.build_engine,
+    fanout_factory: Any = fanout_mod.build_engine,
 ) -> PipelineResult:
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -348,6 +484,24 @@ async def run_pipeline(
             )
 
     # -- Phase 3: dispatch ---------------------------------------------
+    #
+    # Two sibling backends (ADR-0021/0014):
+    #   * "kanban"  (default) — fan each leaf out to an external Hermes worker via
+    #     kanban_executor. Unchanged legacy path.
+    #   * "fanout"  — dispatch leaves IN-PROCESS via requiem.workflows.fanout
+    #     (single process, no Hermes fleet). Needs repo_path (the working tree)
+    #     and a provider; honours fanout_parallel for per-leaf worktree isolation.
+    if dispatch_backend == "fanout":
+        return await _dispatch_in_process(
+            item_id=item_id, log_dir=log_dir, decomposable=decomposable,
+            plan_artifact=plan_artifact, committed_path=committed_path,
+            plan_record=plan_record, repo_path=repo_path, github_repo=github_repo,
+            base_branch=resolved_base, twig=twig, gh=gh, provider=provider,
+            gate_handler=gate_handler, live=live, fanout_parallel=fanout_parallel,
+            trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
+            fanout_factory=fanout_factory,
+        )
+
     real = Toolbelt.real()
     exec_toolbelt = Toolbelt(
         git=real.git, files=real.files, twig=twig if twig is not None else real.twig,
