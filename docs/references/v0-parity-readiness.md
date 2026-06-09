@@ -196,11 +196,20 @@ architectural issues (ADR-0013):
   forces a hermetic demo). `tests/test_seam_propagation.py` (8). The pattern
   generalises the one planning used for `gate_handler` (planning.py:139-154); its
   own contextvars are a deferred consolidation.
-- **B2 — handoff≠failure:** `implementation`'s `end_handoff` is
-  `disposition="completed"` (implementation.py:1057) and the kernel maps any
-  child `Completed(completed)` → parent `Success` (kernel.py:765-772), so a naive
-  fan-out treats failing-tests / bad-coder / push-failure handoffs as successes.
-  Needs a per-slot classifier on `child_final_node`.
+- **B2 — handoff≠failure:** ✅ **CLOSED (2026-06-09).** Was: `implementation`'s
+  single `end_handoff` terminal used `disposition="completed"` for BOTH the
+  success-handoff (a green PR is open) and the surrender paths (red tests / bad
+  coder output / push failure), and the kernel maps any child
+  `Completed(completed)` → parent `Success` — so a fan-out parent treated a
+  surrendered leaf as done. Fixed by splitting the terminal: the success-handoff
+  stays `end_handoff` (`completed`); the surrender paths route to a new
+  `end_needs_human` (`disposition="needs_human"`). The kernel's
+  `_child_result_to_outcome` now maps a child `needs_human` disposition →
+  parent `NeedsHuman` (kernel.py), so a fan-out orchestrator pauses for a human
+  instead of charging ahead. `tests/test_subworkflow.py::test_parent_routes_needs_human_on_child_handoff_terminal`
+  + 4 updated implementation surrender tests. (Planning's own `end_needs_human`
+  still uses `disposition="completed"` — a same-class but lower-risk follow-up,
+  since it routes within recursive planning, not a leaf dispatch.)
 - **B3 — branch model:** ✅ **CLOSED (2026-06-09).** Was: `implementation`
   hard-coded `feature/{item_id}`, conflicting with ADR-0006's `feature/<root>` +
   `impl/<root>-<item>`. Fixed by an optional `root` field on

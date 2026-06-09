@@ -138,6 +138,31 @@ def _gating_child_workflow(name: str = "child_gate"):
     return builder, VerbRegistry
 
 
+def _handoff_child_workflow(name: str = "child_handoff"):
+    """Child that voluntarily TERMINATES with disposition='needs_human'.
+
+    Distinct from ``_gating_child_workflow`` (which *suspends* at a live gate):
+    this child runs to completion but reaches a needs-human terminal — exactly
+    what ``implementation``'s ``end_needs_human`` surrender does (ADR-0013 B2).
+    """
+
+    def builder():
+        return (
+            WorkflowBuilder(name).entry("only")
+                .script("only", verb="surrender")
+                    .edge("only", on="success", to="handoff")
+                .terminate("handoff", disposition="needs_human")
+                .build()
+        )
+
+    def verbs():
+        v = VerbRegistry()
+        v.register("surrender")(lambda ctx: Success(value={"surrendered": True}))
+        return v
+
+    return builder, verbs
+
+
 def _parent_wrapping(child_module: str, *, name: str = "parent"):
     """Parent that has one subworkflow node + success edge to terminate."""
 
@@ -241,6 +266,40 @@ async def test_parent_routes_permanent_failure_on_child_failure(tmp_path: Path):
     routes = [e for e in parent_events if e["kind"] == "route_taken"
               and e.get("node_id") == "call_child"]
     assert any(r["payload"]["key"].startswith("permanent_failure") for r in routes)
+
+
+async def test_parent_routes_needs_human_on_child_handoff_terminal(tmp_path: Path):
+    """ADR-0013 B2: a child that voluntarily TERMINATES with
+    disposition='needs_human' (a handoff, not a suspend) maps to parent
+    NeedsHuman — not Success and not PermanentFailure. Without this, a fan-out
+    orchestrator would treat a surrendered leaf as done."""
+    cb, cv = _handoff_child_workflow()
+    mod = _register_child_module(
+        "tests._sub_handoff", builder=cb, verbs_factory=cv,
+    )
+    pb = _parent_wrapping(mod)
+    # Parent has no gate_handler, so the bubbled NeedsHuman suspends the parent
+    # at its own bubble_gate.
+    engine = _parent_engine(pb, tmp_path)
+
+    result = await engine.run("p_handoff")
+
+    # The child's needs_human terminal maps to parent NeedsHuman, raised as a
+    # gate AT the subworkflow node (call_child). The parent suspends there —
+    # NOT routing to its success edge (end) and NOT permanent_failure (fail_end).
+    assert isinstance(result, Suspended)
+    assert result.node_id == "call_child"
+
+    parent_events = list(replay(tmp_path / "p_handoff.events.jsonl"))
+    # The child itself recorded a needs_human disposition on completion.
+    sub_complete = [e for e in parent_events
+                    if e["kind"] == "subworkflow_completed"]
+    assert sub_complete and sub_complete[0]["payload"]["disposition"] == "needs_human"
+    # The parent opened a gate at call_child (the bubbled NeedsHuman), rather
+    # than taking a success/permanent_failure route.
+    gate_opened = [e for e in parent_events if e["kind"] == "gate_opened"
+                   and e.get("node_id") == "call_child"]
+    assert gate_opened, parent_events
 
 
 # ---- 3. parent → child → NeedsHuman --------------------------------

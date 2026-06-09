@@ -783,6 +783,27 @@ def _child_result_to_outcome(
                 "child_final_node": result.final_node,
                 "child_projection": result.projection,
             })
+        if result.disposition == "needs_human":
+            # ADR-0013 B2: a child that voluntarily reached a
+            # ``terminate(disposition="needs_human")`` node (e.g.
+            # implementation's ``end_handoff`` — failing tests, bad coder
+            # output, push failure) is a HANDOFF, not a success and not a
+            # permanent failure. Surface it to the parent as NeedsHuman so a
+            # fan-out orchestrator pauses for a human instead of charging
+            # ahead (the silent-success-on-handoff footgun).
+            return NeedsHuman(
+                gate=f"{parent_node_id}/{result.final_node}",
+                prompt=(
+                    f"child workflow handed off to a human at "
+                    f"{result.final_node!r}"
+                ),
+                options=("resume", "abort"),
+                context={
+                    "sub_run_id": sub_run_id,
+                    "child_final_node": result.final_node,
+                    "child_disposition": result.disposition,
+                },
+            )
         if result.disposition == "cancelled":
             return Cancelled(cause="operator", at_step=parent_node_id)
         # Any other terminal disposition (e.g. ``failed``) — the child

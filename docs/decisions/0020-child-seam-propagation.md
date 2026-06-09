@@ -176,8 +176,19 @@ Shipped the **non-breaking variant** of §1–§2:
 
 **Deferred:** consolidating `planning.py`'s own (older, separate) seam contextvars
 into `requiem.seam` — planning works and is tested; folding it in is a follow-up
-to avoid widening this change. B2 (handoff classifier) and B3 (branch model)
-remain as noted.
+to avoid widening this change.
+
+**Update (2026-06-09): B2 and B3 also landed** (separate PRs, same day). B3 —
+`implementation` gained an optional `root` so a leaf branch follows ADR-0006's
+`impl/<root>-<item>` (else legacy `feature/<item_id>`). B2 — `implementation`'s
+overloaded `end_handoff` was split into `end_handoff` (success-handoff,
+`completed`) and `end_needs_human` (surrender, `needs_human`), and the kernel's
+`_child_result_to_outcome` now maps a child `needs_human` disposition → parent
+`NeedsHuman` so a fan-out parent pauses instead of treating a surrender as done.
+With B1+B2+B3 closed, the three ADR-0013 fan-out blockers are gone; a real
+in-process tree-walking orchestrator (#4) is now an integration task, not a
+blocked one. (Planning's own `end_needs_human` disposition is a small remaining
+same-class follow-up.)
 
 ## Consequences
 

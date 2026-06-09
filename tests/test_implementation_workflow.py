@@ -472,9 +472,10 @@ async def test_bad_output_routes_to_handoff_no_retry(repo_path: Path, tmp_path: 
     )
     result = await engine.run("badout")
     assert isinstance(result, Completed)
-    # bad_output edge from invoke_coder goes to end_handoff (completed),
-    # not end_failed — the brief says NeedsHuman.
-    assert result.final_node == "end_handoff"
+    # bad_output is a SURRENDER → end_needs_human (disposition needs_human), not
+    # the success-handoff end_handoff and not end_failed (ADR-0013 B2).
+    assert result.final_node == "end_needs_human"
+    assert result.disposition == "needs_human"
     # FakeProvider records call count; bad_output was returned once.
     assert len(provider.calls) == 1
 
@@ -528,7 +529,8 @@ async def test_tests_red_after_revision_no_pr(repo_path: Path, tmp_path: Path) -
     result = await engine.run("redtwice")
     assert isinstance(result, Completed)
     # We surrendered to the human after the revision also failed.
-    assert result.final_node == "end_handoff"
+    assert result.final_node == "end_needs_human"
+    assert result.disposition == "needs_human"
     # No PR was opened — INV-NO-CORRUPT-FORWARD.
     assert gh.created_calls == []
     # No twig comment either.
@@ -626,7 +628,8 @@ async def test_existing_branch_with_auto_gate_handler_routes_to_handoff(
 
     result = await engine.run("foreign_branch_auto")
     assert isinstance(result, Completed)
-    assert result.final_node == "end_handoff"
+    assert result.final_node == "end_needs_human"
+    assert result.disposition == "needs_human"
     assert gh.created_calls == []
     # Auto handler picked ``abort`` — the route key must be present.
     events = list(replay(tmp_path / "logs" / "foreign_branch_auto.events.jsonl"))
@@ -714,7 +717,8 @@ async def test_invalid_path_routes_to_handoff(repo_path: Path, tmp_path: Path) -
     )
     result = await engine.run("evil_path")
     assert isinstance(result, Completed)
-    assert result.final_node == "end_handoff"  # NeedsHuman branch
+    assert result.final_node == "end_needs_human"  # surrender → NeedsHuman
+    assert result.disposition == "needs_human"
     assert gh.created_calls == []
     # Nothing escaped the repo.
     assert not (repo_path.parent / "etc" / "oops").exists()

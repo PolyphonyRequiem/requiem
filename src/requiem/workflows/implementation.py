@@ -17,30 +17,35 @@ Pipeline
                                        set, else legacy feature/<item_id>; idempotent)
       → invoke_coder                (agent  · CoderOutput)
           ├─ success           → apply_changes
-          ├─ bad_output        → end_handoff (NeedsHuman)
+          ├─ bad_output        → end_needs_human (surrender)
           └─ permanent_failure → end_failed
       → apply_changes               (script · fs.write_text per FileChange)
           ├─ success                       → run_tests
           ├─ permanent_failure:no_changes  → end_failed
-          └─ permanent_failure:invalid_path→ end_handoff (NeedsHuman)
+          └─ permanent_failure:invalid_path→ end_needs_human (surrender)
       → run_tests                   (script · subprocess: test_command)
           ├─ success                       → commit_changes
           ├─ permanent_failure:tests_failed→ invoke_coder_revision
-          └─ permanent_failure:test_error  → end_handoff (NeedsHuman)
+          └─ permanent_failure:test_error  → end_needs_human (surrender)
       → invoke_coder_revision       (agent  · CoderOutput, fed failure)
           ├─ success           → apply_changes_revision
-          ├─ bad_output        → end_handoff
-          └─ permanent_failure → end_failed
+          ├─ bad_output        → end_needs_human
+          └─ permanent_failure → end_needs_human
       → apply_changes_revision      (script)
           → run_tests_final
       → run_tests_final             (script)
           ├─ success                       → commit_changes
-          └─ permanent_failure:tests_failed→ end_handoff
+          └─ permanent_failure:tests_failed→ end_needs_human
       → commit_changes              (script · fs.git_commit)
       → push_branch                 (script · fs.git_push, idempotent)
       → create_pr                   (script · gh.pr_create, idempotent via pr_search)
       → link_pr_to_item             (script · twig.comment, best-effort)
-      → end_handoff                 (terminate · NeedsHuman is at the gate)
+      → end_handoff                 (terminate · disposition=completed — a green
+                                       PR is open, hand off to the reviewer)
+      ⟂ end_needs_human             (terminate · disposition=needs_human — the
+                                       surrender target for red tests / bad coder
+                                       output / push failure; ADR-0013 B2 so a
+                                       fan-out parent pauses, not proceeds)
 
 Closed ``error_kind`` taxonomy (ADR 0004 §4.2) used by this workflow:
 
@@ -1025,53 +1030,61 @@ def build_workflow() -> Workflow:
                 # ``branch.exists_foreign`` no longer exists as a
                 # permanent_failure; the verb now returns ``NeedsHuman``
                 # and the kernel suspends at the gate. The fallback
-                # ``needs_human`` edge routes to ``end_handoff`` so that
+                # ``needs_human`` edge routes to ``end_needs_human`` so that
                 # demos (and any auto gate handler) terminate cleanly
                 # instead of dead-ending with ``route.missing``.
-                .edge("create_branch", on="needs_human", to="end_handoff")
-                .edge("create_branch", on="permanent_failure:branch.probe_failed", to="end_handoff")
+                .edge("create_branch", on="needs_human", to="end_needs_human")
+                .edge("create_branch", on="permanent_failure:branch.probe_failed", to="end_needs_human")
                 .edge("create_branch", on="permanent_failure", to="end_failed")
             .agent("invoke_coder", agent="coder", prompt_verb="coder_prompt")
                 .edge("invoke_coder", on="success", to="apply_changes")
-                .edge("invoke_coder", on="bad_output", to="end_handoff")
+                .edge("invoke_coder", on="bad_output", to="end_needs_human")
                 .edge("invoke_coder", on="permanent_failure", to="end_failed")
             .script("apply_changes", verb="apply_changes")
                 .edge("apply_changes", on="success", to="run_tests")
                 .edge("apply_changes", on="permanent_failure:coder.no_changes", to="end_failed")
-                .edge("apply_changes", on="permanent_failure", to="end_handoff")
+                .edge("apply_changes", on="permanent_failure", to="end_needs_human")
             .script("run_tests", verb="run_tests")
                 .edge("run_tests", on="success", to="commit_changes")
                 .edge("run_tests", on="permanent_failure:tests.failed", to="invoke_coder_revision")
-                .edge("run_tests", on="permanent_failure", to="end_handoff")
+                .edge("run_tests", on="permanent_failure", to="end_needs_human")
             .agent(
                 "invoke_coder_revision",
                 agent="coder_revision",
                 prompt_verb="coder_revision_prompt",
             )
                 .edge("invoke_coder_revision", on="success", to="apply_changes_revision")
-                .edge("invoke_coder_revision", on="bad_output", to="end_handoff")
-                .edge("invoke_coder_revision", on="permanent_failure", to="end_handoff")
+                .edge("invoke_coder_revision", on="bad_output", to="end_needs_human")
+                .edge("invoke_coder_revision", on="permanent_failure", to="end_needs_human")
             .script("apply_changes_revision", verb="apply_changes_revision")
                 .edge("apply_changes_revision", on="success", to="run_tests_final")
-                .edge("apply_changes_revision", on="permanent_failure", to="end_handoff")
+                .edge("apply_changes_revision", on="permanent_failure", to="end_needs_human")
             .script("run_tests_final", verb="run_tests_final")
                 .edge("run_tests_final", on="success", to="commit_changes")
-                .edge("run_tests_final", on="permanent_failure", to="end_handoff")
+                .edge("run_tests_final", on="permanent_failure", to="end_needs_human")
             .script("commit_changes", verb="commit_changes")
                 .edge("commit_changes", on="success", to="push_branch")
-                .edge("commit_changes", on="permanent_failure", to="end_handoff")
+                .edge("commit_changes", on="permanent_failure", to="end_needs_human")
             .script("push_branch", verb="push_branch")
                 .edge("push_branch", on="success", to="create_pr")
-                .edge("push_branch", on="permanent_failure", to="end_handoff")
+                .edge("push_branch", on="permanent_failure", to="end_needs_human")
             .script("create_pr", verb="create_pr")
                 .edge("create_pr", on="success", to="link_pr_to_item")
-                .edge("create_pr", on="permanent_failure", to="end_handoff")
+                .edge("create_pr", on="permanent_failure", to="end_needs_human")
             .script("link_pr_to_item", verb="link_pr_to_item")
-                # pr.link_failed is best-effort: still hand off to the
-                # reviewer (the PR already exists), don't fail the run.
+                # pr.link_failed is best-effort: the PR already exists, so this
+                # is the GENUINE success-handoff to the reviewer — not a
+                # surrender. Both edges land on ``end_handoff`` (completed).
                 .edge("link_pr_to_item", on="success", to="end_handoff")
                 .edge("link_pr_to_item", on="permanent_failure", to="end_handoff")
+            # ADR-0013 B2: split the single overloaded handoff terminal into a
+            # success-handoff (a green PR is open → the reviewer takes over; the
+            # parent orchestrator may proceed) and a needs-human surrender (tests
+            # red / bad coder output / push failure → the parent must pause for a
+            # human, NOT treat the leaf as done). The kernel maps a child
+            # ``needs_human`` disposition to parent ``NeedsHuman``.
             .terminate("end_handoff", disposition="completed")
+            .terminate("end_needs_human", disposition="needs_human")
             .terminate("end_failed", disposition="failed")
             .humanize({
                 "start":                   "Starting implementation",
@@ -1089,6 +1102,7 @@ def build_workflow() -> Workflow:
                 "create_pr":               "Opened pull request",
                 "link_pr_to_item":         "Linked PR to work item",
                 "end_handoff":             "implementation",
+                "end_needs_human":         "implementation",
                 "end_failed":              "implementation",
             })
             .build()
