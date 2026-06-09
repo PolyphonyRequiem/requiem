@@ -184,14 +184,20 @@ it. A rigorous design exists (bounded-slot dispatch per `decomposable==False`
 leaf), but a *correct, production-real* fan-out is **blocked** on three verified
 architectural issues (ADR-0013):
 
-- **B1 — child-seam propagation:** the kernel forwards only JSON-flat inputs to a
-  dispatched child's `build_engine` (filtered by signature, kernel.py:543-567).
-  `provider`/`toolbelt`/`gate_handler` are never forwarded, so a dispatched
-  `implementation` falls back to a canned LLM + fake gh/twig over **real** git
-  (implementation.py:1390-1401) — a silent-success footgun. Needs a contextvar/
-  shim seam (the pattern planning uses for `gate_handler`, planning.py:139-154).
+- **B1 — child-seam propagation:** ✅ **CLOSED (2026-06-09, ADR-0020).** Was: the
+  kernel forwarded only JSON-flat inputs to a dispatched child's `build_engine`
+  (filtered by signature, kernel.py:543-567); `provider`/`toolbelt`/`gate_handler`
+  were never forwarded, so a dispatched `implementation` fell back to a canned LLM
+  + fake gh/twig over **real** git — a silent-success footgun. Fixed by a shared
+  `requiem.seam` contextvar module the kernel installs from the parent engine
+  before building each child; `implementation.build_engine` now resolves each seam
+  as **explicit arg → active seam → demo fallback** (so a dispatched child
+  inherits the parent's real seams; a bare demo call is unchanged; `demo=True`
+  forces a hermetic demo). `tests/test_seam_propagation.py` (8). The pattern
+  generalises the one planning used for `gate_handler` (planning.py:139-154); its
+  own contextvars are a deferred consolidation.
 - **B2 — handoff≠failure:** `implementation`'s `end_handoff` is
-  `disposition="completed"` (implementation.py:1048) and the kernel maps any
+  `disposition="completed"` (implementation.py:1057) and the kernel maps any
   child `Completed(completed)` → parent `Success` (kernel.py:765-772), so a naive
   fan-out treats failing-tests / bad-coder / push-failure handoffs as successes.
   Needs a per-slot classifier on `child_final_node`.
