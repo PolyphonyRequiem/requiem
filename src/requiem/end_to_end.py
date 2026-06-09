@@ -41,7 +41,7 @@ from requiem.workflows import kanban_executor as executor_mod
 from requiem.workflows import leaf_pr as leaf_pr_mod
 from requiem.workflows import planning as planning_mod
 from requiem.workflows import trunk_bootstrap as trunk_bootstrap_mod
-from requiem.workflows.feature_pr import LeafPr
+from requiem.workflows.feature_pr import ItemDisposition, LeafPr
 from requiem.workflows.kanban_executor import ExecInputs, LeafSpec
 
 # Engine factories are injected (defaulting to the real ones) so the pipeline
@@ -97,6 +97,21 @@ def _completed_map(log_dir: Path, run_id: str) -> dict[str, dict]:
         if ev.get("kind") == "verb_completed":
             completed[ev["node_id"]] = ev["payload"]["outcome"]
     return completed
+
+
+def _gate_opened(log_dir: Path, run_id: str) -> str | None:
+    """Return the node_id of the last gate_opened event in a run's log, if any.
+
+    A ``NeedsHuman`` gate records a ``gate_opened`` event (not a Success outcome),
+    so this is how the driver learns *which* node fired the human gate — e.g.
+    ``verify_readiness`` (a laggard leaf) vs ``verify_dispositions`` (an
+    unsatisfied requirement). Returns None if no gate opened.
+    """
+    node_id: str | None = None
+    for ev in replay(log_dir / f"{run_id}.events.jsonl"):
+        if ev.get("kind") == "gate_opened":
+            node_id = ev.get("node_id")
+    return node_id
 
 
 def _plan_record(completed: dict[str, dict]) -> dict[str, Any] | None:
@@ -456,6 +471,8 @@ class IntegrationResult:
     feature_pr_url: str | None = None
     leaves_total: int = 0
     leaves_ready: int = 0
+    dispositions_total: int = 0
+    dispositions_satisfied: int = 0
 
 
 async def integrate_pipeline(
@@ -466,6 +483,7 @@ async def integrate_pipeline(
     leaf_pr_map_path: Path | None = None,
     leaves: tuple[LeafPr, ...] | None = None,
     base_branch: str | None = None,
+    dispositions: tuple[ItemDisposition, ...] = (),
     live: bool = False,
     twig: Any | None = None,
     gh: Any | None = None,
@@ -480,6 +498,13 @@ async def integrate_pipeline(
     ``pr_merge``; INV: no self-merge). The expected-leaf set is read from the
     PERSISTED leaf-PR map (``leaf_pr_map_path``), never re-queried, because a
     default ``gh pr list`` is open-only and can't see merged numbers.
+
+    ``dispositions`` carries the in-scope items' requirement dispositions
+    (ADR-0006 INV-DRIVER-GATES-FEATURE-MERGE). The caller sources these from the
+    committed plan / Twig item states; feature_pr's gate refuses to open the
+    feature→base PR while any is unsatisfied (fail-closed). An empty set leaves
+    the gate a no-op (the pre-gate behaviour), so a creds-light caller that does
+    not track dispositions is unaffected.
 
     Drift policy (ratified ADR-0018, confirmed live 2026-06-09): feature_pr only
     *opens* the trunk→base PR; an unmergeable (drifted) PR is surfaced to the
@@ -497,7 +522,7 @@ async def integrate_pipeline(
     resolved_base = base_branch or await _resolve_base_branch(github_repo, gh)
     fp_inputs = feature_pr_mod.FeaturePrInputs(
         root_item_id=item_id, repo=github_repo, leaves=leaves,
-        base_branch=resolved_base, dry_run=not live,
+        base_branch=resolved_base, dry_run=not live, dispositions=dispositions,
     )
     fp_run = f"featurepr-{item_id}"
     fp_engine = feature_pr_factory(
@@ -509,6 +534,9 @@ async def integrate_pipeline(
     fp_result = feature_pr_mod.feature_pr_result(
         _completed_map(log_dir, fp_run), fp_final or "",
     )
+    # The completed-map only carries Success values, so a NeedsHuman gate's
+    # identity (which gate fired) is read from the durable gate_opened event.
+    fp_gate = _gate_opened(log_dir, fp_run)
 
     if fp_final == "end_success":
         status = "previewed" if fp_result.dry_run else "opened"
@@ -520,11 +548,22 @@ async def integrate_pipeline(
         )
     elif fp_final == "end_human":
         status = "not_ready"
-        detail = (
-            f"trunk not ready: {fp_result.leaves_ready}/{fp_result.leaves_total} "
-            "expected leaf PRs merged into the trunk. Merge the laggards (or "
-            "resolve a drifted/unmergeable leaf PR) and re-run."
-        )
+        # Distinguish the two gate causes via the gate that actually fired: a
+        # laggard leaf PR (verify_readiness) vs an unsatisfied in-scope
+        # requirement disposition (verify_dispositions — ADR-0006
+        # INV-DRIVER-GATES-FEATURE-MERGE).
+        if fp_gate == "verify_dispositions":
+            detail = (
+                f"requirement dispositions not satisfied "
+                f"({len(dispositions)} in-scope item(s) gated; resolve the "
+                "unsatisfied item(s) and re-run)."
+            )
+        else:
+            detail = (
+                f"trunk not ready: {fp_result.leaves_ready}/{fp_result.leaves_total} "
+                "expected leaf PRs merged into the trunk. Merge the laggards (or "
+                "resolve a drifted/unmergeable leaf PR) and re-run."
+            )
     else:
         status = "failed"
         detail = f"feature_pr failed (node={fp_final!r})"
@@ -538,6 +577,8 @@ async def integrate_pipeline(
         feature_pr_url=fp_result.pr_url,
         leaves_total=fp_result.leaves_total,
         leaves_ready=fp_result.leaves_ready,
+        dispositions_total=fp_result.dispositions_total,
+        dispositions_satisfied=fp_result.dispositions_satisfied,
     )
 
 
