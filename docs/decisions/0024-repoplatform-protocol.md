@@ -484,6 +484,68 @@ async def run_pipeline(
    now takes a `RepoPlatform` parameter (not a `GhClient`). Add tests
    covering the `ado_repo` path with stub clients. **~80 LOC + 5
    tests.**
+   **STATUS: landed 2026-06-16** (`src/requiem/end_to_end.py`,
+   `tests/test_end_to_end_ado.py`). Concrete shape shipped:
+   - `run_pipeline` + `integrate_pipeline` grew an `ado_repo: str | None`
+     kwarg alongside the existing `github_repo`. Mutually-exclusive at
+     the entry; passing both raises `ValueError`. An optional
+     `repo_client` kwarg lets tests inject a `FakeAdoClient` /
+     `FakeGhClient` directly without a real network hop.
+   - `_resolve_repo_target(github_repo, ado_repo, gh)` is the single
+     resolution funnel: returns `(repo_id, repo_client)` where
+     `repo_id` is the unified internal identifier and `repo_client` is
+     the `RepoPlatform` impl. `AdoClient` is **lazy-imported** in the
+     ADO branch so GitHub-only operators never pay the
+     `azure-identity` dep cost on import.
+   - `_topology_toolbelt(twig, repo_client)` replaces `_gh_toolbelt`
+     for the trunk-bootstrap / leaf-pr / fanout / feature-pr engine
+     constructions. `toolbelt.repo` is set to the chosen client;
+     `toolbelt.gh` continues to point at the real `GhClient` so
+     GH-specific callers (close_out, etc.) keep working untouched.
+     Old `_gh_toolbelt` is preserved as a thin back-compat alias.
+   - `_resolve_base_branch_via_platform(repo_id, repo_client, fallback)`
+     replaces `_resolve_base_branch`: uses the `RepoPlatform`'s
+     `default_branch` method, which both `GhClient` and `AdoClient`
+     implement. The legacy `_resolve_base_branch(github_repo, gh)`
+     stays as a back-compat alias delegating to the new helper. Falls
+     back to `"main"` on any client error — `branch_sha` fail-closes
+     in `trunk_bootstrap` if the guess is wrong.
+   - `PipelineResult` and `IntegrationResult` grew
+     `ado_repo: str | None = None` alongside the existing
+     `github_repo: str | None = None`. Exactly one is populated per
+     run, mirroring the operator's choice. The internal flow keeps
+     `github_repo` as the unified repo_id variable name (zero churn on
+     the 30+ downstream call sites that read it); the operator's
+     original args live in `_github_repo_arg` / `_ado_repo_arg` for
+     result-projection. `_dispatch_in_process` grew matching
+     `github_repo_arg` / `ado_repo_arg` / `repo_client` params and
+     threads them into its three `PipelineResult` constructors.
+   - CLI: both `_build_arg_parser` (for `requiem-end-to-end`) and
+     `_build_integrate_arg_parser` (for `requiem-integrate`) grew
+     `--ado-repo` flags alongside `--github-repo`. `integrate_main`
+     enforces "exactly one of {`--github-repo`, `--ado-repo`}" with
+     a clear error message. Required `--github-repo` on
+     `requiem-integrate` is now optional (one of the two is required).
+   - 10 new tests in `tests/test_end_to_end_ado.py` covering:
+     `_resolve_repo_target` (neither / mutually-exclusive / ADO
+     constructs AdoClient / GitHub reuses injected stub),
+     `_topology_toolbelt` (wires repo_client at toolbelt.repo, gh
+     still populated separately), `run_pipeline(ado_repo=...)`
+     end-to-end through stub factories with `FakeAdoClient` (asserts
+     both trunk_bootstrap and leaf_pr toolbelts get the ADO client),
+     back-compat (GitHub path still projects github_repo), driver-level
+     mutually-exclusive enforcement, executor-only path unaffected by
+     either flag, and `integrate_pipeline(ado_repo=...)` projecting
+     `IntegrationResult.ado_repo`.
+   - 448 tests (3 skipped) across the broad surface still green
+     (clients/, end_to_end variants, trunk-topology workflows,
+     planning, commit_plan, plan_pr, implementation, pr_lifecycle,
+     close_out, fleet contracts, docs, ado_pr).
+   - The chain is complete. `requiem-end-to-end --item N --board
+     requiem-N --ado-repo Contoso/Polyphony/widgets --live` is now a
+     valid live invocation. The remaining gate is purely operational
+     (one `az login` on the host + a reachable scratch ADO repo) —
+     no code blocks an end-to-end CloudVault dogfood run anymore.
 
 Each step is shippable on its own; the chain ends with a live ADO
 scratch run becoming possible.

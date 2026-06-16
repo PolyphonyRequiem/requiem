@@ -78,8 +78,10 @@ class PipelineResult:
     committed_path: str | None = None
     executor_final_node: str | None = None
     # -- ADR-0018 step 4: trunk-topology projections (populated only when a
-    #    github_repo is threaded; all None/empty on the legacy creds-light path) --
+    #    github_repo OR ado_repo is threaded; all None/empty on the legacy
+    #    creds-light path) --
     github_repo: str | None = None
+    ado_repo: str | None = None               # ADR-0024 step 5
     base_branch: str | None = None
     trunk_branch: str | None = None
     trunk_verdict: str | None = None          # created | exists | previewed | failed
@@ -137,43 +139,131 @@ def _plan_record(completed: dict[str, dict]) -> dict[str, Any] | None:
 # dry run genuinely side-effect-free (no ref create, no PR open).
 
 
-def _gh_toolbelt(twig: Any | None, gh: Any | None) -> Toolbelt:
-    """A toolbelt carrying a real (or injected) gh client for the topology steps.
+def _resolve_repo_target(
+    *,
+    github_repo: str | None,
+    ado_repo: str | None,
+    gh: Any | None,
+) -> tuple[str | None, Any | None]:
+    """ADR-0024 step 5: resolve the operator's choice of (--github-repo |
+    --ado-repo) into a single internal (repo_id, repo_client) pair.
 
-    The phase-3 executor toolbelt deliberately omits `gh` (it only coordinates a
-    remote board). The trunk workflows need `toolbelt.gh`, so we build a small
-    real toolbelt and let an injected `gh`/`twig` override it for tests.
+    Mutually exclusive — passing both raises a ValueError so the caller
+    fails closed instead of silently routing one half to one platform and
+    the other half to the other.
+
+    Returns ``(repo_id, repo_client)``:
+    - ``(None, None)`` when neither is set → executor-only path, the
+      legacy creds-light behaviour.
+    - ``(github_repo, gh-or-real-GhClient)`` when ``github_repo`` is set.
+    - ``(ado_repo, AdoClient())`` when ``ado_repo`` is set. The credential
+      chain (explicit → PAT → env → AzureCliCredential) is the one from
+      ADR-0024 step 1; the operator needs ``az login`` for the default
+      path.
+    """
+    if github_repo is not None and ado_repo is not None:
+        raise ValueError(
+            "github_repo and ado_repo are mutually exclusive — pass one or "
+            "the other (or neither, for the executor-only path)"
+        )
+    if github_repo is not None:
+        # Reuse the injected gh client when given; otherwise fall through
+        # to the real GhClient that Toolbelt.real() returns. (Mirrors the
+        # existing _gh_toolbelt() behaviour.)
+        if gh is not None:
+            return github_repo, gh
+        return github_repo, Toolbelt.real().gh
+    if ado_repo is not None:
+        # Lazy import — AdoClient lives in clients/azuredevops.py and
+        # importing it at module top would pull azure-identity into every
+        # end_to_end import even when the operator never uses ADO. Step 1
+        # made azure-identity an optional dep; keep the import lazy so
+        # GitHub-only operators don't see surprising ImportErrors.
+        from requiem.clients.azuredevops import AdoClient
+        return ado_repo, AdoClient()
+    return None, None
+
+
+def _topology_toolbelt(
+    twig: Any | None, repo_client: Any | None,
+) -> Toolbelt:
+    """A toolbelt carrying a real (or injected) RepoPlatform client for
+    the trunk-topology steps.
+
+    Replaces the pre-step-5 ``_gh_toolbelt``: same intent, but the
+    client is now wired via ``toolbelt.repo`` instead of
+    ``toolbelt.gh``. The trunk-topology workflows after step 4 read
+    from ``toolbelt.repo`` first and fall back to ``toolbelt.gh``, so
+    the back-compat path is preserved for any caller still wiring via
+    the old field name.
     """
     real = Toolbelt.real()
     return Toolbelt(
         git=real.git,
         files=real.files,
-        gh=gh if gh is not None else real.gh,
+        # repo_client may be a GhClient or an AdoClient; both implement
+        # RepoPlatform per ADR-0024 step 3.
+        repo=repo_client if repo_client is not None else real.repo,
+        # Keep gh wired too — the legacy back-compat path still resolves
+        # through it, AND GhClient-specific callers (close_out etc.) read
+        # it directly. When the caller is on ADO, gh stays the real
+        # GhClient from Toolbelt.real() (separate instance from `repo`).
+        gh=real.gh,
         twig=twig if twig is not None else real.twig,
         kanban=real.kanban,
     )
 
 
+# Back-compat alias — older internal callers still imported _gh_toolbelt.
+# Keep as a thin wrapper that ignores any explicit `gh` arg and routes
+# through the new platform-agnostic helper. The new helper is the
+# preferred name; this alias may be removed in a fast-follow once
+# nothing in tree references it.
+def _gh_toolbelt(twig: Any | None, gh: Any | None) -> Toolbelt:
+    return _topology_toolbelt(twig, gh)
+
+
+async def _resolve_base_branch_via_platform(
+    repo_id: str, repo_client: Any | None, fallback: str = "main",
+) -> str:
+    """ADR-0024 step 5: resolve the repo's default branch via the
+    RepoPlatform Protocol method ``default_branch``.
+
+    Falls back to ``fallback`` if the client is absent or the probe
+    fails for any reason: trunk_bootstrap's ``branch_sha`` will re-
+    validate fail-closed against any incorrect guess, so the cost of
+    falling through to ``"main"`` and being wrong is a clean failure
+    one stage later (not a corrupt-forward).
+
+    The pre-step-5 helper ``_resolve_base_branch`` reached into
+    ``gh.api("repos/<repo>")`` directly — a GitHub-only surface. The
+    new path goes through ``RepoPlatform.default_branch`` which both
+    GhClient and AdoClient implement uniformly.
+    """
+    if repo_client is None:
+        # No client wired — fall back to the real Toolbelt's GhClient
+        # only if the repo_id looks like a GitHub identifier (two slashes
+        # means ADO; one slash means GitHub).
+        if "/" not in repo_id:
+            return fallback
+        if repo_id.count("/") >= 2:
+            # ADO without a client wired — caller didn't pass one; no
+            # safe fallback. Use the static fallback rather than guess.
+            return fallback
+        repo_client = Toolbelt.real().repo
+    if repo_client is None:
+        return fallback
+    try:
+        return await repo_client.default_branch(repo_id)
+    except Exception:
+        return fallback
+
+
+# Back-compat alias for tests that import _resolve_base_branch directly.
 async def _resolve_base_branch(
     github_repo: str, gh: Any | None, fallback: str = "main",
 ) -> str:
-    """Q2: resolve the repo's real default branch instead of hardcoding `main`.
-
-    Uses the narrow `gh.api()` read escape hatch (no new GhClient mutation
-    surface — the branch-ref pair stays the only added methods). Falls back to
-    `fallback` if the client is absent or the probe fails for any reason: the
-    base is re-validated fail-closed by trunk_bootstrap's `branch_sha` anyway,
-    so a wrong guess surfaces there rather than corrupting forward.
-    """
-    client = gh if gh is not None else Toolbelt.real().gh
-    if client is None:
-        return fallback
-    try:
-        payload = await client.api(f"repos/{github_repo}")
-    except Exception:
-        return fallback
-    default = payload.get("default_branch") if isinstance(payload, dict) else None
-    return str(default) if default else fallback
+    return await _resolve_base_branch_via_platform(github_repo, gh, fallback)
 
 
 def _persist_leaf_pr_map(
@@ -206,7 +296,10 @@ async def _dispatch_in_process(
     committed_path: Path | None,
     plan_record: dict,
     repo_path: Path | None,
-    github_repo: str | None,
+    github_repo: str | None,         # unified repo_id, either GH or ADO
+    ado_repo_arg: str | None = None, # operator-supplied ado_repo (for PipelineResult)
+    github_repo_arg: str | None = None, # operator-supplied github_repo (for PipelineResult)
+    repo_client: Any | None = None,  # ADR-0024: RepoPlatform impl for the topology toolbelt
     base_branch: str | None,
     twig: Any,
     gh: Any,
@@ -260,7 +353,7 @@ async def _dispatch_in_process(
     fo_run = f"fanout-{item_id}"
     fo_engine = fanout_factory(
         log_dir, inputs=fo_inputs,
-        toolbelt=_gh_toolbelt(twig, gh), provider=provider,
+        toolbelt=_topology_toolbelt(twig, repo_client), provider=provider,
         **({"gate_handler": gate_handler} if gate_handler is not None else {}),
     )
     fo_outcome = await fo_engine.run(fo_run)
@@ -278,7 +371,8 @@ async def _dispatch_in_process(
             plan_artifact=plan_artifact,
             committed_path=str(committed_path) if committed_path else None,
             executor_final_node=fo_final,
-            github_repo=github_repo, base_branch=base_branch,
+            github_repo=github_repo_arg, ado_repo=ado_repo_arg,
+            base_branch=base_branch,
             trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
             fanout_verdict=fo_result.verdict,
             fanout_leaves_total=fo_result.leaves_total,
@@ -298,7 +392,8 @@ async def _dispatch_in_process(
             plan_artifact=plan_artifact,
             committed_path=str(committed_path) if committed_path else None,
             executor_final_node=fo_final,
-            github_repo=github_repo, base_branch=base_branch,
+            github_repo=github_repo_arg, ado_repo=ado_repo_arg,
+            base_branch=base_branch,
             trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
             fanout_verdict=fo_result.verdict,
             fanout_leaves_total=fo_result.leaves_total,
@@ -316,7 +411,8 @@ async def _dispatch_in_process(
         plan_artifact=plan_artifact,
         committed_path=str(committed_path) if committed_path else None,
         executor_final_node=fo_final,
-        github_repo=github_repo, base_branch=base_branch,
+        github_repo=github_repo_arg, ado_repo=ado_repo_arg,
+        base_branch=base_branch,
         trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
         fanout_verdict=fo_result.verdict,
         fanout_leaves_total=fo_result.leaves_total,
@@ -347,11 +443,13 @@ async def run_pipeline(
     live: bool = False,
     skills: tuple[str, ...] = (),
     github_repo: str | None = None,
+    ado_repo: str | None = None,
     base_branch: str | None = None,
     twig: Any | None = None,
     provider: Any | None = None,
     kanban: Any | None = None,
     gh: Any | None = None,
+    repo_client: Any | None = None,
     gate_handler: Any | None = None,
     process_config: Any | None = None,
     poll_interval_s: float = 5.0,
@@ -367,6 +465,38 @@ async def run_pipeline(
     fanout_factory: Any = fanout_mod.build_engine,
 ) -> PipelineResult:
     log_dir.mkdir(parents=True, exist_ok=True)
+
+    # -- ADR-0024 step 5: resolve the operator's repo choice early -----
+    #
+    # github_repo + ado_repo are mutually exclusive. Resolve once into
+    # a single (repo_id, repo_client) pair that downstream stages use
+    # uniformly. Tests can inject `repo_client` directly to bypass real
+    # GhClient / AdoClient construction.
+    #
+    # Internally we keep the name `github_repo` as the repo-identifier
+    # variable (so the existing downstream call chains compile unchanged);
+    # it now carries EITHER a GitHub "Owner/Repo" string OR an ADO
+    # "org/project/repo" string, with `repo_client` discriminating which.
+    # The original args are preserved separately to populate the
+    # `github_repo` vs `ado_repo` projection on `PipelineResult`.
+    _github_repo_arg = github_repo
+    _ado_repo_arg = ado_repo
+    if repo_client is None:
+        repo_id, repo_client = _resolve_repo_target(
+            github_repo=github_repo, ado_repo=ado_repo, gh=gh,
+        )
+    else:
+        if github_repo is not None and ado_repo is not None:
+            raise ValueError(
+                "github_repo and ado_repo are mutually exclusive — pass one or "
+                "the other (or neither, for the executor-only path)"
+            )
+        repo_id = github_repo or ado_repo
+    # github_repo is now the unified internal repo-identifier (either
+    # platform). Downstream code reads `github_repo`; the original
+    # operator-supplied args live in `_github_repo_arg` / `_ado_repo_arg`
+    # for use in PipelineResult construction.
+    github_repo = repo_id
 
     # -- Phase 1: plan -------------------------------------------------
     plan_run = f"plan-{item_id}"
@@ -451,14 +581,16 @@ async def run_pipeline(
     trunk_verdict: str | None = None
     trunk_branch: str | None = None
     if github_repo is not None:
-        resolved_base = base_branch or await _resolve_base_branch(github_repo, gh)
+        resolved_base = base_branch or await _resolve_base_branch_via_platform(
+            github_repo, repo_client,
+        )
         boot_inputs = trunk_bootstrap_mod.TrunkBootstrapInputs(
             root_item_id=item_id, repo=github_repo,
             base_branch=resolved_base, dry_run=not live,
         )
         boot_run = f"trunk-{item_id}"
         boot_engine = trunk_bootstrap_factory(
-            log_dir, inputs=boot_inputs, toolbelt=_gh_toolbelt(twig, gh),
+            log_dir, inputs=boot_inputs, toolbelt=_topology_toolbelt(twig, repo_client),
             **({"gate_handler": gate_handler} if gate_handler is not None else {}),
         )
         boot_outcome = await boot_engine.run(boot_run)
@@ -479,7 +611,8 @@ async def run_pipeline(
                         "resolve before dispatching leaves."),
                 decomposable=decomposable, plan_artifact=plan_artifact,
                 committed_path=str(committed_path) if committed_path else None,
-                github_repo=github_repo, base_branch=resolved_base,
+                github_repo=_github_repo_arg, ado_repo=_ado_repo_arg,
+                base_branch=resolved_base,
                 trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
             )
 
@@ -496,6 +629,8 @@ async def run_pipeline(
             item_id=item_id, log_dir=log_dir, decomposable=decomposable,
             plan_artifact=plan_artifact, committed_path=committed_path,
             plan_record=plan_record, repo_path=repo_path, github_repo=github_repo,
+            github_repo_arg=_github_repo_arg, ado_repo_arg=_ado_repo_arg,
+            repo_client=repo_client,
             base_branch=resolved_base, twig=twig, gh=gh, provider=provider,
             gate_handler=gate_handler, live=live, fanout_parallel=fanout_parallel,
             trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
@@ -530,7 +665,8 @@ async def run_pipeline(
             plan_artifact=plan_artifact,
             committed_path=str(committed_path) if committed_path else None,
             executor_final_node=final_node,
-            github_repo=github_repo, base_branch=resolved_base,
+            github_repo=_github_repo_arg, ado_repo=_ado_repo_arg,
+            base_branch=resolved_base,
             trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
         )
 
@@ -552,7 +688,7 @@ async def run_pipeline(
         )
         lp_run = f"leafpr-{item_id}"
         lp_engine = leaf_pr_factory(
-            log_dir, inputs=lp_inputs, toolbelt=_gh_toolbelt(twig, gh),
+            log_dir, inputs=lp_inputs, toolbelt=_topology_toolbelt(twig, repo_client),
             **({"gate_handler": gate_handler} if gate_handler is not None else {}),
         )
         lp_outcome = await lp_engine.run(lp_run)
@@ -574,7 +710,8 @@ async def run_pipeline(
                 plan_artifact=plan_artifact,
                 committed_path=str(committed_path) if committed_path else None,
                 executor_final_node=final_node,
-                github_repo=github_repo, base_branch=resolved_base,
+                github_repo=_github_repo_arg, ado_repo=_ado_repo_arg,
+                base_branch=resolved_base,
                 trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
                 leaf_pr_verdict=leaf_pr_verdict,
                 leaf_pr_map=tuple((lp.leaf_id, lp.pr_number) for lp in leaf_pr_leaves),
@@ -596,7 +733,8 @@ async def run_pipeline(
         plan_artifact=plan_artifact,
         committed_path=str(committed_path) if committed_path else None,
         executor_final_node=final_node,
-        github_repo=github_repo, base_branch=resolved_base,
+        github_repo=_github_repo_arg, ado_repo=_ado_repo_arg,
+        base_branch=resolved_base,
         trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
         leaf_pr_verdict=leaf_pr_verdict,
         leaf_pr_map=tuple((lp.leaf_id, lp.pr_number) for lp in leaf_pr_leaves),
@@ -617,9 +755,12 @@ class IntegrationResult:
     item_id: int
     status: str
     detail: str
-    github_repo: str
-    base_branch: str
-    trunk_branch: str
+    # Exactly one of github_repo / ado_repo is populated, mirroring the
+    # operator's choice on the invocation. ADR-0024 step 5.
+    github_repo: str | None = None
+    ado_repo: str | None = None
+    base_branch: str = ""
+    trunk_branch: str = ""
     feature_pr_verdict: str | None = None
     feature_pr_number: int | None = None
     feature_pr_url: str | None = None
@@ -633,7 +774,8 @@ async def integrate_pipeline(
     item_id: int,
     *,
     log_dir: Path,
-    github_repo: str,
+    github_repo: str | None = None,
+    ado_repo: str | None = None,
     leaf_pr_map_path: Path | None = None,
     leaves: tuple[LeafPr, ...] | None = None,
     base_branch: str | None = None,
@@ -641,6 +783,7 @@ async def integrate_pipeline(
     live: bool = False,
     twig: Any | None = None,
     gh: Any | None = None,
+    repo_client: Any | None = None,
     gate_handler: Any | None = None,
     feature_pr_factory: FeaturePrFactory = feature_pr_mod.build_engine,
 ) -> IntegrationResult:
@@ -665,6 +808,26 @@ async def integrate_pipeline(
     human by pr_lifecycle. No auto-rebase here.
     """
     log_dir.mkdir(parents=True, exist_ok=True)
+    # ADR-0024 step 5: resolve operator's repo choice; integrate_pipeline
+    # requires a repo (no creds-light path here — feature_pr is the
+    # platform-touching step).
+    if repo_client is None:
+        repo_id, repo_client = _resolve_repo_target(
+            github_repo=github_repo, ado_repo=ado_repo, gh=gh,
+        )
+    else:
+        if github_repo is not None and ado_repo is not None:
+            raise ValueError(
+                "github_repo and ado_repo are mutually exclusive"
+            )
+        repo_id = github_repo or ado_repo
+    if repo_id is None:
+        raise ValueError(
+            "integrate_pipeline requires either github_repo or ado_repo"
+        )
+    _github_repo_arg = github_repo
+    _ado_repo_arg = ado_repo
+    github_repo = repo_id   # unified internal identifier
     if leaves is None:
         if leaf_pr_map_path is None:
             raise ValueError(
@@ -673,14 +836,16 @@ async def integrate_pipeline(
             )
         leaves = load_leaf_pr_map(Path(leaf_pr_map_path))
 
-    resolved_base = base_branch or await _resolve_base_branch(github_repo, gh)
+    resolved_base = base_branch or await _resolve_base_branch_via_platform(
+        github_repo, repo_client,
+    )
     fp_inputs = feature_pr_mod.FeaturePrInputs(
         root_item_id=item_id, repo=github_repo, leaves=leaves,
         base_branch=resolved_base, dry_run=not live, dispositions=dispositions,
     )
     fp_run = f"featurepr-{item_id}"
     fp_engine = feature_pr_factory(
-        log_dir, inputs=fp_inputs, toolbelt=_gh_toolbelt(twig, gh),
+        log_dir, inputs=fp_inputs, toolbelt=_topology_toolbelt(twig, repo_client),
         **({"gate_handler": gate_handler} if gate_handler is not None else {}),
     )
     fp_outcome = await fp_engine.run(fp_run)
@@ -724,7 +889,8 @@ async def integrate_pipeline(
 
     return IntegrationResult(
         item_id=item_id, status=status, detail=detail,
-        github_repo=github_repo, base_branch=resolved_base,
+        github_repo=_github_repo_arg, ado_repo=_ado_repo_arg,
+        base_branch=resolved_base,
         trunk_branch=fp_result.trunk_branch,
         feature_pr_verdict=fp_result.verdict,
         feature_pr_number=fp_result.pr_number,
@@ -767,10 +933,17 @@ def _build_arg_parser():
                    help="GitHub repo identity 'Owner/Repo' for trunk topology "
                         "(ADR-0018 step 4). When set, the driver bootstraps "
                         "feature/<root> before dispatch and opens leaf PRs after "
-                        "delivery. Omit to run the legacy executor-only pipeline.")
+                        "delivery. Omit to run the legacy executor-only pipeline. "
+                        "Mutually exclusive with --ado-repo.")
+    p.add_argument("--ado-repo", default=None,
+                   help="Azure DevOps repo identity 'org/project/repo' for trunk "
+                        "topology (ADR-0024). Authenticates via the credential "
+                        "chain: explicit → ADO_PAT env → AzureCliCredential "
+                        "(operator needs `az login` once on the host). Mutually "
+                        "exclusive with --github-repo.")
     p.add_argument("--base-branch", default=None,
                    help="Override the trunk's base branch. Default: resolve the "
-                        "GitHub repo's real default branch (Q2).")
+                        "repo's real default branch via the RepoPlatform Protocol.")
     p.add_argument("--poll-interval", type=float, default=5.0)
     p.add_argument("--max-polls", type=int, default=120)
     return p
@@ -787,8 +960,13 @@ def _build_integrate_arg_parser():
     )
     p.add_argument("--item", type=int, required=True,
                    help="Root ADO work-item id (the run root).")
-    p.add_argument("--github-repo", required=True,
-                   help="GitHub repo identity 'Owner/Repo'.")
+    p.add_argument("--github-repo", default=None,
+                   help="GitHub repo identity 'Owner/Repo'. Mutually exclusive "
+                        "with --ado-repo; exactly one is required.")
+    p.add_argument("--ado-repo", default=None,
+                   help="Azure DevOps repo identity 'org/project/repo' "
+                        "(ADR-0024). Mutually exclusive with --github-repo; "
+                        "exactly one is required.")
     p.add_argument("--leaf-pr-map", type=Path, default=None,
                    help="Path to the persisted leaf-PR map "
                         "(default: <log-dir>/leaf-pr-map-<item>.json).")
@@ -828,6 +1006,7 @@ def main(argv: list[str] | None = None) -> int:
         commit=args.commit,
         live=args.live,
         github_repo=args.github_repo,
+        ado_repo=args.ado_repo,
         base_branch=args.base_branch,
         twig=TwigClient(),
         provider=default_provider(),
@@ -864,6 +1043,12 @@ def integrate_main(argv: list[str] | None = None) -> int:
     from requiem.clients.twig import TwigClient
 
     args = _build_integrate_arg_parser().parse_args(argv)
+    if args.github_repo is None and args.ado_repo is None:
+        print("must pass either --github-repo or --ado-repo")
+        return 2
+    if args.github_repo is not None and args.ado_repo is not None:
+        print("--github-repo and --ado-repo are mutually exclusive")
+        return 2
     map_path = args.leaf_pr_map or (args.log_dir / f"leaf-pr-map-{args.item}.json")
     if not Path(map_path).exists():
         print(f"leaf-PR map not found: {map_path}\n"
@@ -875,6 +1060,7 @@ def integrate_main(argv: list[str] | None = None) -> int:
         args.item,
         log_dir=args.log_dir,
         github_repo=args.github_repo,
+        ado_repo=args.ado_repo,
         leaf_pr_map_path=Path(map_path),
         base_branch=args.base_branch,
         live=args.live,

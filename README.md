@@ -211,10 +211,10 @@ Exit codes:
 **v0.0.1.** Per the
 [parity scorecard](docs/references/v0-parity-readiness.md) (Mahler-3,
 re-assessed 2026-06-09): **GO for the v0 code surface; the remaining gate
-is live Azure DevOps validation, not code.** Every one of the ten §9
-non-negotiables is built and tested — 3 ✅ at-parity, 1 🔵 better, 6 🟡
-partial (code-complete but pending live-ADO exercise), 0 ❌ missing. The
-load-bearing invariants (INV-RESTART, INV-NO-CORRUPT-FORWARD,
+is live exercise against a real ADO repo, not code.** Every one of the
+ten §9 non-negotiables is built and tested — 3 ✅ at-parity, 1 🔵 better,
+6 🟡 partial (code-complete but pending live-ADO exercise), 0 ❌ missing.
+The load-bearing invariants (INV-RESTART, INV-NO-CORRUPT-FORWARD,
 INV-EVENT-LOG-AUTHORITATIVE, INV-DISCRIMINATED-OUTCOMES,
 INV-SUBWORKFLOW-LOG-ISOLATION, INV-LOG-STRICT-STOP-ON-CORRUPTION,
 INV-CANCEL-RESUME-IDEMPOTENT) are pinned by 200+ resume-fidelity tests
@@ -228,11 +228,26 @@ read-only web dashboard + browser gate resolution + opt-in auto-resume
 isolation (ADR-0021/0022, advances #4/#5), the ADO PR lifecycle
 (ADR-0023, closes #10's ADO half), and the ADR-0013 B1/B2/B3 closures.
 
-The auth model on the live container resolves ADR-0007 Q4 (OIDC required;
-PATs not supported in the primary v0 org) by mounting the host's
-`~/.twig` / `~/.config/gh` token stores read-only into the fleet
-container; run `twig auth login` + `gh auth login` once on the host
-before bringing the container up (see `deploy/README.md`).
+**ADR-0024 (June 2026) shipped the second half of the platform story.**
+The trunk-topology workflows (`trunk_bootstrap` / `leaf_pr` /
+`feature_pr`) and the live driver (`requiem-end-to-end`) were
+GitHub-only by construction; ADR-0024 lifts the coupling into a
+`RepoPlatform` Protocol with two concrete impls (`GhClient`,
+`AdoClient`). The driver now takes `--ado-repo org/project/repo`
+alongside `--github-repo Owner/Repo` (mutually exclusive). The first
+primary v0 customer scenario — CloudVault on `dev.azure.com/microsoft`
+— is now code-ready; only the operational gate (one `az login` on the
+host + a reachable scratch ADO repo) remains.
+
+The auth model on the live container resolves ADR-0007 Q4 (OIDC
+required; PATs not supported in the primary v0 org). For the GitHub
+path: mount the host's `~/.config/gh` token store read-only into the
+fleet container (`gh auth login` once on the host). For the ADO path:
+`AdoClient` reads the standard `azure-identity` credential chain
+(default: `AzureCliCredential`, requires `az login` once on the host).
+Both paths converge on the same `~/.twig` token store for ADO work-item
+operations (separate from the repo client). See `deploy/README.md` for
+the container wiring details.
 
 ## Design inputs
 
