@@ -6,8 +6,11 @@
 #
 #   docker compose -f deploy/docker-compose.yml up --build
 #
-# Provide ADO_PAT / ANTHROPIC_API_KEY via your shell or a .env file that is
-# NEVER committed.
+# Provide ANTHROPIC_API_KEY via your shell or a .env file that is NEVER
+# committed. ADO + GitHub auth piggy-backs on the host's twig/gh token stores
+# (mounted read-only below); run `twig auth login` and `gh auth login` ONCE on
+# the host before bringing the fleet up — PATs are not supported in Daniel's
+# primary ADO org (ADR-0007 Q4).
 
 services:
   requiem-fleet:
@@ -16,8 +19,6 @@ services:
       dockerfile: deploy/Dockerfile
     image: requiem-fleet:local
     environment:
-      # Required at run time — sourced from the host env, never baked.
-      ADO_PAT: "${ADO_PAT:?set ADO_PAT in your env or .env}"
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       # Manual orchestration is enforced by the entrypoint; this only controls
       # WHERE the dispatcher runs (in-gateway), not WHETHER it auto-decomposes.
@@ -26,6 +27,11 @@ services:
     volumes:
       # Per-run homes live here; each run gets a fresh subdir (see entrypoint).
       - requiem-runs:/var/lib/requiem/runs
+      # Host token stores mounted read-only — the worker can refresh ADO/GitHub
+      # tokens against the cached refresh token but cannot mint new ones. Run
+      # `twig auth login` and `gh auth login` on the host first.
+      - "${HOME}/.twig:/root/.twig:ro"
+      - "${HOME}/.config/gh:/root/.config/gh:ro"
     # The base image supervises `gateway run` under s6; pass it as the CMD the
     # entrypoint execs into after provisioning.
     command: ["gateway", "run"]

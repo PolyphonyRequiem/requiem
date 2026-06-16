@@ -4,7 +4,10 @@ Container scaffolding for the **hermetic, requiem-managed fleet** (ADR-0017 §2)
 This is honest, operator-facing scaffolding: it shows *how* an operator brings
 the fleet up, but it has **not** been validated against a live Hermes gateway,
 real ADO credentials, or a live worker run — that is the operator's `--live`
-action in their own environment.
+action in their own environment. The auth model described below resolves
+ADR-0007 Q4 on paper; whether the host-mount path actually works inside the
+container (in particular on Docker Desktop for Windows, where `${HOME}` and
+bind-mount semantics differ) is the next live-validation step.
 
 ## The two halves (do not conflate them)
 
@@ -19,11 +22,21 @@ action in their own environment.
 
 ## Bring-up
 
+ADO and GitHub auth piggy-backs on the host's `twig` / `gh` token stores
+(mounted read-only into the container). PATs are not supported in the primary
+v0 ADO org (ADR-0007 Q4), so the credential flow is browser-based PKCE — done
+once on the host, refreshed thereafter:
+
 ```bash
-export ADO_PAT=...                # never commit this
-export ANTHROPIC_API_KEY=...      # matches each profile's config.yaml model
+twig auth login                   # ADO — interactive PKCE, stores ~/.twig/.refresh-token
+gh auth login                     # GitHub — interactive, stores ~/.config/gh/hosts.yml
+export ANTHROPIC_API_KEY=***      # matches each profile's config.yaml model
 docker compose -f deploy/docker-compose.yml up --build
 ```
+
+The container does NOT mint tokens itself; the entrypoint mounts the host's
+`~/.twig` and `~/.config/gh` directories read-only so the worker refreshes
+against the cached refresh token. There is no `ADO_PAT` env var.
 
 The entrypoint fails the container (rather than running degraded) if a profile
 distribution is missing or any profile is not in **Manual** orchestration

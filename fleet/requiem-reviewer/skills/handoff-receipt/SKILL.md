@@ -8,8 +8,10 @@ how you make a verifiable claim.
 
 ## The rule
 
-When (and only when) you have genuinely delivered the leaf — branch pushed, PR
-opened, tests run — you MUST complete the task with a structured receipt:
+When (and only when) you have genuinely finished the work your role owns —
+implementer pushed the branch, reviewer recorded a verdict, or closer drove
+the PR through its lifecycle — you MUST complete the task with a structured
+receipt:
 
 ```
 kanban_complete(metadata={ ...the receipt below... })
@@ -50,7 +52,18 @@ Evidence (optional — include every field you can actually substantiate; their
 `branch`, `commit_sha`, `pr_url`, `changed_files`, `tests_run`,
 `worker_profile_version`.
 
-A complete, contract-valid receipt looks exactly like this:
+### Which evidence fields your role should populate
+
+| Role | Populate | Omit (and why) |
+|------|----------|----------------|
+| `requiem-implementer` | `branch`, `commit_sha`, `changed_files`, `tests_run` | **`pr_url`** — you do **not** open the PR. requiem opens the leaf PR itself (with `base=feature/<root>`) once it sees your delivered branch. Claiming a `pr_url` you didn't create is fabricated evidence; opening a PR yourself targets the wrong base and duplicates requiem's. |
+| `requiem-reviewer`    | `pr_url` (the PR you reviewed) | `branch` / `commit_sha` / `changed_files` are the implementer's evidence; only populate them if your review verifies them. |
+| `requiem-closer`      | `pr_url`, `commit_sha` of the merged commit | `branch` / `changed_files` if the merge altered them. |
+
+A complete, contract-valid receipt with every field populated looks like
+this. **The per-role table above tells you which of these fields YOUR profile
+should actually emit;** the example below exercises the full schema so you can
+see the shape of every field:
 
 ```json
 {

@@ -13,10 +13,14 @@ license: "MIT"
 # passes `--model` at `hermes kanban create` time (it does not exist). The
 # operator pins the model with `hermes -p requiem-implementer model` or by
 # editing config.yaml below before install.
+# Twig and gh authenticate against AAD via interactive PKCE / device-code flows
+# the FIRST time you run them on the host (`twig auth login`, `gh auth login`).
+# Those flows mint refresh tokens stored at ~/.twig/.refresh-token and
+# ~/.config/gh/hosts.yml respectively. The container does NOT mint tokens
+# itself (no `ADO_PAT` env var — PATs are not supported in Daniel's primary
+# ADO org per ADR-0007 Q4). Instead, the host's token stores are MOUNTED
+# READ-ONLY into the container so the worker can refresh them as needed.
 env_requires:
-  - name: ADO_PAT
-    description: "Azure DevOps PAT the worker uses to push branches / open PRs"
-    required: true
   - name: ANTHROPIC_API_KEY
     description: "Model provider key (matches config.yaml model.default)"
     required: false
