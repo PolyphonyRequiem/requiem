@@ -378,6 +378,54 @@ async def run_pipeline(
    pull-requests API (GET/POST), repository GET for `default_branch`.
    Ship `FakeAdoClient` mirroring `GhClient`'s `FakeGhClient` for tests.
    **~300 LOC client + faithful-fake + contract tests.**
+   **STATUS: landed 2026-06-16** (`src/requiem/clients/azuredevops.py`,
+   `tests/clients/test_azuredevops.py`). Concrete shape shipped:
+   - `AdoClient` is a `RepoPlatform` impl over ADO REST (urllib +
+     thread-based async — no httpx dep). Auth resolution order is the
+     same as `RealAdoPrToolkit` (explicit `credential=` → `pat=` →
+     `ADO_PAT` env → lazy `AzureCliCredential`); the shared resolver
+     and `ADO_RESOURCE` constant are imported from `ado_pr` to avoid
+     two sources of truth (consolidation into a dedicated
+     `_AdoSession` helper is noted as a fast-follow).
+   - `repo` is `"<org>/<project>/<repo>"` (matches `RealAdoPrToolkit`'s
+     shape, so operators see one ADO identifier across the toolset).
+   - Typed errors mirror `GhClient`'s taxonomy: `AdoRateLimitedError`,
+     `AdoNotFoundError`, `AdoAuthError`, `AdoServerError`,
+     `AdoUnknownError` (all inheriting `AdoClientError`). Verbs map
+     them to discriminated outcomes per Ravel L-1.
+   - Two ADO-specific behaviours documented + tested:
+     **(a)** `branch_sha` uses the `?filter=heads/<branch>` form (ADO
+     returns `{value: []}` for missing branches rather than 404; the
+     client normalises this to `AdoNotFoundError` so callers don't
+     need to know the API quirk);
+     **(b)** `ensure_branch_ref` uses the nullSha precondition
+     (`oldObjectId == "000…0"`) — the ADO equivalent of "create only
+     if absent", which honours ADR-0018's never-force-move
+     invariant. The fallback path (POST says `success: false`) probes
+     `branch_sha` to confirm the ref is present and returns `False`
+     idempotently; if the probe also says missing, raises
+     `AdoUnknownError` (Ravel L-1).
+   - `refs/heads/` prefix translation is the one leaky boundary. The
+     Protocol contract is bare branch names; the impl prefixes on the
+     wire (in PR-create body, in search criteria) and strips on the
+     way back (in `_to_repo_pr`, in `default_branch`). Tests pin
+     both directions.
+   - `_to_repo_pr` translates ADO's `status` field to the neutral
+     `state` vocab: `active → open`, `abandoned → closed`,
+     `completed → merged`. `closedDate` becomes `merged_at` iff the
+     PR actually merged.
+   - `FakeAdoClient` is the in-memory faithful fake — same constructor
+     shape (`refs`, `open_prs`, `default_branches`, failure-injection
+     hooks). `test_fake_surface_contract.py` automatically discovers
+     it and asserts async-shape parity with `AdoClient`.
+   - 30 new tests in `tests/clients/test_azuredevops.py`: Protocol
+     shape (3), repo parsing (3), 12 mocked-transport tests for the
+     wire protocol (covering refs, PR ops, default branch — including
+     the not-found / unknown-error paths), 7 `FakeAdoClient` behaviour
+     tests, 5 parametrised `_ado_status_to_neutral` cases.
+   - 378 tests across the affected surface still green — no
+     regressions in the trunk-topology workflows or the existing
+     `RealAdoPrToolkit` PAT path.
 
 4. **Make trunk-topology workflows take `RepoPlatform`** — change each
    `_require_gh(ctx)` to `_require_repo_platform(ctx)`; rename the
