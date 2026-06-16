@@ -118,32 +118,118 @@ class AdoPrError(Exception):
         self.status = status
 
 
-# ---- real toolkit (Azure DevOps REST via PAT) ---------------------------
+# ---- credential abstraction ---------------------------------------------
+
+# The ADO REST resource (audience) bearer tokens must target — same audience
+# `az`, `twig`, and AzureCliCredential all request for ADO API calls. The id is
+# stable across tenants; verified against Daniel's live `twig auth status` and
+# the AzureCliCredential docs.
+ADO_RESOURCE = "499b84ac-1321-427f-aa17-267ca6975798"
+
+
+def _resolve_default_credential():
+    """Try to construct an :class:`AzureCliCredential` (the documented v0
+    default for ADO auth per ADR-0024 + ADR-0007 Q4).
+
+    Lazy-imports ``azure.identity`` so non-ADO users don't pay for the
+    dependency. Raises :class:`AdoPrError` with a clear remediation hint if
+    the package isn't installed.
+    """
+    try:
+        from azure.identity import AzureCliCredential
+    except ImportError as e:
+        raise AdoPrError(
+            "AzureCliCredential default requires the `azure-identity` "
+            "package. Install with `pip install requiem[ado]`, or pass "
+            "`pat=...` / set `ADO_PAT` for backward-compat PAT auth."
+        ) from e
+    return AzureCliCredential()
+
+
+# Sentinel marking "defer credential construction to first auth-needing call."
+# Lets us keep `azure-identity` a lazy import without forcing a try/except on
+# every Toolkit construction.
+_LazyDefault = object()
+
+
+# ---- real toolkit (Azure DevOps REST via TokenCredential or PAT) --------
 
 
 class RealAdoPrToolkit:
-    """Production ADO PR toolkit. Azure DevOps REST, PAT-authenticated.
+    """Production ADO PR toolkit. Azure DevOps REST.
 
-    ``repo`` is ``"<organization>/<project>/<repository>"``. The PAT is read from
-    ``ADO_PAT`` (Basic auth, empty username). Every method maps a non-2xx to
-    :class:`AdoPrError`; the verbs translate those to Outcomes — this wrapper
-    never swallows errors.
+    ``repo`` is ``"<organization>/<project>/<repository>"``.
 
-    NOTE: live execution requires a real ``ADO_PAT`` + reachable org/project; that
-    is a deploy-time concern. The unit suite exercises the workflow via
+    **Auth (per ADR-0007 Q4 + ADR-0024):** the v0 default is OIDC via an
+    :class:`azure.identity.TokenCredential` (typically
+    :class:`AzureCliCredential` — the user authenticates once with
+    ``az login`` and tokens are refreshed transparently). PAT auth via
+    ``ADO_PAT`` remains supported as a backward-compat fallback for
+    locked-down runners that cannot run ``az login``; PATs are NOT
+    supported in the primary v0 ADO org and should not be the default.
+
+    **Credential resolution order** (first non-empty wins):
+
+    1. an explicit ``credential=`` argument (any
+       :class:`azure.identity.TokenCredential`);
+    2. an explicit ``pat=`` argument;
+    3. the ``ADO_PAT`` env var (legacy);
+    4. :class:`AzureCliCredential` from ``azure-identity``.
+
+    Every method maps a non-2xx to :class:`AdoPrError`; the verbs translate
+    those to Outcomes — this wrapper never swallows errors.
+
+    NOTE: live execution requires either an authenticated ``az login`` (for
+    OIDC) or a real ``ADO_PAT`` + reachable org/project; that is a
+    deploy-time concern. The unit suite exercises the workflow via
     :class:`FakeAdoPrToolkit`.
     """
 
     API_VERSION = "7.1"
 
-    def __init__(self, *, pat: str | None = None, base_url: str | None = None) -> None:
-        self._pat = pat or os.environ.get("ADO_PAT", "")
+    def __init__(
+        self,
+        *,
+        credential: Any | None = None,           # azure.identity.TokenCredential
+        pat: str | None = None,
+        base_url: str | None = None,
+    ) -> None:
+        # Capture explicit args; defer AzureCliCredential() construction until
+        # we know we'll actually need it (lazy-import path in
+        # _resolve_default_credential).
+        env_pat = os.environ.get("ADO_PAT", "")
+        if credential is not None:
+            self._credential: Any | None = credential
+            self._pat: str = ""
+        elif pat is not None and pat != "":
+            self._credential = None
+            self._pat = pat
+        elif env_pat:
+            self._credential = None
+            self._pat = env_pat
+        else:
+            # Lazy default: defer to first call so import-time of this module
+            # never requires azure-identity. _auth_header() resolves it.
+            self._credential = _LazyDefault
+            self._pat = ""
         # https://dev.azure.com by default; on-prem ADO Server overrides base_url.
         self._base = (base_url or "https://dev.azure.com").rstrip("/")
 
-    def _auth_header(self) -> str:
-        token = base64.b64encode(f":{self._pat}".encode()).decode("ascii")
-        return f"Basic {token}"
+    async def _auth_header(self) -> str:
+        """Resolve to either a Bearer or Basic header, depending on which
+        credential surface is active. Async so we can call
+        ``credential.get_token`` without blocking the event loop.
+        """
+        if self._credential is _LazyDefault:
+            self._credential = _resolve_default_credential()
+        if self._credential is not None:
+            # TokenCredential.get_token is a sync call inside azure-identity;
+            # run it on a thread to keep the event loop unblocked.
+            token = await _to_thread(self._credential.get_token, ADO_RESOURCE)
+            return f"Bearer {token.token}"
+        # PAT path: Basic auth, empty username.
+        encoded = base64.b64encode(f":{self._pat}".encode()).decode("ascii")
+        return f"Basic {encoded}"
 
     def _split_repo(self, repo: str) -> tuple[str, str, str]:
         parts = repo.split("/")
@@ -163,7 +249,7 @@ class RealAdoPrToolkit:
 
         data = json.dumps(body).encode("utf-8") if body is not None else None
         req = urllib.request.Request(url, data=data, method=method)
-        req.add_header("Authorization", self._auth_header())
+        req.add_header("Authorization", await self._auth_header())
         req.add_header("Accept", "application/json")
         if data is not None:
             req.add_header("Content-Type", "application/json")
