@@ -12,7 +12,6 @@
 
 ```powershell
 pip install -e .[cli]
-<<<<<<< HEAD
 
 # Pick a run id (any short string), then run the bundled demo:
 requiem run requiem.workflows.code_review_demo --run-id demo1
@@ -46,22 +45,6 @@ requiem run requiem.workflows.code_review_demo --interactive
 
 # Inspect the workflow's topology:
 requiem describe requiem.workflows.code_review_demo
-```
-
-### CLI reference
-=======
-requiem run requiem.workflows.code_review_demo
-```
-
-A run will end with:
-
-```
-─── Verdict ─────────────────────────────────────────────────────────
-  🚫 Don't merge
-      Top finding:  unhandled ValueError on int(x)
-      Rationale:    1 blocking + 1 warn; correctness reviewer's unhandled ValueError must be fixed before merge.
-  → summary: .runs/<run-id>.summary.md
-─────────────────────────────────────────────────────────────────────
 ```
 
 ## What is Requiem?
@@ -153,6 +136,8 @@ where each node is one of:
 - a **team** (N agents running in parallel — adversarial reviewers,
   multi-perspective planners, anything),
 - a **gate** (pause and ask a human),
+- a **sub-workflow** (invoke another workflow as a node; child gets its
+  own isolated event log per INV-SUBWORKFLOW-LOG-ISOLATION),
 - a **terminate** (end the run with a disposition).
 
 You wire those with edges keyed on outcomes: `on="success"`,
@@ -160,8 +145,14 @@ You wire those with edges keyed on outcomes: `on="success"`,
 retries, parallel fan-out, gate suspension, durable resume, and rendering.
 
 Workflows live in your own repo or in `requiem.workflows.*`. The demo
-under `requiem.workflows.code_review_demo` is the canonical example —
-read it before writing your first one.
+under `requiem.workflows.code_review_demo` is the canonical small example;
+`requiem.workflows.planning` / `requiem.workflows.kanban_executor` /
+`requiem.workflows.feature_pr` are the production-scale ones. The live
+end-to-end driver is `python -m requiem.end_to_end --item <ado-id> --board
+requiem-<id> [--commit] [--live]`; it chains planning → `commit_plan` →
+`trunk_bootstrap` → `kanban_executor` → `leaf_pr` → `feature_pr` per
+ADR-0018 Option C (requiem owns the integration trunk because
+`hermes kanban create` has `--branch` but no `--base` flag).
 
 ## Where do I write my own workflows?
 
@@ -190,7 +181,6 @@ For the architecture, invariants, and decision provenance:
 - `src/requiem/` — the engine itself. Eight modules, ~2 KLOC.
 
 ## CLI reference
->>>>>>> origin/main
 
 | Command | What it does |
 |---|---|
@@ -218,13 +208,31 @@ Exit codes:
 
 ## Status
 
-**v0.0.1.** Phase A — engine integration — is closed. Phase B (real
-workflows, real UI binding, real harness) is in flight. The demo
-workflow runs end-to-end with no external dependencies; agents are
-scripted via `FakeProvider` so the demo is reproducible and key-free.
-Real LLM providers ship in Phase B.
+**v0.0.1.** Per the
+[parity scorecard](docs/references/v0-parity-readiness.md) (Mahler-3,
+re-assessed 2026-06-09): **GO for the v0 code surface; the remaining gate
+is live Azure DevOps validation, not code.** Every one of the ten §9
+non-negotiables is built and tested — 3 ✅ at-parity, 1 🔵 better, 6 🟡
+partial (code-complete but pending live-ADO exercise), 0 ❌ missing. The
+load-bearing invariants (INV-RESTART, INV-NO-CORRUPT-FORWARD,
+INV-EVENT-LOG-AUTHORITATIVE, INV-DISCRIMINATED-OUTCOMES,
+INV-SUBWORKFLOW-LOG-ISOLATION, INV-LOG-STRICT-STOP-ON-CORRUPTION,
+INV-CANCEL-RESUME-IDEMPOTENT) are pinned by 200+ resume-fidelity tests
+across the 14-class crash-point matrix.
 
-Eight test modules; the heaviest is `test_integration_code_review.py`, which promotes the four walking-skeleton scenarios and adds an end-to-end INV-RESTART assertion (truncate the log mid-workflow, prove resume picks up exactly where the engine left off without re-executing committed nodes).
+What landed between the original NO-GO audit and "code complete" (PRs
+#61–#75): full ADR-0018 trunk topology (`trunk_bootstrap` / `leaf_pr` /
+`feature_pr` + driver wiring), the requirement-disposition gate, the
+read-only web dashboard + browser gate resolution + opt-in auto-resume
+(closes #8), in-process fan-out orchestrator + per-item worktree
+isolation (ADR-0021/0022, advances #4/#5), the ADO PR lifecycle
+(ADR-0023, closes #10's ADO half), and the ADR-0013 B1/B2/B3 closures.
+
+The auth model on the live container resolves ADR-0007 Q4 (OIDC required;
+PATs not supported in the primary v0 org) by mounting the host's
+`~/.twig` / `~/.config/gh` token stores read-only into the fleet
+container; run `twig auth login` + `gh auth login` once on the host
+before bringing the container up (see `deploy/README.md`).
 
 ## Design inputs
 
@@ -283,4 +291,4 @@ to an operator rather than silently retry.
 
 ## License
 
-TBD. Likely MIT, matching polyphony, conductor, and platespinner.
+MIT, matching polyphony, conductor, and platespinner.
