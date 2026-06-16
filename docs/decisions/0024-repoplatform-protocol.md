@@ -338,6 +338,39 @@ async def run_pipeline(
    (no behaviour change; only typing). Move `pr_search` to the
    `head=…, base=…` kwargs API; existing GitHub callers update in
    lockstep. **~100 LOC + protocol-shape tests.**
+   **STATUS: landed 2026-06-16** (`src/requiem/clients/repo.py`,
+   updated `src/requiem/clients/gh.py`, `tests/clients/test_repo_platform.py`).
+   Concrete shape shipped:
+   - New `RepoPullRequest` dataclass (`number/title/state/merged_at/
+     head/base/url/raw`); `state` typed `Literal["open","closed","merged"]`
+     normalised in `__post_init__` (legacy uppercase tolerated for
+     back-compat); `.merged` is a derived property.
+   - `GhPullRequest = RepoPullRequest` alias preserves every existing
+     import path. A constructor shim silently drops the legacy
+     `merged=` kwarg so the 20+ existing `GhPullRequest(state="OPEN",
+     merged=False, ...)` call sites keep working without per-site edits.
+   - Six-method `RepoPlatform` Protocol (`@runtime_checkable`):
+     `branch_sha`, `ensure_branch_ref`, `find_open_pr_for_branch`,
+     `pr_view`, `pr_create`, `default_branch`. Decision pivot from the
+     ADR's original draft: instead of *renaming* `pr_search` to take
+     `head=/base=` kwargs (breaking close_out's free-form
+     `"in:body AB#<id>"` query), we keep `pr_search` as a GitHub-only
+     method on `GhClient` AND add `find_open_pr_for_branch(repo, *,
+     head, limit)` as the Protocol-surface method the trunk-topology
+     workflows call. Same end state, zero breaking change to close_out.
+   - `GhClient` grew two methods to satisfy the Protocol:
+     `find_open_pr_for_branch` (thin wrapper around `pr_search`
+     translating to `"head:<head> state:open"`); `default_branch`
+     (reads `default_branch` field from `gh api repos/<repo>`,
+     raises `GhUnknownError` per Ravel L-1 if missing — used by
+     `end_to_end._resolve_base_branch`).
+   - Tests: 11 new `test_repo_platform.py` covering Protocol shape +
+     `RepoPullRequest` normalisation; 3 new `test_gh.py` for
+     `find_open_pr_for_branch` + `default_branch` (happy + missing
+     field). 345 tests across the affected surface still green
+     including the previously-mismatched `test_close_out_workflow.py
+     ::test_pr_not_merged_raises_needs_human_immediately` (now asserts
+     `state=="open"` instead of `"OPEN"`).
 
 3. **Build `AdoClient`** in `src/requiem/clients/azuredevops.py`
    implementing `RepoPlatform` against ADO REST. Refs API (PUT

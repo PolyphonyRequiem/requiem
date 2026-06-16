@@ -55,7 +55,7 @@ import asyncio
 import json
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field  # noqa: F401  (back-compat re-export)
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Final
@@ -64,23 +64,14 @@ from typing import Any, Final
 # ---- typed value object ------------------------------------------------
 
 
-@dataclass(frozen=True, slots=True)
-class GhPullRequest:
-    """Subset of `gh pr view --json ...` that downstream verbs actually need.
+from requiem.clients.repo import RepoPlatform, RepoPullRequest  # noqa: F401  (RepoPlatform re-exported for callers that want to type-annotate GhClient at the Protocol)
 
-    `raw` carries the original dict so verbs that want a field we forgot
-    to surface have an escape hatch — but the canonical shape is the
-    named attributes. New named fields require a `_PR_FIELDS` addition.
-    """
-    number: int
-    title: str
-    state: str                # OPEN | CLOSED | MERGED  (gh's vocabulary)
-    merged: bool
-    merged_at: datetime | None
-    head: str
-    base: str
-    url: str
-    raw: dict[str, Any] = field(default_factory=dict)
+
+# Back-compat alias — older code expected ``GhClient.pr_view`` to return a
+# ``GhPullRequest``. The platform-neutral ``RepoPullRequest`` (ADR-0024) has
+# the same field set, so the alias preserves source compatibility without a
+# rename across the codebase. New code should reach for ``RepoPullRequest``.
+GhPullRequest = RepoPullRequest
 
 
 # ---- typed errors ------------------------------------------------------
@@ -300,13 +291,22 @@ def _parse_merged_at(value: Any) -> datetime | None:
     return dt
 
 
+_GH_STATE_TO_NEUTRAL = {
+    "OPEN": "open",
+    "CLOSED": "closed",
+    "MERGED": "merged",
+}
+
+
 def _to_pr(payload: dict[str, Any]) -> GhPullRequest:
-    state = str(payload.get("state", ""))
+    raw_state = str(payload.get("state", "")).upper()
+    # Normalise to ADR-0024's neutral vocabulary so the platform-neutral
+    # RepoPullRequest contract holds across both GH and ADO impls.
+    neutral_state = _GH_STATE_TO_NEUTRAL.get(raw_state, "open")
     return GhPullRequest(
         number=int(payload.get("number", 0)),
         title=str(payload.get("title", "")),
-        state=state,
-        merged=state.upper() == "MERGED",
+        state=neutral_state,
         merged_at=_parse_merged_at(payload.get("mergedAt")),
         head=str(payload.get("headRefName", "")),
         base=str(payload.get("baseRefName", "")),
@@ -378,6 +378,47 @@ class GhClient:
                 exit_code=0, stderr=stdout[:512], argv=argv,
             )
         return [_to_pr(item) for item in payload]
+
+    # ---- RepoPlatform Protocol surface (ADR-0024) ----
+    #
+    # These are the trunk-topology methods the platform-agnostic workflows
+    # call. ``pr_view`` / ``pr_create`` / ``branch_sha`` / ``ensure_branch_ref``
+    # are already shape-compatible above; this section adds the two methods
+    # the Protocol requires that GhClient didn't ship yet
+    # (``find_open_pr_for_branch`` and ``default_branch``).
+
+    async def find_open_pr_for_branch(
+        self, repo: str, *, head: str, limit: int = 30
+    ) -> list[GhPullRequest]:
+        """Find open PRs whose source branch is ``head``.
+
+        Translates to ``gh pr list --search "head:<head> state:open"``.
+        Bare branch names only — GitHub's search index doesn't accept
+        ``refs/heads/`` prefixes. Mirrors the ADR-0024 contract.
+        """
+        return await self.pr_search(
+            repo, query=f"head:{head} state:open", limit=limit
+        )
+
+    async def default_branch(self, repo: str) -> str:
+        """Resolve the repo's default branch via ``gh api repos/<repo>``.
+
+        Returns the bare branch name (no ``refs/heads/`` prefix). Raises
+        :class:`GhNotFoundError` if the repo doesn't exist;
+        :class:`GhUnknownError` if the API returns a payload without a
+        ``default_branch`` field (forbidden but worth defending — Ravel L-1
+        says "unknown shape is NeedsHuman, not RetryableFailure").
+        """
+        payload = await self.api(f"repos/{repo}")
+        branch = payload.get("default_branch")
+        if not isinstance(branch, str) or not branch:
+            raise GhUnknownError(
+                f"gh api repos/{repo}: missing or empty default_branch field",
+                exit_code=0,
+                stderr=str(payload)[:512],
+                argv=(self._binary, "api", f"repos/{repo}"),
+            )
+        return branch
 
     async def api(
         self,

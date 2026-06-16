@@ -388,7 +388,7 @@ async def test_pr_not_merged_raises_needs_human_immediately(tmp_path: Path):
     gates = [e for e in events if e["kind"] == "gate_opened"]
     assert any(
         g["node_id"] == "fetch_pr"
-        and g["payload"]["context"].get("state") == "OPEN"
+        and g["payload"]["context"].get("state") == "open"
         for g in gates
     )
 

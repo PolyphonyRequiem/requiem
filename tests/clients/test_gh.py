@@ -105,7 +105,7 @@ def test_pr_view_happy_path_parses_all_fields() -> None:
     assert isinstance(pr, GhPullRequest)
     assert pr.number == 13
     assert pr.title.startswith("Promote")
-    assert pr.state == "MERGED"
+    assert pr.state == "merged"
     assert pr.merged is True
     assert pr.merged_at == datetime(2026, 6, 1, 4, 34, 17, tzinfo=timezone.utc)
     assert pr.head == "promote/engine-v0"
@@ -127,7 +127,7 @@ def test_pr_view_open_pr_is_not_merged() -> None:
     p, _ = _patch_subprocess(stdout=json.dumps(payload))
     with p:
         pr = asyncio.run(GhClient().pr_view("repo/x", 1))
-    assert pr.state == "OPEN"
+    assert pr.state == "open"
     assert pr.merged is False
     assert pr.merged_at is None
 
@@ -156,6 +156,56 @@ def test_pr_search_empty_list_is_a_valid_result() -> None:
 def test_pr_search_rejects_zero_limit() -> None:
     with pytest.raises(ValueError):
         asyncio.run(GhClient().pr_search("repo/x", "q", limit=0))
+
+
+# ---- RepoPlatform additions (ADR-0024 step 2) ---------------------------
+
+
+def test_find_open_pr_for_branch_translates_to_pr_list_search() -> None:
+    """find_open_pr_for_branch is the RepoPlatform wrapper around pr_search.
+    GitHub: turns ``head=feature/x`` into ``--search "head:feature/x state:open"``.
+    """
+    payloads = [_pr_payload(number=42, state="OPEN")]
+    p, calls = _patch_subprocess(stdout=json.dumps(payloads))
+    with p:
+        prs = asyncio.run(
+            GhClient().find_open_pr_for_branch(
+                "repo/x", head="feature/widget", limit=10
+            )
+        )
+    assert [pr.number for pr in prs] == [42]
+    argv = calls[0]["argv"]
+    assert "--search" in argv
+    # The query gets stitched together as one positional argv element.
+    assert any("head:feature/widget" in a and "state:open" in a for a in argv), (
+        f"expected head:feature/widget state:open in argv, got {argv}"
+    )
+    assert "--limit" in argv and "10" in argv
+
+
+def test_default_branch_reads_from_repos_api() -> None:
+    """default_branch resolves via ``gh api repos/<repo>`` and pulls the
+    ``default_branch`` field — used by end_to_end to discover whether the
+    trunk integrates back into main/master/develop."""
+    payload = {"default_branch": "master", "id": 1234, "name": "x"}
+    p, calls = _patch_subprocess(stdout=json.dumps(payload))
+    with p:
+        branch = asyncio.run(GhClient().default_branch("acme/widgets"))
+    assert branch == "master"
+    argv = calls[0]["argv"]
+    assert "api" in argv and "repos/acme/widgets" in argv
+
+
+def test_default_branch_raises_on_missing_field() -> None:
+    """Per Ravel L-1: an unknown shape from gh is NeedsHuman, not silent
+    retry. If the API payload lacks default_branch (forbidden but worth
+    defending), raise GhUnknownError rather than returning empty string."""
+    from requiem.clients.gh import GhUnknownError
+    payload = {"id": 1234, "name": "x"}  # default_branch missing
+    p, _ = _patch_subprocess(stdout=json.dumps(payload))
+    with p:
+        with pytest.raises(GhUnknownError):
+            asyncio.run(GhClient().default_branch("acme/widgets"))
 
 
 def test_api_get_returns_parsed_dict() -> None:
