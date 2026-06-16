@@ -433,6 +433,51 @@ async def run_pipeline(
    `repo: RepoPlatform | None`; existing `gh: GhClient | None` field
    remains for callers that want GitHub-specific behaviour. **~50 LOC
    per workflow + a few new tests per workflow.**
+   **STATUS: landed 2026-06-16** (`src/requiem/toolbelt.py`,
+   `src/requiem/workflows/{trunk_bootstrap,leaf_pr,feature_pr}.py`,
+   `tests/test_trunk_topology_against_ado.py`). Concrete shape shipped:
+   - `Toolbelt` grew `repo: RepoPlatform | None = None`; `Toolbelt.real()`
+     constructs one `GhClient` and assigns it to BOTH `gh` and `repo`
+     (GhClient IS a RepoPlatform — single instance, two type-narrowed
+     references).
+   - Each of the three trunk-topology workflows
+     (`trunk_bootstrap`, `leaf_pr`, `feature_pr`) renamed its
+     `_require_gh(ctx)` helper to `_require_repo_platform(ctx)`. New
+     resolution order: `ctx.toolbelt.repo or ctx.toolbelt.gh`. **Back-compat
+     property:** wiring that only sets `toolbelt.gh` still works — proven
+     by a dedicated test (`test_back_compat_gh_only_still_works`).
+   - All `await gh.X(...)` callsites in the three workflows refit to
+     `await repo_client.X(...)`. The single API change: `pr_search(repo,
+     query, limit)` → `find_open_pr_for_branch(repo, *, head, limit)` per
+     step 2's pivot.
+   - Platform-agnostic exception handling via `_REPO_NOT_FOUND_ERRORS` /
+     `_REPO_CLIENT_ERRORS` tuples covering both `(GhNotFoundError,
+     AdoNotFoundError)` and `(GhClientError, AdoClientError)`. Each
+     workflow defines its own tuple at module top — small duplication
+     vs introducing a Protocol-level error hierarchy (which would be a
+     separate ADR's worth of design).
+   - error_kind strings renamed `gh.* → repo.*` (`gh.base_sha_failed`
+     → `repo.base_sha_failed`, etc.). Grep-confirmed nothing in tree
+     pinned the old names — these were emitted-only.
+   - **Test fakes refit in five places** to add `find_open_pr_for_branch`
+     alongside the legacy `pr_search`: `_DemoGhClient` in `leaf_pr.py` +
+     `feature_pr.py`, `FakeGh` in `tests/test_leaf_pr_workflow.py` +
+     `tests/test_feature_pr_workflow.py`. Both methods coexist so any
+     remaining `pr_search`-shaped callers in non-trunk workflows
+     (close_out, implementation, plan_pr) keep working unchanged.
+   - **New `tests/test_trunk_topology_against_ado.py`** (8 tests) is
+     the load-bearing proof step 4 actually unblocks the ADO path: each
+     of the three workflows runs end-to-end against `FakeAdoClient`
+     via `toolbelt.repo` with `toolbelt.gh=None`. Trunk creation,
+     idempotent re-run, fail-closed-on-missing-base, leaf-PR creation,
+     leaf-PR idempotent reuse, feature-PR open-after-leaves-merged,
+     fail-closed when neither client is set, and the back-compat
+     `gh-only` fallback path are all individually pinned.
+   - 437 tests (3 skipped) across the affected surface still green —
+     no regressions in close_out, pr_lifecycle, implementation,
+     plan_pr, kanban_executor, commit_plan, or any of the contract
+     suites. Step 5 (driver wiring) is now the last remaining piece;
+     after it, `requiem-end-to-end --ado-repo ...` becomes live-runnable.
 
 5. **Driver wiring** — split `github_repo` into the two-arg shape
    above; both go through the same `_resolve_base_branch` helper which

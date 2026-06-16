@@ -57,11 +57,24 @@ from pathlib import Path
 from typing import Literal
 
 from requiem import branch_model
+from requiem.clients.azuredevops import AdoClientError, AdoNotFoundError
 from requiem.clients.gh import GhClientError, GhNotFoundError
 from requiem.dsl import AgentRegistry, VerbRegistry, Workflow, WorkflowBuilder
 from requiem.kernel import Engine
 from requiem.outcomes import PermanentFailure, Success
 from requiem.toolbelt import FakeFileClient, RealGitClient, Toolbelt
+
+# ADR-0024 step 4: the trunk-topology workflows are platform-neutral via
+# the RepoPlatform Protocol; the only place that still differs is the
+# error taxonomy (GhClient raises Gh* errors, AdoClient raises Ado* errors).
+# Tuples that the workflow except-clauses unify over so we don't have to
+# special-case one platform.
+_REPO_NOT_FOUND_ERRORS: tuple[type[Exception], ...] = (
+    GhNotFoundError, AdoNotFoundError,
+)
+_REPO_CLIENT_ERRORS: tuple[type[Exception], ...] = (
+    GhClientError, AdoClientError,
+)
 
 # ---- error kinds --------------------------------------------------------
 
@@ -137,14 +150,20 @@ def build_verb_registry(inputs: TrunkBootstrapInputs) -> VerbRegistry:
     verbs = VerbRegistry()
     trunk = inputs.trunk_branch
 
-    def _require_gh(ctx):
-        gh = ctx.toolbelt.gh
-        if gh is None:
+    def _require_repo_platform(ctx):
+        # ADR-0024: workflows prefer the platform-neutral toolbelt.repo;
+        # fall back to toolbelt.gh so older callers that haven't migrated
+        # keep working (GhClient IS a RepoPlatform).
+        repo_client = ctx.toolbelt.repo or ctx.toolbelt.gh
+        if repo_client is None:
             return PermanentFailure(
                 error_kind="toolbelt.missing_client",
-                message="trunk_bootstrap workflow requires toolbelt.gh",
+                message=(
+                    "trunk_bootstrap workflow requires a RepoPlatform "
+                    "(set toolbelt.repo, or toolbelt.gh for back-compat)"
+                ),
             )
-        return gh
+        return repo_client
 
     @verbs.register("start_run")
     def _start(ctx):
@@ -159,16 +178,16 @@ def build_verb_registry(inputs: TrunkBootstrapInputs) -> VerbRegistry:
 
     @verbs.register("ensure_trunk")
     async def _ensure(ctx):
-        gh = _require_gh(ctx)
-        if isinstance(gh, PermanentFailure):
-            return gh
+        repo_client = _require_repo_platform(ctx)
+        if isinstance(repo_client, PermanentFailure):
+            return repo_client
 
         # The base SHA is needed in every mode: it is the source for a real
         # create and the "would create from" report in dry-run. A missing base
         # is fail-closed — there is nothing to branch from.
         try:
-            base_sha = await gh.branch_sha(inputs.repo, inputs.base_branch)
-        except GhNotFoundError as e:
+            base_sha = await repo_client.branch_sha(inputs.repo, inputs.base_branch)
+        except _REPO_NOT_FOUND_ERRORS as e:
             return PermanentFailure(
                 error_kind=EK_BASE_MISSING,
                 message=(
@@ -177,24 +196,24 @@ def build_verb_registry(inputs: TrunkBootstrapInputs) -> VerbRegistry:
                 ),
                 details={"base_branch": inputs.base_branch, "error": str(e)},
             )
-        except GhClientError as e:
+        except _REPO_CLIENT_ERRORS as e:
             return PermanentFailure(
-                error_kind="gh.base_sha_failed",
-                message=f"gh api (base sha) failed: {e}",
+                error_kind="repo.base_sha_failed",
+                message=f"repo client (base sha) failed: {e}",
                 details={"base_branch": inputs.base_branch, "error": str(e)},
             )
 
         if inputs.dry_run:
             # Read-only probe: does the trunk already exist?
             try:
-                await gh.branch_sha(inputs.repo, trunk)
+                await repo_client.branch_sha(inputs.repo, trunk)
                 exists = True
-            except GhNotFoundError:
+            except _REPO_NOT_FOUND_ERRORS:
                 exists = False
-            except GhClientError as e:
+            except _REPO_CLIENT_ERRORS as e:
                 return PermanentFailure(
-                    error_kind="gh.trunk_probe_failed",
-                    message=f"gh api (trunk probe) failed: {e}",
+                    error_kind="repo.trunk_probe_failed",
+                    message=f"repo client (trunk probe) failed: {e}",
                     details={"trunk": trunk, "error": str(e)},
                 )
             return Success(value={
@@ -204,11 +223,11 @@ def build_verb_registry(inputs: TrunkBootstrapInputs) -> VerbRegistry:
             })
 
         try:
-            created = await gh.ensure_branch_ref(inputs.repo, trunk, base_sha)
-        except GhClientError as e:
+            created = await repo_client.ensure_branch_ref(inputs.repo, trunk, base_sha)
+        except _REPO_CLIENT_ERRORS as e:
             return PermanentFailure(
-                error_kind="gh.ensure_ref_failed",
-                message=f"gh api (ensure ref) failed: {e}",
+                error_kind="repo.ensure_ref_failed",
+                message=f"repo client (ensure ref) failed: {e}",
                 details={"trunk": trunk, "base_sha": base_sha, "error": str(e)},
             )
         return Success(

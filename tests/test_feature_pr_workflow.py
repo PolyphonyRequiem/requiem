@@ -51,6 +51,14 @@ class FakeGh:
             raise self.raise_on_search
         return list(self.open_prs)
 
+    async def find_open_pr_for_branch(
+        self, repo: str, *, head: str, limit: int = 30
+    ):
+        # ADR-0024 step 4 RepoPlatform method — filter open_prs by head.
+        if self.raise_on_search is not None:
+            raise self.raise_on_search
+        return [pr for pr in self.open_prs if pr.head == head][:limit]
+
     async def pr_create(self, repo: str, *, title: str, body: str, head: str, base: str):
         if self.raise_on_create is not None:
             raise self.raise_on_create

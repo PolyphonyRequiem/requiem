@@ -18,6 +18,7 @@ from typing import Protocol
 from requiem.clients.fs import FilesystemClient
 from requiem.clients.gh import GhClient
 from requiem.clients.kanban import KanbanClient
+from requiem.clients.repo import RepoPlatform
 from requiem.clients.twig import TwigClient
 
 
@@ -128,16 +129,27 @@ class Toolbelt:
     # ``None`` should raise a typed ``PermanentFailure(error_kind=
     # "toolbelt.missing_client")`` rather than ``AttributeError``).
     gh: GhClient | None = None
+    # Platform-neutral repo client (ADR-0024). When both ``gh`` and
+    # ``repo`` are set, ``repo`` wins for trunk-topology workflows
+    # (trunk_bootstrap / leaf_pr / feature_pr); ``gh`` remains for
+    # callers that want GitHub-specific behaviour (``pr_search`` with
+    # arbitrary search syntax, the low-level ``api`` escape hatch).
+    # When ``repo`` is unset but ``gh`` is set, the trunk-topology
+    # workflows fall back to ``gh`` (GhClient IS a RepoPlatform), so
+    # existing wiring keeps working with zero edits.
+    repo: RepoPlatform | None = None
     fs: FilesystemClient | None = None
     twig: TwigClient | None = None
     kanban: KanbanClient | None = None
 
     @classmethod
     def real(cls) -> "Toolbelt":
+        gh = GhClient()
         return cls(
             git=RealGitClient(),
             files=RealFileClient(),
-            gh=GhClient(),
+            gh=gh,
+            repo=gh,           # GhClient IS a RepoPlatform; share the instance
             fs=FilesystemClient(),
             twig=TwigClient(),
             kanban=KanbanClient(),

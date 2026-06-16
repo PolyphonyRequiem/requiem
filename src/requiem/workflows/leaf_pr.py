@@ -61,12 +61,19 @@ from pathlib import Path
 from typing import Any, Literal
 
 from requiem import branch_model
+from requiem.clients.azuredevops import AdoClientError
 from requiem.clients.gh import GhClientError, GhPullRequest
 from requiem.dsl import AgentRegistry, VerbRegistry, Workflow, WorkflowBuilder
 from requiem.kernel import Engine
 from requiem.outcomes import NeedsHuman, PermanentFailure, Success
 from requiem.toolbelt import FakeFileClient, RealGitClient, Toolbelt
 from requiem.workflows.feature_pr import LeafPr  # the hand-off element type
+
+# ADR-0024 step 4: a tuple covering both platforms' typed client errors.
+# Lets the workflow except-clauses stay platform-agnostic.
+_REPO_CLIENT_ERRORS: tuple[type[Exception], ...] = (
+    GhClientError, AdoClientError,
+)
 
 # ---- error kinds --------------------------------------------------------
 
@@ -139,6 +146,14 @@ class _DemoGhClient:
             raise self.raise_on_search
         return list(self.open_prs)
 
+    async def find_open_pr_for_branch(
+        self, repo: str, *, head: str, limit: int = 30
+    ):
+        # ADR-0024 step 4 RepoPlatform method — filter open_prs by head.
+        if self.raise_on_search is not None:
+            raise self.raise_on_search
+        return [pr for pr in self.open_prs if pr.head == head][:limit]
+
     async def pr_create(self, repo: str, *, title: str, body: str, head: str, base: str):
         if self.raise_on_create is not None:
             raise self.raise_on_create
@@ -161,14 +176,18 @@ def build_verb_registry(inputs: LeafPrInputs) -> VerbRegistry:
     verbs = VerbRegistry()
     trunk = inputs.trunk_branch
 
-    def _require_gh(ctx):
-        gh = ctx.toolbelt.gh
-        if gh is None:
+    def _require_repo_platform(ctx):
+        # ADR-0024: prefer toolbelt.repo; fall back to toolbelt.gh.
+        repo_client = ctx.toolbelt.repo or ctx.toolbelt.gh
+        if repo_client is None:
             return PermanentFailure(
                 error_kind="toolbelt.missing_client",
-                message="leaf_pr workflow requires toolbelt.gh",
+                message=(
+                    "leaf_pr workflow requires a RepoPlatform "
+                    "(set toolbelt.repo, or toolbelt.gh for back-compat)"
+                ),
             )
-        return gh
+        return repo_client
 
     # ---- start --------------------------------------------------------
 
@@ -196,9 +215,9 @@ def build_verb_registry(inputs: LeafPrInputs) -> VerbRegistry:
                 ),
                 details={"root_item_id": inputs.root_item_id, "trunk": trunk},
             )
-        gh = _require_gh(ctx)
-        if isinstance(gh, PermanentFailure):
-            return gh
+        repo_client = _require_repo_platform(ctx)
+        if isinstance(repo_client, PermanentFailure):
+            return repo_client
 
         # Pass 1 — classify each leaf against the open-PR set (read-only). We
         # gather every conflict first so a single bad leaf fails the whole set
@@ -209,13 +228,13 @@ def build_verb_registry(inputs: LeafPrInputs) -> VerbRegistry:
         for leaf_id in inputs.leaf_ids:
             want_head = inputs.impl_branch_for(leaf_id)
             try:
-                results = await gh.pr_search(
-                    inputs.repo, query=f"head:{want_head} state:open", limit=5,
+                results = await repo_client.find_open_pr_for_branch(
+                    inputs.repo, head=want_head, limit=5,
                 )
-            except GhClientError as e:
+            except _REPO_CLIENT_ERRORS as e:
                 return PermanentFailure(
                     error_kind="pr.search_failed",
-                    message=f"gh pr list failed for {want_head}: {e}",
+                    message=f"repo client pr search failed for {want_head}: {e}",
                     details={"leaf_id": leaf_id, "head": want_head, "error": str(e)},
                 )
             matches = [pr for pr in results if pr.head == want_head]
@@ -264,13 +283,13 @@ def build_verb_registry(inputs: LeafPrInputs) -> VerbRegistry:
                     f"`{trunk}` integration trunk.\n"
                 )
                 try:
-                    pr = await gh.pr_create(
+                    pr = await repo_client.pr_create(
                         inputs.repo, title=title, body=body, head=want_head, base=trunk,
                     )
-                except GhClientError as e:
+                except _REPO_CLIENT_ERRORS as e:
                     return PermanentFailure(
                         error_kind="pr.create_failed",
-                        message=f"gh pr create failed for {want_head}: {e}",
+                        message=f"repo client pr create failed for {want_head}: {e}",
                         details={"leaf_id": leaf_id, "head": want_head, "base": trunk,
                                  "error": str(e)},
                     )
