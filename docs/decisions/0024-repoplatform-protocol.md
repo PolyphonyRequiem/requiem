@@ -1,7 +1,7 @@
 # ADR 0024 — RepoPlatform Protocol: GitHub + Azure DevOps parity for the trunk topology
 
-**Status:** Proposed (2026-06-16)
-**Date:** 2026-06-16
+**Status:** Accepted (2026-06-16)
+**Date:** 2026-06-16 (drafted) / 2026-06-16 (accepted)
 **Relates to:** ADR-0006 (merge-group topology), ADR-0007 (PR-lifecycle
 architecture — §5.2 / §5.6 / §9.2 closure of Q3), ADR-0014 (Hermes fan-out
 executor), ADR-0017 (Hermes delivery fleet), ADR-0018 (trunk integration on
@@ -320,6 +320,18 @@ async def run_pipeline(
    compat with anyone who's wired it that way locally. Closes the
    ADR-0007 Q4 mismatch in the *existing* code without changing any
    workflow. **~50 LOC + 4 tests.**
+   **STATUS: landed 2026-06-16** (`src/requiem/workflows/ado_pr.py`,
+   `tests/test_ado_pr_workflow.py`, commit on `main`). Resolution order
+   (first non-empty wins): explicit `credential=` → explicit `pat=` →
+   `ADO_PAT` env → lazy `AzureCliCredential()`. Lazy default defers the
+   `azure.identity` import until first `_auth_header()` call, so non-ADO
+   users pay zero dep cost. Missing-package error names `requiem[ado]`
+   extra. ADO REST resource id `499b84ac-1321-427f-aa17-267ca6975798`
+   (verified against `twig auth status`'s live audience). 4 new tests
+   cover the resolution order, the lazy default, the actionable
+   missing-package message, and the bearer-vs-basic header semantics;
+   10 pre-existing tests still green. Optional `[ado]` extra added to
+   `pyproject.toml`.
 
 2. **Extract `RepoPlatform` Protocol + `RepoPullRequest`** in
    `src/requiem/clients/repo.py`. Make `GhClient` an explicit impl
