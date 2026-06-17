@@ -324,6 +324,24 @@ class ProcessConfig:
             return None
         return tc.max_nesting_depth
 
+    def has_facet(self, work_item_type: str | None, facet: str) -> bool:
+        """True if the type's TypeConfig declares ``facet``.
+
+        Used by ``branch_decomposable`` to distinguish types that are
+        BOTH plannable AND implementable (e.g. Feature in the CVAPI
+        config — the planner is invoked, but a leaf verdict is OK
+        because the type can also be implemented directly) from
+        types that are plannable-only (where a leaf verdict from the
+        planner is a policy violation).
+        """
+        norm = self.normalize_type(work_item_type)
+        if norm is None:
+            return False
+        tc = self.types.get(norm)
+        if tc is None:
+            return False
+        return facet in tc.facets
+
     def to_snapshot(self) -> dict[str, Any]:
         """A JSON-safe, order-stable snapshot for the event log / manifest."""
         return {

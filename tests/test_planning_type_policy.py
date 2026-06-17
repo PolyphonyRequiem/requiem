@@ -22,7 +22,7 @@ import pytest
 from requiem.agent import FakeProvider
 from requiem.clients.twig import TwigItem
 from requiem.kernel import Completed
-from requiem.process_config import ProcessConfig
+from requiem.process_config import ProcessConfig, TypeConfig
 from requiem.workflows.planning import (
     FakeTwigClient,
     build_engine,
@@ -80,12 +80,12 @@ def _leaf(summary: str = "leaf") -> dict:
     }
 
 
-def _decomp(*titles: str, summary: str = "decomposable") -> dict:
+def _decomp(*titles: str, summary: str = "decomposable", child_type: str = "Task") -> dict:
     return {
         "summary": summary,
         "decomposable": True,
         "children": [
-            {"title": t, "description": f"{t} desc", "work_item_type": "Task"}
+            {"title": t, "description": f"{t} desc", "work_item_type": child_type}
             for t in titles
         ],
         "estimated_complexity": "medium",
@@ -625,3 +625,266 @@ async def test_reviewer_prompt_does_not_truncate_descriptions(
         f"reviewer prompt should never contain the truncation ellipsis; "
         f"got:\n{reviewer_prompt}"
     )
+
+
+# ============================================================
+# ADR-0026 step 2: planner prompt injects decomposition_guidance
+# ============================================================
+
+
+async def test_planner_prompt_includes_decomposition_guidance_for_decomposable_type(
+    log_dir: Path,
+):
+    """When the parent's TypeConfig has decomposition_guidance, that text
+    MUST appear in the planner's prompt. This is the lever that steers
+    the LLM toward producing the right child types (Features under
+    Scenarios, Tasks under Features, etc.). Without it the planner is
+    free to invent any decomposition shape consistent with the loose
+    schema enum — which is exactly the 2026-06-17 SKU-fallback dogfood
+    bug (Scenarios produced Tasks directly because nothing told the
+    planner to produce Features first)."""
+    cfg = ProcessConfig(
+        types={
+            "Scenario": TypeConfig(
+                facets=("plannable",),
+                decomposition_guidance=(
+                    "Decompose into Features. NEVER directly into Tasks — "
+                    "Features always sit between."
+                ),
+            ),
+            "Feature": TypeConfig(
+                facets=("plannable", "implementable"),
+                decomposition_guidance="Decompose into Tasks.",
+            ),
+            "Task": TypeConfig(facets=("implementable",)),
+        }
+    )
+    provider = FakeProvider(
+        scripts={
+            "planner": [_decomp("First Feature", "Second Feature")],
+            "plan_reviewer": [_approve()],
+        }
+    )
+    twig = _twig({
+        ROOT_ID: "Scenario",
+        ROOT_ID * 100 + 1: "Feature",
+        ROOT_ID * 100 + 2: "Feature",
+    })
+    engine = build_engine(
+        log_dir,
+        item_id=ROOT_ID,
+        twig=twig,
+        provider=provider,
+        process_config=cfg,
+    )
+    result = await engine.run("guidance-injected")
+    assert isinstance(result, Completed), result
+
+    planner_calls = [c for c in provider.calls if c["agent"] == "planner"]
+    assert planner_calls, "planner should be invoked for a Scenario root"
+    planner_prompt = planner_calls[0]["user_message"]
+
+    # The actual regression assertion: the guidance text MUST be in the prompt.
+    assert "Decompose into Features" in planner_prompt, (
+        f"planner prompt should include Scenario's decomposition_guidance; "
+        f"got prompt:\n{planner_prompt}"
+    )
+    assert "NEVER directly into Tasks" in planner_prompt, (
+        f"planner prompt should include the full guidance, not a fragment; "
+        f"got prompt:\n{planner_prompt}"
+    )
+
+
+async def test_planner_prompt_omits_guidance_for_types_without_it(
+    log_dir: Path,
+):
+    """A type with `plannable` facet but NO decomposition_guidance must
+    not blow up — the prompt just doesn't include any guidance line."""
+    cfg = ProcessConfig(
+        types={
+            "Scenario": TypeConfig(facets=("plannable",)),  # no guidance
+            "Task": TypeConfig(facets=("implementable",)),
+        }
+    )
+    provider = FakeProvider(
+        scripts={
+            "planner": [_decomp("child")],
+            "plan_reviewer": [_approve()],
+        }
+    )
+    twig = _twig({ROOT_ID: "Scenario", ROOT_ID * 100 + 1: "Task"})
+    engine = build_engine(
+        log_dir,
+        item_id=ROOT_ID,
+        twig=twig,
+        provider=provider,
+        process_config=cfg,
+    )
+    result = await engine.run("no-guidance")
+    assert isinstance(result, Completed), result
+
+    planner_calls = [c for c in provider.calls if c["agent"] == "planner"]
+    assert planner_calls
+    planner_prompt = planner_calls[0]["user_message"]
+    # The generic policy line still appears.
+    assert "MUST be decomposed" in planner_prompt
+    # But no domain-specific guidance.
+    assert "Decompose into" not in planner_prompt
+
+
+async def test_planner_prompt_omits_guidance_for_implementable_types(
+    log_dir: Path,
+):
+    """Implementable types short-circuit out of the planner via Gap A,
+    so guidance attached to them (even if present) is never injected.
+    Pin: a Task root never hits the planner regardless of any guidance
+    attached to its TypeConfig."""
+    cfg = ProcessConfig(
+        types={
+            # Pathological but legal: implementable type with guidance.
+            # Guidance must be IGNORED — the type short-circuits.
+            "Task": TypeConfig(
+                facets=("implementable",),
+                decomposition_guidance="SHOULD NEVER APPEAR IN ANY PROMPT",
+            ),
+        }
+    )
+    provider = FakeProvider(scripts={})  # planner should NEVER be called
+    twig = _twig({ROOT_ID: "Task"})
+    engine = build_engine(
+        log_dir,
+        item_id=ROOT_ID,
+        twig=twig,
+        provider=provider,
+        process_config=cfg,
+    )
+    result = await engine.run("impl-guidance-ignored")
+    assert isinstance(result, Completed), result
+    # Gap A short-circuit should have run — no provider calls.
+    assert provider.calls == [], (
+        f"implementable types must bypass the planner; got calls: "
+        f"{provider.calls}"
+    )
+
+
+# ============================================================
+# ADR-0026 step 3: branch_decomposable enforces per-type max_nesting_depth
+# ============================================================
+
+
+async def test_max_nesting_depth_per_type_blocks_recursion(
+    log_dir: Path,
+):
+    """ADR-0026 step 3 — DEFERRED.
+
+    Per-type max_nesting_depth ENFORCEMENT requires cap propagation
+    through child_inputs so each subworkflow knows its remaining
+    budget — meaningful wiring beyond the lever the
+    decomposition_guidance prompt already provides. Deferred to a
+    follow-up once we have evidence guidance alone isn't sufficient.
+
+    This test pins the CURRENT (deferred) behavior: the TypeConfig
+    field is parsed, accessible via `max_nesting_depth_for`, and
+    snapshotted — but `branch_decomposable` does not yet enforce it.
+    The intent is to flip this test from documenting absence to
+    asserting presence when the cap-propagation refactor lands.
+    """
+    cfg = ProcessConfig(
+        types={
+            "Scenario": TypeConfig(
+                facets=("plannable",),
+                max_nesting_depth=1,
+            ),
+            "Feature": TypeConfig(facets=("plannable", "implementable")),
+            "Task": TypeConfig(facets=("implementable",)),
+        }
+    )
+    # The field is accessible.
+    assert cfg.max_nesting_depth_for("Scenario") == 1
+    assert cfg.max_nesting_depth_for("Feature") is None
+    # And it round-trips through snapshot for the resume path.
+    snap = cfg.to_snapshot()
+    restored = ProcessConfig.from_snapshot(snap)
+    assert restored.max_nesting_depth_for("Scenario") == 1
+
+
+async def test_max_nesting_depth_per_type_zero_caps_at_root(
+    log_dir: Path,
+):
+    """max_nesting_depth=0 means 'this type cannot have its
+    decomposition recurse at all — children must be leaves'. With the
+    short-circuit (Gap A) handling implementable children, this is
+    equivalent to 'a plannable type with all-implementable children'.
+
+    Edge case test: ensure 0 is handled, not interpreted as None/missing.
+    """
+    cfg = ProcessConfig(
+        types={
+            "Epic": TypeConfig(
+                facets=("plannable",),
+                max_nesting_depth=0,  # children of Epic must not decompose further
+            ),
+            "Task": TypeConfig(facets=("implementable",)),
+        }
+    )
+    provider = FakeProvider(
+        scripts={
+            "planner": [_decomp("the-task")],
+            "plan_reviewer": [_approve()],
+        }
+    )
+    twig = _twig({ROOT_ID: "Epic", ROOT_ID * 100 + 1: "Task"})
+    engine = build_engine(
+        log_dir,
+        item_id=ROOT_ID,
+        twig=twig,
+        provider=provider,
+        process_config=cfg,
+        max_depth=4,
+        gate_handler=_proceed_handler,
+    )
+    result = await engine.run("per-type-depth-zero")
+    # The Epic decomposes once (depth 0 → depth 1); children are Tasks
+    # which short-circuit as leaves. No deeper recursion attempted. Run
+    # should complete cleanly.
+    assert isinstance(result, Completed), result
+
+
+async def test_max_nesting_depth_per_type_none_does_not_block(
+    log_dir: Path,
+):
+    """When max_nesting_depth is None (the default), only the global
+    max_depth caps recursion. Pin: a plannable type without a per-type
+    cap allows recursion up to global max_depth as before."""
+    cfg = ProcessConfig(
+        types={
+            # No max_nesting_depth on either type.
+            "Scenario": TypeConfig(facets=("plannable",)),
+            "Feature": TypeConfig(facets=("plannable", "implementable")),
+            "Task": TypeConfig(facets=("implementable",)),
+        }
+    )
+    feature_id = ROOT_ID * 100 + 1
+    provider = FakeProvider(
+        scripts={
+            "planner": [_decomp("the-feature", child_type="Feature"), _leaf("atomic")],
+            "plan_reviewer": [_approve(), _approve()],
+        }
+    )
+    twig = _twig({
+        ROOT_ID: "Scenario",
+        feature_id: "Feature",
+    })
+    engine = build_engine(
+        log_dir,
+        item_id=ROOT_ID,
+        twig=twig,
+        provider=provider,
+        process_config=cfg,
+        max_depth=4,
+    )
+    result = await engine.run("no-per-type-cap")
+    assert isinstance(result, Completed), result
+    # Both levels recursed cleanly because there's no per-type cap.
+    plan = project_plan_result(completed_from_log(engine.log_path("no-per-type-cap")))
+    assert plan is not None

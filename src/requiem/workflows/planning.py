@@ -208,7 +208,21 @@ class PlanResult:
 class ChildPlan(BaseModel):
     title: str
     description: str
-    work_item_type: Literal["Task", "Bug", "User Story"]
+    # ADR-0026 step 3 (2026-06-17): the Literal was originally
+    # ``["Task", "Bug", "User Story"]`` because the flat-tier model
+    # assumed Feature was always at the decomposable tier and never
+    # appeared as a *child* type. With per-type config, Feature is
+    # plannable+implementable and IS a legitimate child type
+    # (Scenarios decompose into Features per CVAPI). Expanded to
+    # cover the standard ADO process-template types. Any type the
+    # operator's TypeConfig declares should appear here; we list the
+    # common set explicitly so Pydantic still catches typos at parse
+    # time. The downstream workflow does the policy-driven semantic
+    # validation against ProcessConfig.types.
+    work_item_type: Literal[
+        "Task", "Bug", "User Story", "Feature",
+        "Scenario", "Epic", "Key Result", "Objective",
+    ]
     item_id: int | None = None
     """Optional pinned ADO id for the child.
 
@@ -573,7 +587,9 @@ def build_verb_registry(
     def _planner_prompt(iteration: int):
         def _prompt(ctx):
             item = ctx.completed["fetch_item"]["value"]
-            policy = _effective_config(ctx).tier_for_type(item.get("work_item_type"))
+            cfg = _effective_config(ctx)
+            wit = item.get("work_item_type")
+            policy = cfg.tier_for_type(wit)
             policy_line = ""
             if policy == "implementable":
                 policy_line = (
@@ -587,11 +603,29 @@ def build_verb_registry(
                     f"'{item['work_item_type']}' MUST be decomposed: set "
                     "decomposable=true and propose at least one child.\n"
                 )
+
+            # ADR-0026 step 2: inject per-type decomposition_guidance
+            # AFTER the generic policy line. This is the domain-specific
+            # lever ("Decompose into Features. NEVER directly into Tasks.")
+            # that steers the LLM toward the right child types. Only
+            # injected for plannable types (implementable types short-
+            # circuit out of the planner via Gap A and never reach this
+            # prompt). Falls back to an empty string when no guidance is
+            # configured — the generic policy line still applies.
+            guidance = cfg.decomposition_guidance_for(wit)
+            guidance_line = ""
+            if guidance and policy == "decomposable":
+                guidance_line = (
+                    f"Repo-specific decomposition guidance for "
+                    f"'{item['work_item_type']}':\n  {guidance.strip()}\n"
+                )
+
             base = (
                 f"Plan work item AB#{item['item_id']} — \"{item['title']}\" "
                 f"(type={item['work_item_type']}, state={item['state']}).\n"
                 f"Current planning depth: {current_depth} of {max_depth}.\n"
                 + policy_line
+                + guidance_line
             )
             if iteration == 1:
                 return base + "Produce a first plan."
@@ -763,7 +797,20 @@ def build_verb_registry(
 
         # Decomposable types MUST break down; a planner leaf (or zero proposed
         # children) is an unsatisfiable policy → fail closed to a human gate.
-        if policy == "decomposable" and (not planner_decomposable or child_count == 0):
+        #
+        # EXCEPTION (ADR-0026): a type with BOTH `plannable` AND
+        # `implementable` facets (e.g. Feature in CVAPI) explicitly
+        # allows the planner to choose either path. A leaf verdict from
+        # such a type is honoured as a leaf rather than treated as a
+        # policy violation. This is the "Implement directly when the
+        # change fits one PR" escape hatch that polyphony's Issue type
+        # has and CVAPI's Feature type inherits.
+        type_is_also_implementable = cfg.has_facet(work_item_type, "implementable")
+        if (
+            policy == "decomposable"
+            and (not planner_decomposable or child_count == 0)
+            and not type_is_also_implementable
+        ):
             return PermanentFailure(
                 error_kind="config_requires_decomposition",
                 message=(
@@ -777,6 +824,29 @@ def build_verb_registry(
                     "planner_decomposable": planner_decomposable,
                     "child_count": child_count,
                     "work_item_type": work_item_type,
+                },
+            )
+
+        # ADR-0026 bi-facet leaf: a plannable+implementable type that
+        # the planner chose to leaf — return Success(leaf) so the run
+        # routes to record_plan. The type's "decomposable" tier brought
+        # the planner in; the type's "implementable" facet lets the
+        # leaf verdict stand.
+        if (
+            policy == "decomposable"
+            and not planner_decomposable
+            and type_is_also_implementable
+        ):
+            return Success(
+                value={
+                    "decomposable": False,
+                    "branch": "leaf",
+                    "child_count": 0,
+                    "approved_iteration": approved_iter,
+                    "policy_tier": "decomposable",
+                    "type_facets_allowed_leaf": True,
+                    "overrode_planner": False,
+                    "planner_decomposable": False,
                 },
             )
 
@@ -820,6 +890,17 @@ def build_verb_registry(
                     "child_count": child_count,
                 },
             )
+
+        # ADR-0026 step 3 NOTE (2026-06-17): per-type max_nesting_depth
+        # enforcement is INTENTIONALLY deferred to a follow-up. The
+        # semantic ("starting from an X, the recursion may go at most N
+        # levels deep") requires cap propagation through child_inputs so
+        # each child subworkflow knows its remaining budget. The
+        # decomposition_guidance text lever (step 2) handles 90% of the
+        # steering need without the wiring complexity; the structural
+        # cap can land later if guidance proves insufficient in practice.
+        # The TypeConfig field is parsed and snapshotted — it's just not
+        # yet consumed here.
         return PermanentFailure(
             error_kind="recurse",
             message=f"will recurse into {child_count} sub-plans",
