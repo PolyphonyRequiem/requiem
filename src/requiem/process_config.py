@@ -83,6 +83,71 @@ class ProcessConfigError(Exception):
 
 
 @dataclass(frozen=True, slots=True)
+class TypeConfig:
+    """Per work-item-type configuration (ADR-0026).
+
+    Each ADO work-item type in the repo's process template can carry
+    one or more *facets* describing what requiem may do with items of
+    that type:
+
+    * ``plannable``     — the planner is invoked; child decomposition allowed.
+    * ``implementable`` — workflow may implement the item directly (no
+      decomposition required).
+    * ``actionable``    — an executor backend (``actionable_executor``) picks
+      this up for the actual action.
+
+    A type can carry multiple facets. Polyphony's ``Feature``/``Issue`` is
+    both ``plannable`` AND ``implementable``: the planner is invoked, and
+    if the planner returns ``decomposable=false`` the workflow treats it
+    as a leaf.
+
+    ``decomposition_guidance`` is free-form prompt text injected into the
+    planner prompt for items of this type — the most powerful lever for
+    steering decomposition shape (e.g. "Decompose Scenarios into Features.
+    NEVER directly into Tasks.").
+
+    ``max_nesting_depth`` is an optional per-type recursion cap. ``1``
+    means "decompose once, then children must be implementable leaves";
+    ``None`` means no per-type cap (the global ``max_depth`` in
+    ``build_engine`` still applies).
+
+    ``actionable_executor`` names the executor backend for actionable
+    items (today only ``requiem`` is implemented; future: kanban worker,
+    ado-pipeline, etc.).
+    """
+
+    facets: tuple[str, ...] = ()
+    decomposition_guidance: str | None = None
+    max_nesting_depth: int | None = None
+    actionable_executor: str | None = None
+
+    def to_snapshot(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"facets": list(self.facets)}
+        if self.decomposition_guidance is not None:
+            out["decomposition_guidance"] = self.decomposition_guidance
+        if self.max_nesting_depth is not None:
+            out["max_nesting_depth"] = self.max_nesting_depth
+        if self.actionable_executor is not None:
+            out["actionable_executor"] = self.actionable_executor
+        return out
+
+    @classmethod
+    def from_snapshot(cls, snap: Mapping[str, Any]) -> "TypeConfig":
+        return cls(
+            facets=tuple(snap.get("facets") or ()),
+            decomposition_guidance=snap.get("decomposition_guidance"),
+            max_nesting_depth=snap.get("max_nesting_depth"),
+            actionable_executor=snap.get("actionable_executor"),
+        )
+
+
+VALID_FACETS: frozenset[str] = frozenset({"plannable", "implementable", "actionable"})
+"""Allowed facet values. Unknown facets fail loud at parse time per
+INV-NO-CORRUPT-FORWARD — silently ignoring an unrecognized facet would
+let a typo (``implementible``) become a routing bug."""
+
+
+@dataclass(frozen=True, slots=True)
 class ProcessConfig:
     """The type-routing facts a workflow needs, loaded from ``process.yaml``.
 
@@ -98,11 +163,47 @@ class ProcessConfig:
     type_aliases: Mapping[str, str] = field(default_factory=dict)
     decomposable_types: frozenset[str] = frozenset()
     implementable_types: frozenset[str] = frozenset()
+    types: Mapping[str, TypeConfig] = field(default_factory=dict)
     roles: Mapping[str, RoleBinding] = field(default_factory=dict)
     source: Path | None = None
     sha256: str | None = None
 
     def __post_init__(self) -> None:
+        # ADR-0026: `types` is the new authoritative source. If both
+        # `types` and the legacy flat sets are provided, the source of
+        # truth is ambiguous — fail loud (INV-NO-CORRUPT-FORWARD).
+        # Empty flat sets are fine because that's the back-compat shape
+        # used when `types` IS the source.
+        if self.types and (self.decomposable_types or self.implementable_types):
+            raise ProcessConfigError(
+                "process config is ambiguous: both `types` (new per-type "
+                "schema, ADR-0026) and legacy `decomposable_types`/"
+                "`implementable_types` are provided. Use `types` only.",
+                path=self.source,
+            )
+
+        # Two paths to populate flat sets + types map, both ending with
+        # both shapes available to consumers:
+        #
+        #  (a) types is provided → derive flat sets from facets;
+        #  (b) only flat sets are provided → synthesise a minimal types
+        #      map so downstream code that reads `types` doesn't need a
+        #      special case for legacy configs.
+        if self.types:
+            derived_dec, derived_impl = self._derive_flat_sets_from_types()
+            # Bypass frozen via object.__setattr__ — the derived sets are
+            # part of the config's invariant, not an override of an
+            # operator-provided value.
+            object.__setattr__(self, "decomposable_types", derived_dec)
+            object.__setattr__(self, "implementable_types", derived_impl)
+        elif self.decomposable_types or self.implementable_types:
+            synth: dict[str, TypeConfig] = {}
+            for t in self.decomposable_types:
+                synth[t] = TypeConfig(facets=("plannable",))
+            for t in self.implementable_types:
+                synth[t] = TypeConfig(facets=("implementable", "actionable"))
+            object.__setattr__(self, "types", synth)
+
         # A type cannot be declared both decomposable and implementable — that
         # is a contradictory tier policy. Catch it loud at construction (covers
         # parsing, ``from_snapshot``, and direct construction) rather than
@@ -119,6 +220,26 @@ class ProcessConfig:
                 f"implementable (after alias normalization): {sorted(overlap)}",
                 path=self.source,
             )
+
+    def _derive_flat_sets_from_types(self) -> tuple[frozenset[str], frozenset[str]]:
+        """Project the per-type facets onto the legacy flat sets.
+
+        Rule (ADR-0026):
+
+        * ``plannable`` facet → decomposable (planner is invoked)
+        * ``implementable`` facet WITHOUT ``plannable`` → implementable leaf
+        * BOTH facets → decomposable (planner is invoked, may emit
+          ``decomposable=false`` and the workflow accepts that as a leaf —
+          this avoids double-classifying Feature-style types)
+        """
+        dec: set[str] = set()
+        impl: set[str] = set()
+        for type_name, tc in self.types.items():
+            if "plannable" in tc.facets:
+                dec.add(type_name)
+            elif "implementable" in tc.facets:
+                impl.add(type_name)
+        return frozenset(dec), frozenset(impl)
 
     def normalize_type(self, work_item_type: str | None) -> str | None:
         """Resolve a work-item type through the configured aliases."""
@@ -168,6 +289,41 @@ class ProcessConfig:
         """The fleet binding for a role, or ``None`` when none is configured."""
         return self.roles.get(name)
 
+    # ---- ADR-0026 per-type helpers ----------------------------------
+
+    def decomposition_guidance_for(self, work_item_type: str | None) -> str | None:
+        """Per-type planner guidance text, or None when none is configured.
+
+        Used by ``planning.py``'s ``_planner_prompt`` to inject domain
+        rules ("Decompose Scenarios into Features. NEVER directly into
+        Tasks.") into the planner's prompt for items of this type.
+        Returns ``None`` for types without ``decomposition_guidance``,
+        for unknown types, and for ``None`` input — callers fall back
+        to the generic prompt in all three cases.
+        """
+        norm = self.normalize_type(work_item_type)
+        if norm is None:
+            return None
+        tc = self.types.get(norm)
+        if tc is None:
+            return None
+        return tc.decomposition_guidance
+
+    def max_nesting_depth_for(self, work_item_type: str | None) -> int | None:
+        """Per-type recursion cap, or None when none is configured.
+
+        Used by ``planning.py``'s ``branch_decomposable`` to cap
+        recursion below the global ``max_depth``. ``None`` means no
+        per-type cap (the global cap still applies).
+        """
+        norm = self.normalize_type(work_item_type)
+        if norm is None:
+            return None
+        tc = self.types.get(norm)
+        if tc is None:
+            return None
+        return tc.max_nesting_depth
+
     def to_snapshot(self) -> dict[str, Any]:
         """A JSON-safe, order-stable snapshot for the event log / manifest."""
         return {
@@ -175,6 +331,7 @@ class ProcessConfig:
             "type_aliases": dict(self.type_aliases),
             "decomposable_types": sorted(self.decomposable_types),
             "implementable_types": sorted(self.implementable_types),
+            "types": {k: self.types[k].to_snapshot() for k in sorted(self.types)},
             "roles": {k: self.roles[k].to_snapshot() for k in sorted(self.roles)},
             "source": str(self.source) if self.source is not None else None,
             "sha256": self.sha256,
@@ -184,6 +341,26 @@ class ProcessConfig:
     def from_snapshot(cls, snap: Mapping[str, Any]) -> "ProcessConfig":
         """Reconstruct a config from a :meth:`to_snapshot` payload."""
         src = snap.get("source")
+        types_snap = snap.get("types") or {}
+        types = {
+            k: TypeConfig.from_snapshot(v) for k, v in types_snap.items()
+        }
+        # When `types` is present, the flat sets in the snapshot are
+        # the derived values from a prior __post_init__. Don't re-pass
+        # them — __post_init__ will re-derive (and ambiguous-check would
+        # fire otherwise).
+        if types:
+            return cls(
+                root_parent_types=frozenset(snap.get("root_parent_types", ())),
+                type_aliases=dict(snap.get("type_aliases", {})),
+                types=types,
+                roles={
+                    k: RoleBinding.from_snapshot(v)
+                    for k, v in (snap.get("roles") or {}).items()
+                },
+                source=Path(src) if src else None,
+                sha256=snap.get("sha256"),
+            )
         return cls(
             root_parent_types=frozenset(snap.get("root_parent_types", ())),
             type_aliases=dict(snap.get("type_aliases", {})),
@@ -297,6 +474,106 @@ def _str_set_seq(
     return tuple(raw)
 
 
+def _types_map(
+    data: Mapping[str, Any], key: str, path: Path | None
+) -> dict[str, TypeConfig]:
+    """Parse the ADR-0026 `types: dict[str, TypeConfig]` field."""
+    raw = data.get(key)
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise ProcessConfigError(
+            f"'{key}' must be a mapping of type-name to per-type config, "
+            f"got {type(raw).__name__}",
+            path=path,
+        )
+    out: dict[str, TypeConfig] = {}
+    for type_name, body in raw.items():
+        if not isinstance(type_name, str):
+            raise ProcessConfigError(
+                f"'{key}' keys must be type-name strings, got "
+                f"{type(type_name).__name__}",
+                path=path,
+            )
+        if not isinstance(body, Mapping):
+            raise ProcessConfigError(
+                f"'{key}.{type_name}' must be a mapping with at least "
+                f"'facets', got {type(body).__name__}",
+                path=path,
+            )
+
+        # facets — required, must be a list of valid facet strings.
+        facets_raw = body.get("facets")
+        if facets_raw is None:
+            raise ProcessConfigError(
+                f"'{key}.{type_name}' is missing required field 'facets'",
+                path=path,
+            )
+        if isinstance(facets_raw, str) or not isinstance(facets_raw, (list, tuple)):
+            raise ProcessConfigError(
+                f"'{key}.{type_name}.facets' must be a list of strings, "
+                f"got {type(facets_raw).__name__}",
+                path=path,
+            )
+        facets: list[str] = []
+        for f in facets_raw:
+            if not isinstance(f, str):
+                raise ProcessConfigError(
+                    f"'{key}.{type_name}.facets' entries must be strings, "
+                    f"got {type(f).__name__}",
+                    path=path,
+                )
+            if f not in VALID_FACETS:
+                raise ProcessConfigError(
+                    f"'{key}.{type_name}.facets' contains unknown facet "
+                    f"{f!r}; valid facets are {sorted(VALID_FACETS)}",
+                    path=path,
+                )
+            facets.append(f)
+
+        # decomposition_guidance — optional, must be a string when present.
+        guidance = body.get("decomposition_guidance")
+        if guidance is not None and not isinstance(guidance, str):
+            raise ProcessConfigError(
+                f"'{key}.{type_name}.decomposition_guidance' must be a "
+                f"string, got {type(guidance).__name__}",
+                path=path,
+            )
+
+        # max_nesting_depth — optional, must be a non-negative int.
+        depth = body.get("max_nesting_depth")
+        if depth is not None:
+            if not isinstance(depth, int) or isinstance(depth, bool):
+                raise ProcessConfigError(
+                    f"'{key}.{type_name}.max_nesting_depth' must be a "
+                    f"non-negative integer, got {type(depth).__name__}",
+                    path=path,
+                )
+            if depth < 0:
+                raise ProcessConfigError(
+                    f"'{key}.{type_name}.max_nesting_depth' must be "
+                    f"non-negative, got {depth}",
+                    path=path,
+                )
+
+        # actionable_executor — optional, must be a string when present.
+        executor = body.get("actionable_executor")
+        if executor is not None and not isinstance(executor, str):
+            raise ProcessConfigError(
+                f"'{key}.{type_name}.actionable_executor' must be a "
+                f"string, got {type(executor).__name__}",
+                path=path,
+            )
+
+        out[type_name] = TypeConfig(
+            facets=tuple(facets),
+            decomposition_guidance=guidance,
+            max_nesting_depth=depth,
+            actionable_executor=executor,
+        )
+    return out
+
+
 def _build_from_mapping(
     data: Mapping[str, Any], *, source: Path | None, sha256: str | None
 ) -> ProcessConfig:
@@ -311,6 +588,7 @@ def _build_from_mapping(
         type_aliases=_str_map(data, "type_aliases", source),
         decomposable_types=_str_set(data, "decomposable_types", source),
         implementable_types=_str_set(data, "implementable_types", source),
+        types=_types_map(data, "types", source),
         roles=_roles_map(data, "roles", source),
         source=source,
         sha256=sha256,

@@ -18,6 +18,7 @@ from requiem.process_config import (
     ProcessConfig,
     ProcessConfigError,
     RoleBinding,
+    TypeConfig,
     default_process_config,
     discover_process_config,
     find_process_config_path,
@@ -346,3 +347,206 @@ def test_snapshot_round_trip_is_stable():
     assert restored.decomposable_types == cfg.decomposable_types
     assert restored.sha256 == "deadbeef"
     assert restored.source == Path("/x/.requiem-config/process.yaml")
+
+
+# ============================================================
+# ADR-0026: per-type process config (facets/guidance/depth)
+# ============================================================
+
+
+def test_type_config_facets_drive_derived_flat_sets():
+    """The new authoritative source of truth is `types: dict[str, TypeConfig]`.
+    The flat decomposable_types / implementable_types sets MUST be derived from
+    facets so legacy verb code keeps working without each verb knowing about
+    facets. Rule: a type with `plannable` facet → decomposable; a type with
+    `implementable` (and NOT `plannable`) → implementable. Types with BOTH
+    facets (e.g. Feature in CVAPI) appear in decomposable only — the planner
+    is invoked but it's free to return decomposable=false."""
+    cfg = ProcessConfig(
+        types={
+            "Epic": TypeConfig(facets=("plannable",)),
+            "Feature": TypeConfig(facets=("plannable", "implementable")),
+            "Task": TypeConfig(facets=("implementable", "actionable")),
+        }
+    )
+    assert cfg.decomposable_types == frozenset({"Epic", "Feature"})
+    assert cfg.implementable_types == frozenset({"Task"})
+
+
+def test_type_config_back_compat_legacy_flat_sets_synthesize_types():
+    """A config that uses ONLY the legacy flat sets (no `types` map) must
+    keep working. The constructor synthesizes a minimal types map from the
+    flat sets so downstream code that reads `types` doesn't need a special
+    case for legacy configs."""
+    cfg = ProcessConfig(
+        decomposable_types=frozenset({"Scenario"}),
+        implementable_types=frozenset({"Task", "Bug"}),
+    )
+    # Downstream can read both shapes interchangeably.
+    assert "Scenario" in cfg.types
+    assert "plannable" in cfg.types["Scenario"].facets
+    assert "Task" in cfg.types
+    assert "implementable" in cfg.types["Task"].facets
+    # And the derived flat sets are stable.
+    assert cfg.decomposable_types == frozenset({"Scenario"})
+    assert cfg.implementable_types == frozenset({"Task", "Bug"})
+
+
+def test_type_config_ambiguous_when_both_flat_and_types_provided():
+    """A config that mixes the new `types` map with legacy flat sets is
+    ambiguous (which is the source of truth?). Fail loud at construction
+    time per INV-NO-CORRUPT-FORWARD."""
+    with pytest.raises(ProcessConfigError, match="ambiguous"):
+        ProcessConfig(
+            types={"Task": TypeConfig(facets=("implementable",))},
+            decomposable_types=frozenset({"Epic"}),
+        )
+
+
+def test_type_config_decomposition_guidance_accessible_per_type():
+    """The planner prompt machinery needs to look up per-type guidance.
+    Provide a helper method that returns the guidance string or None."""
+    cfg = ProcessConfig(
+        types={
+            "Scenario": TypeConfig(
+                facets=("plannable",),
+                decomposition_guidance=(
+                    "Decompose into Features. NEVER directly into Tasks."
+                ),
+            ),
+            "Task": TypeConfig(facets=("implementable",)),
+        }
+    )
+    assert cfg.decomposition_guidance_for("Scenario") == (
+        "Decompose into Features. NEVER directly into Tasks."
+    )
+    # Implementable types have no guidance — return None, not empty string.
+    assert cfg.decomposition_guidance_for("Task") is None
+    # Unknown types — also None (planner falls back to generic prompt).
+    assert cfg.decomposition_guidance_for("Spike") is None
+    # None input — None output (don't crash on missing work_item_type).
+    assert cfg.decomposition_guidance_for(None) is None
+
+
+def test_type_config_max_nesting_depth_per_type():
+    """Each plannable type can carry its own recursion cap. None means
+    no per-type cap (subject only to the global max_depth in build_engine)."""
+    cfg = ProcessConfig(
+        types={
+            "Epic": TypeConfig(facets=("plannable",), max_nesting_depth=1),
+            "Feature": TypeConfig(facets=("plannable", "implementable")),
+            "Task": TypeConfig(facets=("implementable",)),
+        }
+    )
+    assert cfg.max_nesting_depth_for("Epic") == 1
+    assert cfg.max_nesting_depth_for("Feature") is None  # unbounded per-type
+    assert cfg.max_nesting_depth_for("Task") is None  # leaf, never decomposes
+    assert cfg.max_nesting_depth_for("Unknown") is None
+
+
+def test_load_types_schema_from_yaml(tmp_path: Path):
+    """End-to-end: a YAML file using the new schema parses into a config
+    whose `types` map has facets, guidance, and depth caps."""
+    cfg_path = _write_config(
+        tmp_path,
+        """
+        types:
+          Scenario:
+            facets: [plannable]
+            decomposition_guidance: |
+              Decompose into Features. NEVER directly into Tasks.
+            max_nesting_depth: 1
+          Feature:
+            facets: [plannable, implementable]
+            decomposition_guidance: |
+              Decompose into Tasks.
+          Task:
+            facets: [implementable, actionable]
+            actionable_executor: requiem
+        """,
+    )
+    cfg = load_process_config(cfg_path)
+    assert set(cfg.types.keys()) == {"Scenario", "Feature", "Task"}
+    sc = cfg.types["Scenario"]
+    assert sc.facets == ("plannable",)
+    assert "NEVER directly into Tasks" in sc.decomposition_guidance
+    assert sc.max_nesting_depth == 1
+    feat = cfg.types["Feature"]
+    assert feat.facets == ("plannable", "implementable")
+    assert feat.max_nesting_depth is None
+    task = cfg.types["Task"]
+    assert task.facets == ("implementable", "actionable")
+    assert task.actionable_executor == "requiem"
+    # Derived flat sets are correct.
+    assert cfg.decomposable_types == frozenset({"Scenario", "Feature"})
+    assert cfg.implementable_types == frozenset({"Task"})
+
+
+def test_load_types_schema_with_legacy_flat_sets_fails(tmp_path: Path):
+    """A YAML file that mixes both shapes must fail at load time, not
+    silently prefer one over the other."""
+    cfg_path = _write_config(
+        tmp_path,
+        """
+        types:
+          Task:
+            facets: [implementable]
+        decomposable_types: [Epic]
+        """,
+    )
+    with pytest.raises(ProcessConfigError, match="ambiguous"):
+        load_process_config(cfg_path)
+
+
+def test_load_types_invalid_facet_fails_closed(tmp_path: Path):
+    """Unknown facet values must fail loud — not silently ignored."""
+    cfg_path = _write_config(
+        tmp_path,
+        """
+        types:
+          Task:
+            facets: [implementable, hallucinated]
+        """,
+    )
+    with pytest.raises(ProcessConfigError, match="(?i)facet"):
+        load_process_config(cfg_path)
+
+
+def test_types_round_trip_through_snapshot():
+    """to_snapshot / from_snapshot must preserve the new per-type fields."""
+    cfg = ProcessConfig(
+        types={
+            "Scenario": TypeConfig(
+                facets=("plannable",),
+                decomposition_guidance="Decompose into Features.",
+                max_nesting_depth=2,
+            ),
+            "Task": TypeConfig(
+                facets=("implementable", "actionable"),
+                actionable_executor="requiem",
+            ),
+        }
+    )
+    snap = cfg.to_snapshot()
+    restored = ProcessConfig.from_snapshot(snap)
+    assert restored.types == cfg.types
+    assert restored.decomposable_types == cfg.decomposable_types
+    assert restored.implementable_types == cfg.implementable_types
+
+
+def test_tier_for_type_works_with_types_schema():
+    """tier_for_type (used everywhere downstream) MUST return the right
+    classification when the config uses the new types-only schema."""
+    cfg = ProcessConfig(
+        types={
+            "Scenario": TypeConfig(facets=("plannable",)),
+            "Feature": TypeConfig(facets=("plannable", "implementable")),
+            "Task": TypeConfig(facets=("implementable", "actionable")),
+        }
+    )
+    assert cfg.tier_for_type("Scenario") == "decomposable"
+    # Feature is BOTH plannable and implementable — decomposable wins
+    # (planner is invoked, may still emit decomposable=false).
+    assert cfg.tier_for_type("Feature") == "decomposable"
+    assert cfg.tier_for_type("Task") == "implementable"
+    assert cfg.tier_for_type("Unknown") == "unspecified"
