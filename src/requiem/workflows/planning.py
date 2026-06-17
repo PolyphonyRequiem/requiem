@@ -9,16 +9,21 @@ three iterations before the workflow escalates to a human.
 
 ::
 
-    start → guard_depth → fetch_item → planner_1 → reviewer_1 → router_1
+    start → guard_depth → fetch_item → policy_classifier
+        policy_classifier ─ success    → planner_1 → reviewer_1 → router_1
+        policy_classifier ─ short_circuit_implementable → record_leaf_from_policy → end
         router_1 ─ approve  → branch_decomposable
         router_1 ─ revise   → planner_2 → reviewer_2 → router_2
-                                                  router_2 ─ approve → branch_decomposable
-                                                  router_2 ─ revise  → planner_3 → reviewer_3 → router_3
-                                                                                             router_3 ─ approve → branch_decomposable
-                                                                                             router_3 ─ revise  → escalation_gate
-                                                                                             router_3 ─ escalate→ escalation_gate
-                                                  router_2 ─ escalate→ escalation_gate
-        router_1 ─ escalate → escalation_gate
+            ...continues up to planner_{ITER_CAP} → reviewer_{ITER_CAP} → router_{ITER_CAP}
+            router_{ITER_CAP} ─ approve  → branch_decomposable
+            router_{ITER_CAP} ─ revise   → escalation_gate
+            router_{ITER_CAP} ─ escalate → escalation_gate
+        router_i (i < ITER_CAP) ─ escalate → escalation_gate
+
+(``ITER_CAP`` is defined as a module constant; the topology is generated
+by a loop, so bumping the constant scales the planner/reviewer chain
+automatically. ``policy_classifier`` short-circuits implementable types
+out of the LLM loop entirely per ADR-0025 Gap A.)
 
     branch_decomposable
         ─ leaf                          → record_plan → end
@@ -312,7 +317,21 @@ class FakeTwigClient:
 
 
 # Iteration cap — change this only by editing the topology in `build_workflow`.
-ITER_CAP = 3
+ITER_CAP = 5
+"""Max planner+reviewer iterations before the workflow escalates to a
+human gate. Bumped from 3 → 5 (2026-06-17) after the #62759077
+dogfood retry: the reviewer was producing substantive feedback each
+round and the planner was visibly incorporating it (iter 1 → 2 → 3
+each addressed different concerns), but 3 iterations weren't enough
+for the planner to converge on a clean decomposition. The trade-off
+is up to 4 extra LLM calls per planning run for complex root items;
+small leaves still converge in 1-2 iterations and don't pay the cost.
+
+This is a temporary lever. The right long-term shape is an
+``iter_cap`` parameter on ``build_engine`` / CLI (``--max-plan-iterations``)
+so operators can dial up complex Scenarios without paying the cost
+on every plan. Tracked as a follow-up in ADR-0025.
+"""
 
 # Version stamp for the `.plan.tree.json` sidecar. Bumped to 2 when each
 # recursive node gained its own `proposals` list (making the artifact
@@ -1129,7 +1148,7 @@ def _plan_result_to_dict(plan: "PlanResult") -> dict[str, Any]:
 
 
 def _find_approved_iteration(completed: dict) -> int:
-    """Walk router_1..router_3 to find which one returned `approve` (Success).
+    """Walk router_1..router_{ITER_CAP} to find which one returned `approve` (Success).
 
     `Success` routers go to `branch_decomposable`/`record_plan`; any
     `PermanentFailure` router routes elsewhere (revise/escalate). So the
@@ -1527,7 +1546,7 @@ def build_workflow() -> Workflow:
             .edge("escalation_gate", on="needs_human:abort", to="fail_end")
     )
 
-    # Three planner/reviewer/router iterations, wired left-to-right.
+    # `ITER_CAP` planner/reviewer/router iterations, wired left-to-right.
     for i in range(1, ITER_CAP + 1):
         b = (
             b.agent(
@@ -1563,7 +1582,7 @@ def build_workflow() -> Workflow:
                 on="permanent_failure:revise",
                 to=f"planner_{i + 1}",
             )
-        # router_3's revise is rerouted to escalation_gate by the verb
+        # router_{ITER_CAP}'s revise is rerouted to escalation_gate by the verb
         # itself (it returns escalate on revise when the cap is hit), so
         # no extra edge is needed at the topology level.
 

@@ -378,7 +378,7 @@ async def test_revise_then_approve_iteration_2(log_dir: Path):
     assert completed["planner_2"]["value"]["parsed"]["summary"].startswith("Tightened")
 
 
-async def test_three_revisions_escalates_to_human(log_dir: Path):
+async def test_max_revisions_escalates_to_human(log_dir: Path):
     """Reviewer revises every iteration → router_3 escalates → human gate."""
     provider = FakeProvider(
         scripts={
@@ -424,7 +424,7 @@ async def test_three_revisions_escalates_to_human(log_dir: Path):
     assert len(gate_opens) == 1
 
 
-async def test_three_revisions_then_operator_aborts(log_dir: Path):
+async def test_max_revisions_then_operator_aborts(log_dir: Path):
     """Cap is hit; operator picks `abort` at the escalation gate."""
     provider = FakeProvider(
         scripts={
