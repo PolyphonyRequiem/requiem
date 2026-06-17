@@ -545,3 +545,83 @@ async def test_reviewer_prompt_includes_child_titles_not_just_count(
         f"reviewer prompt should include child 3's title; got prompt:\n"
         f"{reviewer_prompt}"
     )
+
+
+async def test_reviewer_prompt_does_not_truncate_descriptions(
+    log_dir: Path,
+):
+    """Pin against the 2026-06-17 dogfood run 7 regression: the
+    reviewer prompt USED to truncate child descriptions at 400 chars
+    and append `…`. The reviewer then thought the PLANNER produced
+    truncated descriptions ("description is truncated mid-sentence at
+    'recommended SKU p…'") and revised forever to fix what was actually
+    a rendering artifact in our prompt template.
+
+    Fix: show the description in full. This test pins that a
+    description longer than 400 chars survives intact in the prompt
+    with no '…' ellipsis appended."""
+    cfg = ProcessConfig(
+        decomposable_types=frozenset({"Scenario"}),
+        implementable_types=frozenset({"Task"}),
+    )
+    # Build a child with a 600-char description that mentions specific
+    # phrases at both ends so we can assert the full string survived.
+    long_desc = (
+        "Implement the SKU fallback selection module that wraps the "
+        "Azure Compute SDK's VirtualMachineSizes client, queries the "
+        "regional capacity API, ranks candidate SKUs by configured "
+        "priority, validates each against the workload's resource "
+        "requirements (memory, NVMe, accelerated networking), filters "
+        "out SKUs the subscription doesn't have quota for, and emits "
+        "structured telemetry on every fallback decision so that "
+        "operators can investigate the chosen SKU after the fact via "
+        "the recommended SKU policy review dashboard. NOTE: this is "
+        "the END of the description."
+    )
+    assert len(long_desc) > 400, "test description must exceed the old cap"
+
+    planner_output = {
+        "summary": "decomposable",
+        "decomposable": True,
+        "children": [
+            {
+                "title": "Build SKU fallback module",
+                "description": long_desc,
+                "work_item_type": "Task",
+            }
+        ],
+        "estimated_complexity": "medium",
+        "rationale": "separable",
+    }
+    provider = FakeProvider(
+        scripts={
+            "planner": [planner_output],
+            "plan_reviewer": [_approve()],
+        }
+    )
+    twig = _twig({ROOT_ID: "Scenario", ROOT_ID * 100 + 1: "Task"})
+    engine = build_engine(
+        log_dir,
+        item_id=ROOT_ID,
+        twig=twig,
+        provider=provider,
+        process_config=cfg,
+    )
+    result = await engine.run("no-truncate")
+    assert isinstance(result, Completed), result
+
+    reviewer_prompt = next(
+        c["user_message"] for c in provider.calls if c["agent"] == "plan_reviewer"
+    )
+
+    # The first words of the description must appear.
+    assert "Implement the SKU fallback selection module" in reviewer_prompt
+    # The LAST words must also appear — proves no truncation happened.
+    assert "this is the END of the description." in reviewer_prompt, (
+        f"description must NOT be truncated; full prompt:\n{reviewer_prompt}"
+    )
+    # And NO truncation ellipsis (the … character we used to append).
+    assert "…" not in reviewer_prompt, (
+        f"reviewer prompt should never contain the truncation ellipsis; "
+        f"got:\n{reviewer_prompt}"
+    )

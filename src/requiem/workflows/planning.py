@@ -627,11 +627,16 @@ def build_verb_registry(
                     child_block += f"    {i}. [{wit}] {title}\n"
                     if desc:
                         # Indent the description so it visually nests under
-                        # the title; cap to keep the prompt focused.
-                        desc_short = desc.strip()
-                        if len(desc_short) > 400:
-                            desc_short = desc_short[:400] + "…"
-                        child_block += f"        {desc_short}\n"
+                        # the title. NO truncation — see ADR-0025 dogfood
+                        # run 7 (2026-06-17): truncating at 400 chars made
+                        # the reviewer think the PLANNER produced truncated
+                        # descriptions ("description is truncated mid-
+                        # sentence at 'recommended SKU p…'"). It kept
+                        # revising to "fix" what was actually a rendering
+                        # artifact, never converging. Trust the planner's
+                        # output — show it complete.
+                        desc_clean = desc.strip()
+                        child_block += f"        {desc_clean}\n"
             else:
                 child_block = "\n  proposed children: none (leaf plan)\n"
 
