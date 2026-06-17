@@ -275,13 +275,14 @@ class CopilotProvider:
         if schema is None:
             return success_with({"text": response_text}, receipt, agent=spec.name)
 
-        # Strip markdown code fences before parsing — Copilot models
-        # (especially claude-sonnet-4.5) frequently wrap JSON in
-        # ```json ... ``` fences even when the prompt says not to.
-        # OpenAI's strict json_schema mode and Anthropic's tool-use
-        # both sidestep this at the API layer; we have no equivalent
-        # channel with Copilot, so we post-process defensively.
-        clean = _strip_code_fence(response_text)
+        # Extract JSON from the response — Copilot models (especially
+        # claude-sonnet-4.5) routinely add prose preamble + wrap JSON in
+        # ```json ... ``` fences even when the prompt forbids it. They
+        # also sometimes emit prose AFTER the JSON. OpenAI's strict
+        # json_schema mode and Anthropic's tool-use API both sidestep
+        # this at the API layer; with Copilot we have to post-process
+        # defensively. See _extract_json_block for the strategy.
+        clean = _extract_json_block(response_text)
 
         parsed, errors = validate_schema(clean, schema)
         if parsed is None:
@@ -291,30 +292,152 @@ class CopilotProvider:
         return success_with(parsed, receipt, agent=spec.name)
 
 
-def _strip_code_fence(text: str) -> str:
-    """Strip a leading/trailing markdown code fence if present.
+def _extract_json_block(text: str) -> str:
+    """Pull a JSON candidate out of a possibly-prosey LLM response.
 
-    Handles ``` ``` (bare), ```json ```, ```JSON ```, and ``` ```\\n
-    variants. If no fence is present, returns the text unchanged.
-    Only strips ONE outer fence — if the LLM nests fences (rare), the
-    inner content is preserved as-is and pydantic will surface the
-    real shape error.
+    Strategy (try each in order, return the first that produces a
+    plausible JSON candidate):
+
+    1. **Whole-text already-JSON**: if the trimmed text starts with
+       ``{`` or ``[``, return it. validate_schema handles the parsing.
+    2. **Fenced block anywhere**: scan for the first ``\\u0060\\u0060\\u0060`` opening
+       fence (with or without a ``json``/``JSON`` language hint); return
+       the content up to the next ``\\u0060\\u0060\\u0060``. This handles the common
+       "prose preamble + ```json {...} ``` + optional trailing prose"
+       shape claude-sonnet-4.5 produces under codebase-grounding tasks.
+    3. **Brace-balanced extraction**: find the first ``{`` or ``[`` in
+       the text, then walk forward maintaining brace depth (respecting
+       JSON string escaping) until the matching close. Return that
+       slice. This is the fallback for the un-fenced "prose then naked
+       JSON" shape.
+    4. **Give up**: return the trimmed text and let validate_schema
+       report a parse error. (Caller turns this into BadOutput.)
+
+    No JSON parsing here — that's validate_schema's job. We just narrow
+    the candidate to maximise its chance of parsing cleanly.
     """
     s = text.strip()
-    if not s.startswith("```"):
-        return text
-    # Drop the opening fence line (e.g. ```json or just ```)
-    nl = s.find("\n")
-    if nl == -1:
-        # ``` on its own line, no body — let the parser report empty
-        return text
-    body = s[nl + 1 :]
-    # Drop the trailing ``` (may be the last line or end of string)
-    if body.endswith("```"):
-        body = body[:-3]
-    elif body.rstrip().endswith("```"):
-        body = body.rstrip()[:-3]
-    return body.strip()
+    if not s:
+        return s
+
+    # (1) Already-JSON whole text.
+    if s.startswith("{") or s.startswith("["):
+        return s
+
+    # (2) Fenced block anywhere in the response.
+    fenced = _extract_fenced_json(s)
+    if fenced is not None:
+        return fenced
+
+    # (3) Brace-balanced extraction from first { or [.
+    balanced = _extract_balanced_json(s)
+    if balanced is not None:
+        return balanced
+
+    # (4) Last resort — return as-is and let the parser surface the error.
+    return s
+
+
+def _extract_fenced_json(s: str) -> str | None:
+    """Find the first ```...``` block whose opening line is bare or
+    ``json``/``JSON``. Returns the inner content (no fence markers), or
+    None if no plausible fence was found.
+
+    The fence may appear anywhere in the input (start, middle, end);
+    prose before and after is ignored. Non-JSON fences (```python,
+    ```bash, etc.) are skipped — including their closing ``` — so the
+    scan continues past them looking for a JSON-typed fence later in
+    the response.
+    """
+    # Walk through ``` openings. For each, the opening line ends at the
+    # next \n; the content is everything up to the next ``` on its own
+    # line (or end-of-string).
+    cursor = 0
+    while True:
+        open_idx = s.find("```", cursor)
+        if open_idx == -1:
+            return None
+        # The "language hint" is whatever's on the opening line after ```
+        line_end = s.find("\n", open_idx + 3)
+        if line_end == -1:
+            # ``` with no newline — malformed, skip.
+            return None
+        hint = s[open_idx + 3 : line_end].strip().lower()
+        body_start = line_end + 1
+        # Find the closing ```; tolerate optional whitespace before/after.
+        close_idx = s.find("```", body_start)
+        # Accept bare fence ("") or json/JSON hint. Skip non-JSON fences
+        # like ```python, ```bash etc. — they won't contain our payload.
+        # Critical: when skipping, advance cursor PAST the close fence
+        # (close_idx + 3) so we don't re-find the same close as the next
+        # "opening" ```.
+        if hint not in ("", "json"):
+            cursor = (close_idx + 3) if close_idx != -1 else (line_end + 1)
+            continue
+        if close_idx == -1:
+            # Open fence but no close — take everything to end of string.
+            body = s[body_start:].strip()
+            if body and (body[0] == "{" or body[0] == "["):
+                return body
+            return None
+        body = s[body_start:close_idx].strip()
+        # Only return this fenced block if its content looks like JSON;
+        # otherwise keep scanning for a later fence (advance past close).
+        if body and (body[0] == "{" or body[0] == "["):
+            return body
+        cursor = close_idx + 3
+
+
+def _extract_balanced_json(s: str) -> str | None:
+    """Find the first { or [ and return the slice through its matching
+    close bracket, respecting JSON string escaping. Returns None if no
+    opener is found or the bracket structure never balances.
+
+    This is the "naked JSON after prose" fallback when no fence was used.
+    """
+    # Find the first opener.
+    for i, ch in enumerate(s):
+        if ch in "{[":
+            opener = ch
+            closer = "}" if opener == "{" else "]"
+            break
+    else:
+        return None
+
+    depth = 0
+    in_string = False
+    escape_next = False
+    for j in range(i, len(s)):
+        ch = s[j]
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == "\\" and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                return s[i : j + 1]
+    return None
+
+
+# Back-compat: older callers / tests import _strip_code_fence directly.
+# Keep the symbol as a thin wrapper over the new extractor so existing
+# imports continue to work. The new logic is a strict superset of the
+# old behaviour (every input the old function returned cleanly the new
+# one returns the same cleaned result, plus more).
+def _strip_code_fence(text: str) -> str:
+    """Deprecated alias for :func:`_extract_json_block`. Kept for tests
+    and external callers that imported the old name."""
+    return _extract_json_block(text)
 
 
 # ---- prompt shaping ---------------------------------------------------

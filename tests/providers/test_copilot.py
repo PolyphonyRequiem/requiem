@@ -37,6 +37,9 @@ from requiem.providers.copilot import (
     CopilotProvider,
     _build_prompt,
     _copilot_token_present,
+    _extract_balanced_json,
+    _extract_fenced_json,
+    _extract_json_block,
     _strip_code_fence,
 )
 
@@ -465,3 +468,189 @@ def test_default_provider_prefers_copilot_when_token_set(monkeypatch):
     fake = _FakeCopilotClient(script=_success_script('{"answer": "x"}'))
     chosen = default_provider(client=fake)
     assert type(chosen).__name__ == "CopilotProvider"
+
+
+# ---- regression: 2026-06-17 dogfood #62759077 grandchild --------------
+#
+# The first --commit dogfood ran the recursion 2 levels deep. At the
+# grandchild planner_1 (task: "Implement capacity probe mechanism"),
+# claude-sonnet-4.5 produced a high-quality JSON plan — but PREFIXED
+# with prose ("Based on the codebase analysis, I can see this is a
+# CloudVault service..."). The original _strip_code_fence only stripped
+# if the *whole text* started with ```; this case starts with prose
+# then has the fence in the middle. Result: BadOutput, escalation_gate,
+# exit 1 — and we threw away a perfectly good plan.
+#
+# The fix (_extract_json_block) handles four shapes:
+#   1. whole text already JSON
+#   2. ``` fence anywhere in the response (with or without `json` hint)
+#   3. naked JSON after prose (brace-balanced extraction)
+#   4. give up (let validate_schema report)
+# These tests pin each shape + the actual live response that triggered
+# the bug.
+
+
+_LIVE_GRANDCHILD_RESPONSE = '''Based on the codebase analysis, I can see this is a CloudVault service with existing health endpoints (`/health/live`, `/health/ready`, `/health/dependencies`). A "capacity probe mechanism" would extend this health infrastructure to report service capacity metrics for load balancing and auto-scaling decisions. Given this is at planning depth 2 of 4, this should decompose into concrete implementation tasks.
+
+```json
+{
+  "summary": "Implement a capacity probe endpoint",
+  "decomposable": true,
+  "estimated_complexity": "medium",
+  "rationale": "This task naturally decomposes into four distinct sub-tasks.",
+  "children": [
+    {"title": "Define capacity metrics", "description": "spec the schema", "work_item_type": "Task"},
+    {"title": "Implement capacity calc", "description": "IHealthCheck impl", "work_item_type": "Task"}
+  ]
+}
+```'''
+
+
+async def test_live_dogfood_grandchild_prose_preamble_then_fenced_json():
+    """REGRESSION PIN (dogfood 2026-06-17 grandchild #62759077): the
+    actual live response from claude-sonnet-4.5 must parse. Before the
+    fix this hit BadOutput → bad_output_gate → abort."""
+
+    class _RichOut(BaseModel):
+        summary: str
+        decomposable: bool
+        estimated_complexity: str
+        rationale: str
+        children: list[dict]
+
+    spec = _make_spec(response_model=_RichOut)
+    fake = _FakeCopilotClient(script=_success_script(_LIVE_GRANDCHILD_RESPONSE))
+    provider = CopilotProvider(client=fake)
+    outcome = await provider.invoke(_make_call(spec))
+    await provider.aclose()
+
+    assert isinstance(outcome, Success), f"got {type(outcome).__name__}: {outcome}"
+    parsed = outcome.value["parsed"]
+    assert parsed["decomposable"] is True
+    assert len(parsed["children"]) == 2
+    assert parsed["children"][0]["title"] == "Define capacity metrics"
+
+
+async def test_naked_json_after_prose_brace_balanced_extraction():
+    """Prose preamble + bare JSON (no fence) + optional prose trail —
+    falls through to the brace-balanced extraction path."""
+    raw = '''Looking at the schema requirements:
+
+{"answer": "naked", "extra": "ignored?"}
+
+That's my answer.'''
+    fake = _FakeCopilotClient(script=_success_script(raw))
+    provider = CopilotProvider(client=fake)
+    outcome = await provider.invoke(_make_call(_make_spec()))
+    await provider.aclose()
+    assert isinstance(outcome, Success), f"got {type(outcome).__name__}"
+    # _TinyOut has only `answer`; pydantic ignores the extra by default.
+    assert outcome.value["parsed"] == {"answer": "naked"}
+
+
+async def test_python_fenced_block_is_ignored_falls_to_balanced():
+    """A ```python fence in the response is NOT mistaken for JSON.
+    The extractor skips non-JSON fences and falls through to balanced
+    JSON extraction (which finds nothing → fence content survives →
+    parse fails → BadOutput, the correct outcome)."""
+    raw = '''Here is some code:
+```python
+print("hello")
+```
+No JSON answer.'''
+    fake = _FakeCopilotClient(script=_success_script(raw))
+    provider = CopilotProvider(client=fake)
+    outcome = await provider.invoke(_make_call(_make_spec()))
+    await provider.aclose()
+    assert isinstance(outcome, BadOutput), (
+        f"non-JSON response should produce BadOutput; got {type(outcome).__name__}"
+    )
+
+
+# ---- unit tests for the new extractor helpers -------------------------
+
+
+def test_extract_json_block_whole_text_json_passthrough():
+    assert _extract_json_block('{"a": 1}') == '{"a": 1}'
+    assert _extract_json_block('[1, 2, 3]') == '[1, 2, 3]'
+
+
+def test_extract_json_block_empty_input():
+    assert _extract_json_block("") == ""
+    assert _extract_json_block("   ") == ""
+
+
+def test_extract_fenced_json_finds_mid_response_fence():
+    """The killer case: prose preamble, then ```json {...} ```, then
+    optional trailing prose."""
+    s = 'Prefix prose.\n\n```json\n{"x": 1}\n```\n\nTrailing prose.'
+    out = _extract_fenced_json(s)
+    assert out == '{"x": 1}'
+
+
+def test_extract_fenced_json_bare_fence_with_json_content():
+    s = 'Some context.\n\n```\n{"x": 1}\n```'
+    out = _extract_fenced_json(s)
+    assert out == '{"x": 1}'
+
+
+def test_extract_fenced_json_skips_non_json_fences():
+    """A ```python fence should be skipped; if there's a later ```json
+    fence, that one wins. If not, returns None."""
+    s = '```python\nprint(1)\n```\n\n```json\n{"x": 2}\n```'
+    out = _extract_fenced_json(s)
+    assert out == '{"x": 2}'
+
+
+def test_extract_fenced_json_python_only_returns_none():
+    """If the only fence is non-JSON-looking content, return None so the
+    caller falls through to the next extraction strategy."""
+    s = '```python\nprint("not json")\n```'
+    out = _extract_fenced_json(s)
+    assert out is None
+
+
+def test_extract_fenced_json_uppercase_hint():
+    s = '```JSON\n{"x": 1}\n```'
+    assert _extract_fenced_json(s) == '{"x": 1}'
+
+
+def test_extract_balanced_json_finds_object_after_prose():
+    s = 'Here is the result: {"x": 1, "y": [2, 3]} done.'
+    assert _extract_balanced_json(s) == '{"x": 1, "y": [2, 3]}'
+
+
+def test_extract_balanced_json_finds_array_after_prose():
+    s = 'Items: [1, 2, {"k": "v"}] returned.'
+    assert _extract_balanced_json(s) == '[1, 2, {"k": "v"}]'
+
+
+def test_extract_balanced_json_respects_string_escaping():
+    """Braces inside JSON string values must not affect depth counting."""
+    s = 'Result: {"msg": "has } and { inside"} done.'
+    assert _extract_balanced_json(s) == '{"msg": "has } and { inside"}'
+
+
+def test_extract_balanced_json_respects_backslash_escape():
+    """Backslash-escaped quote inside a string must not toggle in_string."""
+    s = r'Result: {"msg": "has \"quotes\" inside"} done.'
+    assert _extract_balanced_json(s) == r'{"msg": "has \"quotes\" inside"}'
+
+
+def test_extract_balanced_json_no_opener_returns_none():
+    assert _extract_balanced_json("no braces here") is None
+
+
+def test_extract_balanced_json_unbalanced_returns_none():
+    """Half-open brackets are not extracted (no matching close)."""
+    assert _extract_balanced_json("{open without close") is None
+
+
+def test_strip_code_fence_back_compat_alias():
+    """_strip_code_fence is kept as a back-compat alias delegating to
+    _extract_json_block. Verifies the symbol still works for callers
+    that imported it under the old name."""
+    assert _strip_code_fence('```json\n{"a": 1}\n```') == '{"a": 1}'
+    assert _strip_code_fence('{"a": 1}') == '{"a": 1}'
+    assert _strip_code_fence("plain text") == "plain text"
+
