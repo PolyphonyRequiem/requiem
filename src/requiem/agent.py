@@ -89,7 +89,11 @@ class FakeProvider:
                 ),
             )
         self._cursor[call.spec.name] = idx + 1
-        self.calls.append({"agent": call.spec.name, "retry_key": call.retry_key})
+        self.calls.append({
+            "agent": call.spec.name,
+            "retry_key": call.retry_key,
+            "user_message": call.user_message,
+        })
 
         entry = entries[idx]
         if call.event_callback:

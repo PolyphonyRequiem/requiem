@@ -591,14 +591,39 @@ def build_verb_registry(
         def _prompt(ctx):
             planner = ctx.completed[f"planner_{iteration}"]["value"]["parsed"]
             item = ctx.completed["fetch_item"]["value"]
+            children = planner.get("children") or []
+            # ADR-0025 Gap A* fix: render the actual children so the
+            # reviewer can evaluate the decomposition, not just see a
+            # count. Pre-fix the prompt showed "children: N proposed"
+            # which forced reviewers to escalate ("cannot evaluate
+            # without seeing the children") — see 2026-06-17 #62759077
+            # dogfood run 4. Each child rendered as a numbered bullet
+            # with title, type, and description.
+            if children:
+                child_block = "\n  proposed children:\n"
+                for i, c in enumerate(children, 1):
+                    title = c.get("title", "(no title)")
+                    wit = c.get("work_item_type", "(no type)")
+                    desc = c.get("description", "") or ""
+                    child_block += f"    {i}. [{wit}] {title}\n"
+                    if desc:
+                        # Indent the description so it visually nests under
+                        # the title; cap to keep the prompt focused.
+                        desc_short = desc.strip()
+                        if len(desc_short) > 400:
+                            desc_short = desc_short[:400] + "…"
+                        child_block += f"        {desc_short}\n"
+            else:
+                child_block = "\n  proposed children: none (leaf plan)\n"
+
             return (
                 f"Review the following plan for AB#{item['item_id']} "
                 f"(\"{item['title']}\"):\n\n"
                 f"  summary: {planner['summary']}\n"
                 f"  decomposable: {planner['decomposable']}\n"
                 f"  estimated_complexity: {planner['estimated_complexity']}\n"
-                f"  rationale: {planner['rationale']}\n"
-                f"  children: {len(planner['children'])} proposed\n\n"
+                f"  rationale: {planner['rationale']}"
+                f"{child_block}\n"
                 f"Iteration: {iteration} of {ITER_CAP}. "
                 "Approve, request revision, or escalate."
             )

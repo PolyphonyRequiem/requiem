@@ -469,3 +469,79 @@ async def test_no_tier_policy_still_calls_planner_no_regression(
     agent_names = [c["agent"] for c in provider.calls]
     assert "planner" in agent_names
     assert "plan_reviewer" in agent_names
+
+
+# ---- ADR-0025 Gap A* (post-Gap-A finding): reviewer prompt must include
+# the planner's proposed children, not just the count ----------------------
+#
+# 2026-06-17 SKU-fallback dogfood retry (#62759077, run 4): after Gap A
+# shipped, the top-level Scenario plan still cascade-failed because the
+# reviewer escalated on iteration 2 with the feedback:
+#
+#   "Cannot properly evaluate plan without seeing the 7 proposed child
+#    tasks. Need visibility into the actual decomposition to verify..."
+#
+# That feedback was CORRECT. The reviewer prompt was literally telling
+# the model "children: 7 proposed" — just the count — without any of
+# the actual titles, types, or descriptions. The reviewer had no way to
+# evaluate the decomposition. Fix: render the full child list in the
+# reviewer prompt so it can evaluate properly.
+
+
+async def test_reviewer_prompt_includes_child_titles_not_just_count(
+    log_dir: Path,
+):
+    """Pin against the 2026-06-17 dogfood regression: when the planner
+    proposes children, the reviewer's prompt must contain each child's
+    title (and ideally type+description) so the reviewer can actually
+    evaluate the decomposition. Showing just '7 proposed' as a count
+    forces the reviewer to escalate (or worse, hallucinate)."""
+    cfg = ProcessConfig(
+        decomposable_types=frozenset({"Scenario"}),
+        implementable_types=frozenset({"Task"}),
+    )
+    provider = FakeProvider(
+        scripts={
+            "planner": [_decomp("Investigate SKU selection", "Implement fallback logic", "Add observability")],
+            "plan_reviewer": [_approve()],
+        }
+    )
+    twig = _twig({
+        ROOT_ID: "Scenario",
+        ROOT_ID * 100 + 1: "Task",
+        ROOT_ID * 100 + 2: "Task",
+        ROOT_ID * 100 + 3: "Task",
+    })
+    engine = build_engine(
+        log_dir,
+        item_id=ROOT_ID,
+        twig=twig,
+        provider=provider,
+        process_config=cfg,
+    )
+    result = await engine.run("reviewer-sees-children")
+    assert isinstance(result, Completed), result
+    assert result.final_node == "end", (
+        f"approved reviewer should reach end; got {result.final_node}"
+    )
+
+    # Find the reviewer call's user_message.
+    reviewer_calls = [c for c in provider.calls if c["agent"] == "plan_reviewer"]
+    assert reviewer_calls, "reviewer should have been called for a Scenario root"
+    reviewer_prompt = reviewer_calls[0]["user_message"]
+
+    # The actual regression assertion: each proposed child's title must
+    # appear in the reviewer's prompt. Pre-fix, only the count ("3 proposed")
+    # was rendered; post-fix, the titles must be present.
+    assert "Investigate SKU selection" in reviewer_prompt, (
+        f"reviewer prompt should include child 1's title; got prompt:\n"
+        f"{reviewer_prompt}"
+    )
+    assert "Implement fallback logic" in reviewer_prompt, (
+        f"reviewer prompt should include child 2's title; got prompt:\n"
+        f"{reviewer_prompt}"
+    )
+    assert "Add observability" in reviewer_prompt, (
+        f"reviewer prompt should include child 3's title; got prompt:\n"
+        f"{reviewer_prompt}"
+    )
