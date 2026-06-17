@@ -448,3 +448,186 @@ async def test_inv_restart_2level_crash_mid_grandchild(log_dir: Path):
     plan2 = project_plan_result(completed_from_log(root_log))
     assert plan2 is not None
     assert plan2 == plan1, (plan1, plan2)
+
+
+# ---- regression: 2026-06-17 SKU-fallback dogfood ----------------------
+#
+# The first live dogfood run against #62758386 hit a guaranteed-failure
+# path: the planner returned a decomposable plan, the workflow tried to
+# recurse into child_1, and the child's `fetch_item` called twig with the
+# synthesised id `parent_id * 100 + 1` — which does NOT exist in ADO
+# until `commit_plan` seeds it. Twig returned not-found → twig_gate →
+# escalation_gate → fail_end. Every decomposable plan in `--commit=false`
+# mode would have hit this. (The existing recursion suite above hides
+# the bug because it pre-seeds the FakeTwigClient with every synthetic
+# id — exactly the lookup that fails in production.)
+#
+# The fix carries the parent's already-resolved ChildPlan
+# (title/description/work_item_type) through `child_inputs` → `start_run`
+# and short-circuits `fetch_item` in the recursive child. These tests
+# pin both branches: top-level still calls twig (no regression), and the
+# recursive child works without ANY child ids pre-seeded in twig.
+
+
+async def test_recursive_child_uses_parent_proposal_without_twig_seed(
+    log_dir: Path,
+):
+    """REGRESSION PIN (dogfood 2026-06-17, item #62758386 / commit d155ae8):
+    a decomposable root must recurse cleanly even when twig has ONLY the
+    root pre-seeded and not the synthesised child ids. Before the fix
+    this hit twig_not_found → escalation_gate. After the fix the
+    recursive child uses the parent's already-resolved ChildPlan and
+    skips twig entirely."""
+    # Build the planner script: root says "decomposable into 2 leaves",
+    # each child says "leaf".
+    provider = FakeProvider(
+        scripts={
+            "planner": [
+                _decomp("Probe SKUs", "Rank + surface"),  # root
+                _leaf("probe"),                            # child 1
+                _leaf("rank"),                             # child 2
+            ],
+            "plan_reviewer": [_approve(), _approve(), _approve()],
+        }
+    )
+    # CRITICAL: only the ROOT is in twig. Synthetic child ids
+    # (1234500 + 1, +2) are NOT seeded — they don't exist in ADO yet,
+    # mirroring the real --commit=false dogfood scenario.
+    twig = _twig_with(ROOT_ID)  # ONLY root, no children
+    engine = build_engine(
+        log_dir, item_id=ROOT_ID, twig=twig, provider=provider,
+    )
+    result = await engine.run("rec-no-seed")
+    assert isinstance(result, Completed), result
+    assert result.final_node == "end", (
+        f"recursive run should reach 'end', got {result.final_node!r}"
+    )
+
+    plan = project_plan_result(completed_from_log(engine.log_path("rec-no-seed")))
+    assert plan is not None
+    assert plan.decomposable is True
+    assert len(plan.children) == 2, (
+        f"expected 2 children, got {len(plan.children)}"
+    )
+    # Each child got the parent's proposal flowed through; titles came
+    # from the planner's ChildPlan (via prep_child_i.child_title) rather
+    # than a twig lookup.
+    titles = {c.summary for c in plan.children}
+    assert titles == {"probe", "rank"}, (
+        f"children summaries should reflect each child's planner output: {titles}"
+    )
+
+
+async def test_recursive_child_fetch_item_records_proposal_artifact(
+    log_dir: Path,
+):
+    """The recursive `fetch_item` outcome records its source as
+    `planner:proposal/<handle>@<id>` (NOT `twig:item/<id>`) so an
+    operator reading the event log can tell that THIS child's metadata
+    came from the parent's planner output, not a twig fetch. Important
+    for debugging + auditability."""
+    provider = FakeProvider(
+        scripts={
+            "planner": [_decomp("only-child"), _leaf("c")],
+            "plan_reviewer": [_approve(), _approve()],
+        }
+    )
+    twig = _twig_with(ROOT_ID)  # ONLY root
+    engine = build_engine(log_dir, item_id=ROOT_ID, twig=twig, provider=provider)
+    result = await engine.run("rec-artifact")
+    assert isinstance(result, Completed)
+    assert result.final_node == "end"
+
+    # Read the CHILD's events.jsonl directly, find its fetch_item
+    # outcome, and confirm the inspected_artifacts marker.
+    child_log = log_dir / "rec-artifact__child_1.events.jsonl"
+    assert child_log.exists()
+    found_proposal_artifact = False
+    for ev in replay(child_log):
+        if ev.get("kind") != "verb_completed":
+            continue
+        if ev.get("node_id") != "fetch_item":
+            continue
+        artifacts = (ev.get("payload") or {}).get("outcome", {}).get(
+            "inspected_artifacts", []
+        )
+        for a in artifacts:
+            if a.startswith("planner:proposal/"):
+                found_proposal_artifact = True
+        # fetch_item should NOT have called twig (no twig:item artifact).
+        assert not any(a.startswith("twig:item/") for a in artifacts), (
+            f"recursive child's fetch_item should skip twig; artifacts={artifacts}"
+        )
+    assert found_proposal_artifact, (
+        "recursive child's fetch_item should record a planner:proposal/* "
+        "artifact tagging its source as the parent's resolved ChildPlan"
+    )
+
+
+async def test_top_level_still_calls_twig_no_regression(log_dir: Path):
+    """The top-level (no child_proposal) path is UNCHANGED — still calls
+    twig and records `twig:item/<id>`. Guards against the fix accidentally
+    making the top-level case skip twig too."""
+    provider = FakeProvider(
+        scripts={
+            "planner": [_leaf("atomic")],
+            "plan_reviewer": [_approve()],
+        }
+    )
+    twig = _twig_with(ROOT_ID)
+    engine = build_engine(log_dir, item_id=ROOT_ID, twig=twig, provider=provider)
+    result = await engine.run("top-level")
+    assert isinstance(result, Completed)
+    assert result.final_node == "end"
+
+    root_log = log_dir / "top-level.events.jsonl"
+    found_twig_artifact = False
+    for ev in replay(root_log):
+        if ev.get("kind") != "verb_completed":
+            continue
+        if ev.get("node_id") != "fetch_item":
+            continue
+        artifacts = (ev.get("payload") or {}).get("outcome", {}).get(
+            "inspected_artifacts", []
+        )
+        if any(a == f"twig:item/{ROOT_ID}" for a in artifacts):
+            found_twig_artifact = True
+        assert not any(a.startswith("planner:proposal/") for a in artifacts), (
+            f"top-level fetch_item should NOT skip twig; artifacts={artifacts}"
+        )
+    assert found_twig_artifact, (
+        "top-level fetch_item should record twig:item/<id>; got log without it"
+    )
+
+
+async def test_build_engine_accepts_child_proposal_kwarg(log_dir: Path):
+    """`build_engine(child_proposal=...)` is the supported direct API
+    for constructing a recursive child engine (the kernel calls this
+    internally on subworkflow spawn). Pinning the kwarg shape so a
+    future refactor doesn't quietly drop it."""
+    proposal = {
+        "title": "Direct child",
+        "description": "made by hand",
+        "work_item_type": "Task",
+        "state": "Proposed",
+    }
+    provider = FakeProvider(
+        scripts={"planner": [_leaf("direct")], "plan_reviewer": [_approve()]}
+    )
+    # Pre-seed NOTHING — proves we go via the proposal path.
+    twig = _twig_with()  # empty
+    engine = build_engine(
+        log_dir,
+        item_id=999_999_99,   # synthetic-looking id, NOT in twig
+        twig=twig,
+        provider=provider,
+        child_proposal=proposal,
+    )
+    result = await engine.run("direct-child")
+    assert isinstance(result, Completed)
+    assert result.final_node == "end"
+    # The plan should reflect the proposal's title/type.
+    plan = project_plan_result(completed_from_log(engine.log_path("direct-child")))
+    assert plan is not None
+    assert plan.summary == "direct"
+

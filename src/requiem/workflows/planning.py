@@ -332,6 +332,7 @@ def build_verb_registry(
     twig: TwigClientProto,
     log_dir: Path,
     config: ProcessConfig | None = None,
+    child_proposal: dict[str, Any] | None = None,
 ) -> VerbRegistry:
     verbs = VerbRegistry()
     ancestor_set = tuple(int(a) for a in ancestor_item_ids)
@@ -363,6 +364,14 @@ def build_verb_registry(
                 # Snapshot the effective tier-routing config so a resume reads
                 # the durable facts rather than re-reading disk (INV-RESTART).
                 "process_config": closed_config.to_snapshot(),
+                # Recursive-child proposal carried over from the parent (see
+                # build_engine docstring + fetch_item). Top-level runs leave
+                # this None and fetch_item calls twig; recursive children
+                # receive the parent's already-resolved ChildPlan and skip the
+                # twig fetch (the child's id is a synthesised
+                # parent_id*100+slot that does NOT exist in ADO until
+                # commit_plan seeds it).
+                "child_proposal": child_proposal,
             },
         )
 
@@ -381,6 +390,27 @@ def build_verb_registry(
 
     @verbs.register("fetch_item")
     async def _fetch(ctx):
+        # Recursive-child path: the parent already resolved this child's
+        # title / description / work_item_type from its planner output and
+        # passed it through `child_inputs` → `start_run`. The child's
+        # synthesised id (parent_id*100+slot) does NOT exist in ADO until
+        # `commit_plan` seeds it, so a twig lookup would fail. Use the
+        # parent-supplied proposal directly and skip twig.
+        start_val = (ctx.completed.get("start") or {}).get("value") or {}
+        proposal = start_val.get("child_proposal")
+        if proposal:
+            return Success(
+                value={
+                    "item_id": item_id,
+                    "title": proposal.get("title") or "",
+                    "state": proposal.get("state") or "Proposed",
+                    "work_item_type": proposal.get("work_item_type") or "",
+                    "area_path": proposal.get("area_path") or "",
+                },
+                inspected_artifacts=(
+                    f"planner:proposal/{parent_plan_id or 'recursive'}@{item_id}",
+                ),
+            )
         try:
             item = await twig.show_async(item_id)
         except TwigItemNotFoundError as e:
@@ -728,6 +758,18 @@ def build_verb_registry(
         snap = (ctx.completed.get("start") or {}).get("value", {}).get(
             "process_config"
         )
+        # Carry the parent's already-resolved child proposal so the child's
+        # `fetch_item` can skip twig (the synthesised id doesn't exist in ADO
+        # until commit_plan seeds it). This is the load-bearing fix for
+        # decomposable dry-runs: without this, the recursive `fetch_item`
+        # would call twig with `parent_id*100+slot` and hit twig_not_found,
+        # cascading into the escalation_gate.
+        child_proposal = {
+            "title": prep.get("child_title") or "",
+            "description": prep.get("child_description") or "",
+            "work_item_type": prep.get("child_work_item_type") or "",
+            "state": "Proposed",
+        }
         return {
             "item_id": child_id,
             "current_depth": current_depth + 1,
@@ -735,6 +777,7 @@ def build_verb_registry(
             "parent_plan_id": parent_handle,
             "ancestor_item_ids": new_ancestors,
             "process_config": snap,
+            "child_proposal": child_proposal,
         }
 
     @verbs.register("aggregate_children")
@@ -1631,6 +1674,7 @@ def build_engine(
     provider: AgentProvider | None = None,
     gate_handler=None,
     process_config: "ProcessConfig | dict[str, Any] | None" = None,
+    child_proposal: dict[str, Any] | None = None,
 ) -> Engine:
     """Construct a runnable Engine for the planning workflow.
 
@@ -1642,6 +1686,16 @@ def build_engine(
     ``ancestor_item_ids`` carries the chain of ``item_id``s from the
     root planning run down to this invocation (cycle detection input).
     For the root invocation, leave it empty.
+
+    ``child_proposal`` carries the parent's already-resolved ChildPlan
+    (``{title, description, work_item_type, state}``) when this engine
+    is the recursive child of another planning run. When set, the
+    workflow's ``fetch_item`` verb uses this proposal directly and
+    skips the twig lookup — the synthesised child id
+    (``parent_id*100+slot``) does NOT exist in ADO until ``commit_plan``
+    seeds it, so a twig fetch is guaranteed to fail. Top-level callers
+    always leave this ``None``; the recursive ``child_inputs`` verb
+    populates it from the parent's ``prep_child_i`` outcome.
 
     Test-fake threading: any non-None ``twig`` / ``provider`` /
     ``gate_handler`` arguments are installed in module-level contextvars
@@ -1692,6 +1746,7 @@ def build_engine(
             twig=final_twig,
             log_dir=log_dir,
             config=final_config,
+            child_proposal=child_proposal,
         ),
         agents=build_agent_registry(),
         provider=final_provider,
