@@ -273,17 +273,18 @@ class TwigClient:
 
         ## Inferred CLI contract
 
-        Polyphony's ``twig`` ships a dedicated ``create-child`` verb;
-        the local twig binary (0.81) exposes the same shape via
-        ``twig new --parent <id> --title <str> --type <str>``. We invoke
-        the polyphony-canonical form here so the seam reads the same as
-        the rest of the file:
+        The local twig binary (0.81+) exposes child creation via:
 
-            twig create-child --parent <id> --title <str>
-                              --work-item-type <str>
-                              [--area-path <str>]
-                              [--description <str>]
-                              --output json
+            twig new --parent <id> --title <str> --type <str>
+                     [--area <str>]
+                     [--description <str>]
+                     -o json
+
+        Note the flag rename history (caused dogfood run 8 failure,
+        2026-06-17): older twig builds used `create-child` /
+        `--work-item-type` / `--area-path` / `--output json`. Current
+        twig uses `new` / `--type` / `--area` / `-o json`. We invoke
+        the current names here.
 
         On exit 0, stdout is JSON with at least an ``id`` field; we lift
         it via the same ``_coerce_item`` path as ``show_async``. The
@@ -300,22 +301,18 @@ class TwigClient:
         to convert ``TwigUnknownError`` to ``NeedsHuman`` rather than
         auto-retry; auto-retrying an unclassified failure would violate
         ``INV-NO-CORRUPT-FORWARD``.
-
-        Not yet wired into the planning workflow — that wiring is
-        Stravinsky's ADR-0006 work. This method is design-neutral
-        infrastructure that any topology alternative still needs.
         """
         argv = [
-            "create-child",
+            "new",
             "--parent", str(parent_id),
             "--title", title,
-            "--work-item-type", work_item_type,
+            "--type", work_item_type,
         ]
         if area_path is not None:
-            argv.extend(["--area-path", area_path])
+            argv.extend(["--area", area_path])
         if description is not None:
             argv.extend(["--description", description])
-        argv.extend(["--output", "json"])
+        argv.extend(["-o", "json"])
 
         stdout, _ = await self._run(argv)
         payload = _parse_json(stdout)

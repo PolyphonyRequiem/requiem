@@ -387,11 +387,11 @@ class TestCreateChild:
         args = list(fake.captured["args"])
         assert args[0] == "twig"
         assert args[1:] == [
-            "create-child",
+            "new",
             "--parent", "1234",
             "--title", "New child",
-            "--work-item-type", "Task",
-            "--output", "json",
+            "--type", "Task",
+            "-o", "json",
         ]
 
     def test_create_includes_optional_area_and_description(self):
@@ -409,13 +409,13 @@ class TestCreateChild:
         args = list(fake.captured["args"])
         # Order: positional verb, parent, title, type, optionals, output.
         assert args[1:] == [
-            "create-child",
+            "new",
             "--parent", "1234",
             "--title", "New child",
-            "--work-item-type", "Task",
-            "--area-path", "PolyphonyRequiem\\v0",
+            "--type", "Task",
+            "--area", "PolyphonyRequiem\\v0",
             "--description", "Spawned by recursive planning.",
-            "--output", "json",
+            "-o", "json",
         ]
 
     def test_create_omits_optionals_when_none(self):
@@ -430,7 +430,7 @@ class TestCreateChild:
                 )
             )
         args = list(fake.captured["args"])
-        assert "--area-path" not in args
+        assert "--area" not in args
         assert "--description" not in args
 
     def test_create_refetches_when_payload_is_thin(self):
@@ -444,7 +444,7 @@ class TestCreateChild:
 
         async def factory(*args, **kwargs):
             calls.append(list(args))
-            if "create-child" in args:
+            if "new" in args:
                 return _FakeProc(b'{"id": 4242}', b"", 0)
             return _FakeProc(_NEW_CHILD_JSON.encode(), b"", 0)
 
@@ -460,7 +460,7 @@ class TestCreateChild:
         assert item.title == "New child seeded by recursive plan"
         # We expect two subprocess calls: create-child, then show.
         assert len(calls) == 2
-        assert "create-child" in calls[0]
+        assert "new" in calls[0]
         assert "show" in calls[1]
         assert "4242" in calls[1]
 
