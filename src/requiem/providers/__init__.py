@@ -38,37 +38,53 @@ from requiem.providers.anthropic import (
     DEFAULT_ANTHROPIC_MODEL,
     AnthropicProvider,
 )
+from requiem.providers.copilot import (
+    DEFAULT_COPILOT_MODEL,
+    CopilotProvider,
+    _copilot_token_present,
+)
 from requiem.providers.openai import DEFAULT_OPENAI_MODEL, OpenAIProvider
 
 
 def default_provider(**kw: Any):
     """Pick a provider based on environment.
 
-    Resolution order:
+    Resolution order (first match wins):
 
-    1. ``ANTHROPIC_API_KEY`` set → `AnthropicProvider` (preferred when
-       both are present, per the task brief).
-    2. ``OPENAI_API_KEY`` set → `OpenAIProvider`.
-    3. Neither set → ``RuntimeError`` (callers should fall back to
-       `FakeProvider` themselves in tests / dev).
+    1. ``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` / ``GITHUB_TOKEN`` set, or
+       interactive ``copilot login`` has been run → ``CopilotProvider``.
+       Copilot is preferred when present because it is the operator's
+       sanctioned-by-default model surface in v0 (no API-key billing,
+       no per-call cost worry).
+    2. ``ANTHROPIC_API_KEY`` set → ``AnthropicProvider``.
+    3. ``OPENAI_API_KEY`` set → ``OpenAIProvider``.
+    4. None of the above → ``RuntimeError`` (callers should fall back to
+       ``FakeProvider`` themselves in tests / dev).
 
     Extra kwargs are forwarded to the chosen provider's constructor.
     """
+    if _copilot_token_present():
+        return CopilotProvider(**kw)
     if os.environ.get("ANTHROPIC_API_KEY"):
         return AnthropicProvider(**kw)
     if os.environ.get("OPENAI_API_KEY"):
         return OpenAIProvider(**kw)
     raise RuntimeError(
-        "default_provider(): neither ANTHROPIC_API_KEY nor OPENAI_API_KEY "
-        "is set. Pass `AnthropicProvider(api_key=...)` / `OpenAIProvider("
-        "api_key=...)` explicitly, or use `FakeProvider` for tests."
+        "default_provider(): no provider credentials in env. Set one of:\n"
+        "  - COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN (CopilotProvider)\n"
+        "  - ANTHROPIC_API_KEY (AnthropicProvider)\n"
+        "  - OPENAI_API_KEY (OpenAIProvider)\n"
+        "Or pass a concrete provider explicitly (`AnthropicProvider(api_key=...)`, "
+        "`CopilotProvider()`, etc.), or use `FakeProvider` for tests."
     )
 
 
 __all__ = [
     "AnthropicProvider",
+    "CopilotProvider",
     "OpenAIProvider",
     "DEFAULT_ANTHROPIC_MODEL",
+    "DEFAULT_COPILOT_MODEL",
     "DEFAULT_OPENAI_MODEL",
     "default_provider",
     "make_receipt",
