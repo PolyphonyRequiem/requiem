@@ -275,12 +275,46 @@ class CopilotProvider:
         if schema is None:
             return success_with({"text": response_text}, receipt, agent=spec.name)
 
-        parsed, errors = validate_schema(response_text, schema)
+        # Strip markdown code fences before parsing — Copilot models
+        # (especially claude-sonnet-4.5) frequently wrap JSON in
+        # ```json ... ``` fences even when the prompt says not to.
+        # OpenAI's strict json_schema mode and Anthropic's tool-use
+        # both sidestep this at the API layer; we have no equivalent
+        # channel with Copilot, so we post-process defensively.
+        clean = _strip_code_fence(response_text)
+
+        parsed, errors = validate_schema(clean, schema)
         if parsed is None:
             return bad_output_with(
                 raw=response_text, errors=errors, receipt=receipt,
             )
         return success_with(parsed, receipt, agent=spec.name)
+
+
+def _strip_code_fence(text: str) -> str:
+    """Strip a leading/trailing markdown code fence if present.
+
+    Handles ``` ``` (bare), ```json ```, ```JSON ```, and ``` ```\\n
+    variants. If no fence is present, returns the text unchanged.
+    Only strips ONE outer fence — if the LLM nests fences (rare), the
+    inner content is preserved as-is and pydantic will surface the
+    real shape error.
+    """
+    s = text.strip()
+    if not s.startswith("```"):
+        return text
+    # Drop the opening fence line (e.g. ```json or just ```)
+    nl = s.find("\n")
+    if nl == -1:
+        # ``` on its own line, no body — let the parser report empty
+        return text
+    body = s[nl + 1 :]
+    # Drop the trailing ``` (may be the last line or end of string)
+    if body.endswith("```"):
+        body = body[:-3]
+    elif body.rstrip().endswith("```"):
+        body = body.rstrip()[:-3]
+    return body.strip()
 
 
 # ---- prompt shaping ---------------------------------------------------

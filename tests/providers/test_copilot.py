@@ -37,6 +37,7 @@ from requiem.providers.copilot import (
     CopilotProvider,
     _build_prompt,
     _copilot_token_present,
+    _strip_code_fence,
 )
 
 
@@ -289,6 +290,33 @@ async def test_schema_violation_returns_bad_output():
     assert any("answer" in e for e in outcome.validation_errors)
 
 
+async def test_json_wrapped_in_markdown_fences_parses_via_strip():
+    """REGRESSION pin (2026-06-17 live dryrun): claude-sonnet-4.5 ignores
+    the prompt instruction to omit fences and wraps its JSON in
+    ```json ... ```. Provider must strip the fence before parsing —
+    otherwise Mahler-A turns this into a permanent abort."""
+    wrapped = '```json\n{"answer": "wrapped"}\n```'
+    fake = _FakeCopilotClient(script=_success_script(wrapped))
+    provider = CopilotProvider(client=fake)
+    outcome = await provider.invoke(_make_call(_make_spec()))
+    await provider.aclose()
+
+    assert isinstance(outcome, Success), f"expected Success, got {type(outcome).__name__}"
+    assert outcome.value["parsed"] == {"answer": "wrapped"}
+
+
+async def test_json_wrapped_in_bare_fences_also_parses():
+    """Same fix should handle ``` ... ``` without the `json` hint."""
+    wrapped = '```\n{"answer": "bare"}\n```'
+    fake = _FakeCopilotClient(script=_success_script(wrapped))
+    provider = CopilotProvider(client=fake)
+    outcome = await provider.invoke(_make_call(_make_spec()))
+    await provider.aclose()
+
+    assert isinstance(outcome, Success)
+    assert outcome.value["parsed"] == {"answer": "bare"}
+
+
 async def test_empty_response_returns_bad_output():
     """session.idle with no assistant.message in the script → BadOutput."""
     fake = _FakeCopilotClient(script=[_event("session.idle")])
@@ -382,6 +410,39 @@ def test_build_prompt_with_schema_appends_schema_instruction():
     assert "Respond with ONLY a single JSON object" in out
     assert "Schema:" in out
     assert "answer" in out  # _TinyOut's field name
+
+
+# ---- code-fence stripping unit tests ------------------------------------
+
+
+def test_strip_code_fence_no_fence_passthrough():
+    """Bare text without fences is returned unchanged."""
+    assert _strip_code_fence('{"a": 1}') == '{"a": 1}'
+
+
+def test_strip_code_fence_with_json_hint():
+    assert _strip_code_fence('```json\n{"a": 1}\n```') == '{"a": 1}'
+
+
+def test_strip_code_fence_with_bare_fence():
+    assert _strip_code_fence('```\n{"a": 1}\n```') == '{"a": 1}'
+
+
+def test_strip_code_fence_uppercase_json_hint():
+    """Some models emit ```JSON in caps; should still strip."""
+    assert _strip_code_fence('```JSON\n{"a": 1}\n```') == '{"a": 1}'
+
+
+def test_strip_code_fence_with_trailing_newline_after_close():
+    """Trailing newline after the closing fence is tolerated."""
+    assert _strip_code_fence('```json\n{"a": 1}\n```\n') == '{"a": 1}'
+
+
+def test_strip_code_fence_no_newline_in_body_is_returned_unchanged():
+    """If there's no newline after the opening ```, the input is
+    malformed; we return the original text and let pydantic surface
+    the parse error rather than guessing."""
+    assert _strip_code_fence('```nofence') == '```nofence'
 
 
 # ---- default_provider integration --------------------------------------
