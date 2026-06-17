@@ -905,6 +905,44 @@ async def integrate_pipeline(
 # ---- operator CLI ----------------------------------------------------
 
 
+def _resolve_process_config(
+    *, explicit_path: Path | None, repo_path: Path,
+) -> Any:
+    """Resolve the ProcessConfig requiem will use for this run.
+
+    Two paths:
+
+    1. ``explicit_path`` set (``--process-config`` on the CLI) — load
+       that file directly. Bypasses walking-up discovery. A missing
+       file or malformed YAML raises ``ProcessConfigError`` LOUDLY
+       so the operator sees their typo instead of silently running
+       with polyphony defaults (which is exactly how the 2026-06-17
+       SKU-fallback dogfood ended up recursing 4 levels deep on
+       Tasks — discovery found nothing, defaults applied, neither
+       implementable nor decomposable was set, planner had full
+       LLM discretion at every level).
+    2. ``explicit_path is None`` — walk up from ``repo_path`` for a
+       ``.requiem-config/process.yaml`` exactly as
+       ``discover_process_config`` does. Returns
+       ``default_process_config()`` when nothing is found.
+
+    Centralising this in one helper lets the run and integrate
+    entrypoints share identical resolution semantics, and gives the
+    test suite a single seam to pin the precedence behaviour at
+    (see ``tests/test_process_config_cli.py``).
+    """
+    from requiem.process_config import (
+        discover_process_config,
+        load_process_config,
+    )
+
+    if explicit_path is not None:
+        # load_process_config already raises ProcessConfigError with
+        # a path-bearing message on missing/malformed files.
+        return load_process_config(explicit_path)
+    return discover_process_config(repo_path)
+
+
 def _build_arg_parser():
     import argparse
 
@@ -929,6 +967,13 @@ def _build_arg_parser():
     p.add_argument("--repo", type=Path, default=Path("."),
                    help="Repo root to discover .requiem-config/process.yaml from "
                         "(drives the type-agnostic tier policy; default: cwd).")
+    p.add_argument("--process-config", type=Path, default=None,
+                   help="Path to an explicit process.yaml. When set, overrides "
+                        "the --repo-based walking-up discovery. Use this when "
+                        "the per-machine config should NOT live in the target "
+                        "repo (e.g. early dogfood). Missing file or malformed "
+                        "YAML raises a clear error instead of silently falling "
+                        "back to defaults.")
     p.add_argument("--github-repo", default=None,
                    help="GitHub repo identity 'Owner/Repo' for trunk topology "
                         "(ADR-0018 step 4). When set, the driver bootstraps "
@@ -977,6 +1022,13 @@ def _build_integrate_arg_parser():
                    help="Actually open the trunk→base PR (default: dry-run preview).")
     p.add_argument("--log-dir", type=Path, default=Path(".runs"),
                    help="Durable run-log directory (default: .runs).")
+    p.add_argument("--repo", type=Path, default=Path("."),
+                   help="Repo root to discover .requiem-config/process.yaml from "
+                        "(default: cwd).")
+    p.add_argument("--process-config", type=Path, default=None,
+                   help="Path to an explicit process.yaml. When set, overrides "
+                        "the --repo-based walking-up discovery. Same semantics "
+                        "as requiem-end-to-end's --process-config.")
     return p
 
 
@@ -985,7 +1037,6 @@ def main(argv: list[str] | None = None) -> int:
 
     from requiem.clients.kanban import KanbanClient
     from requiem.clients.twig import TwigClient
-    from requiem.process_config import discover_process_config
     from requiem.providers import default_provider
 
     args = _build_arg_parser().parse_args(argv)
@@ -994,9 +1045,12 @@ def main(argv: list[str] | None = None) -> int:
               "--board (e.g. requiem-<item>).")
         return 2
 
-    # Discover the repo's tier policy (falls back to polyphony-equivalent
-    # defaults when no .requiem-config/process.yaml is present).
-    process_config = discover_process_config(args.repo)
+    # Resolve the repo's tier policy. With --process-config <path>,
+    # that file is loaded directly; otherwise we walk up from --repo
+    # looking for .requiem-config/process.yaml. See ADR-0025 §1.
+    process_config = _resolve_process_config(
+        explicit_path=args.process_config, repo_path=args.repo,
+    )
 
     result = asyncio.run(run_pipeline(
         args.item,

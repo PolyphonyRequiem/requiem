@@ -442,6 +442,22 @@ landing (it's small enough to fit), commit the example process.yaml
 to `docs/references/cvapi-process-config.example.yaml` for
 discoverability, and add to CVAPI worktree's `.git/info/exclude`.
 
+**STATUS: shipped 2026-06-17** (commit: this one). Path B taken:
+- `--process-config <path>` CLI flag wired into both
+  `requiem-end-to-end` and `requiem-integrate` (see
+  `_build_arg_parser` / `_build_integrate_arg_parser`).
+- Central `_resolve_process_config(explicit_path, repo_path)` helper
+  in `end_to_end.py` — explicit path beats discovery, missing/malformed
+  raises `ProcessConfigError` loudly (no silent default fallback).
+- 8 tests in `tests/test_process_config_cli.py` pinning precedence
+  + argparse plumbing + error surfacing.
+- CVAPI worktree's `.requiem-config/` removed; the file lives at
+  `~/.config/requiem/cvapi-process.yaml` (per-operator) and the bare
+  repo's `.git/info/exclude` ignores `.requiem-config/` so future
+  accidental commits are blocked.
+- Example doc at `docs/references/cvapi-process-config.example.md`
+  documents the shape + usage for other operators.
+
 ### 2. Reviewer charter improvement
 
 Separate ADR. The reviewer's escalation on `Task` leaves was
