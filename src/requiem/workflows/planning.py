@@ -331,20 +331,25 @@ class FakeTwigClient:
 
 
 # Iteration cap — change this only by editing the topology in `build_workflow`.
-ITER_CAP = 5
+ITER_CAP = 8
 """Max planner+reviewer iterations before the workflow escalates to a
-human gate. Bumped from 3 → 5 (2026-06-17) after the #62759077
-dogfood retry: the reviewer was producing substantive feedback each
-round and the planner was visibly incorporating it (iter 1 → 2 → 3
-each addressed different concerns), but 3 iterations weren't enough
-for the planner to converge on a clean decomposition. The trade-off
-is up to 4 extra LLM calls per planning run for complex root items;
-small leaves still converge in 1-2 iterations and don't pay the cost.
+human gate. Iteration history (all on the SKU-fallback dogfood):
 
-This is a temporary lever. The right long-term shape is an
-``iter_cap`` parameter on ``build_engine`` / CLI (``--max-plan-iterations``)
-so operators can dial up complex Scenarios without paying the cost
-on every plan. Tracked as a follow-up in ADR-0025.
+* 3 (original): converged on simple Tasks but ran out for complex Scenarios
+* 5 (commit 2b1979e): bumped after reviewer-prompt fix unlocked
+  substantive feedback the planner needed more rounds to address.
+  Still insufficient on plannable Features with cross-cutting concerns
+  (security review timing, observability ownership, dependency chains).
+* 8 (this commit): bumped after ADR-0026 dogfood retry showed even
+  Features under Scenarios need more rounds to converge against
+  high-quality reviewer feedback. The right long-term answer is
+  `--on-escalate=accept-last` policy (where the workflow ships the
+  last planner output and routes the reviewer's escalation feedback
+  to a side-channel rather than blocking) — tracked separately.
+
+This is a temporary lever. The right shape is a configurable per-run
+``iter_cap`` parameter on ``build_engine`` / ``--max-plan-iterations``
+CLI flag plus the escalation policy. See ADR-0025 open questions.
 """
 
 # Version stamp for the `.plan.tree.json` sidecar. Bumped to 2 when each
