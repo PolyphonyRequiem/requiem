@@ -445,6 +445,112 @@ def build_verb_registry(
             inspected_artifacts=(f"twig:item/{item.id}",),
         )
 
+    @verbs.register("policy_classifier")
+    def _policy_classify(ctx):
+        """ADR-0025 Gap A: short-circuit planning for implementable types.
+
+        When the process-config tier policy classifies the work item's
+        type as ``implementable``, the planner and reviewer have no
+        useful work to do — the planner can only restate the title,
+        and the reviewer's "escalate" verdict on a vague leaf summary
+        cascades into a tree-killing failure (see ADR-0025).
+
+        Routing (using the established convention of returning
+        ``PermanentFailure`` to drive non-default workflow edges; same
+        trick branch_decomposable uses for the ``recurse`` branch):
+
+        * ``Success({"tier": ...})`` → planner_1 (legacy path,
+          unchanged) — fires for ``decomposable``, ``unknown``, and
+          unset policy.
+        * ``PermanentFailure("short_circuit_implementable")`` →
+          record_leaf_from_policy (no LLM calls).
+        """
+        item = ctx.completed["fetch_item"]["value"]
+        work_item_type = (item.get("work_item_type") or "").strip()
+        policy = _effective_config(ctx).tier_for_type(work_item_type)
+        if policy == "implementable":
+            return PermanentFailure(
+                error_kind="short_circuit_implementable",
+                message=(
+                    f"type {work_item_type!r} is in implementable_types; "
+                    f"skipping planner+reviewer (ADR-0025 Gap A)"
+                ),
+                details={
+                    "tier": policy,
+                    "work_item_type": work_item_type,
+                },
+            )
+        return Success(
+            value={
+                "tier": policy or "unset",
+                "work_item_type": work_item_type,
+            },
+        )
+
+    @verbs.register("record_leaf_from_policy")
+    def _record_policy_leaf(ctx):
+        """Record a synthesised leaf plan when policy_classifier short-
+        circuited (tier=='implementable').
+
+        Produces a ``record_plan``-shape Success so downstream consumers
+        (`project_plan_result`, the renderer, the executor) read it
+        identically to a planner-driven leaf. The inspected_artifact
+        ``policy:implementable/<type>`` makes the policy-driven origin
+        legible in the event log.
+        """
+        item = ctx.completed["fetch_item"]["value"]
+        work_item_type = (item.get("work_item_type") or "").strip()
+        plan_id = f"plan-{item['item_id']}-{ctx.run_id}"
+
+        # Synthesise a planner-shaped dict so the sidecar writer can
+        # serialise it without special-casing.
+        synthetic_planner = {
+            "summary": item.get("title") or "",
+            "decomposable": False,
+            "children": [],
+            "estimated_complexity": "unknown",
+            "rationale": (
+                f"Forced leaf per repo process config: type "
+                f"{work_item_type!r} is in implementable_types. "
+                f"Planner and reviewer skipped (ADR-0025 Gap A)."
+            ),
+        }
+        artifact = _write_plan_sidecar(
+            log_dir=log_dir,
+            run_id=ctx.run_id,
+            plan_id=plan_id,
+            item=item,
+            planner=synthetic_planner,
+            approved_iteration=0,         # no iteration; no review happened
+            current_depth=current_depth,
+            recursive_children=[],
+            effective_decomposable=False,
+            policy_tier="implementable",
+            discarded_child_count=0,
+        )
+        return Success(
+            value={
+                "plan_id": plan_id,
+                "item_id": item["item_id"],
+                "item_title": item["title"],
+                "decomposable": False,
+                "children": [],
+                "proposals": [],
+                "policy_tier": "implementable",
+                "overrode_planner": False,
+                "discarded_child_count": 0,
+                "summary": synthetic_planner["summary"],
+                "estimated_complexity": "unknown",
+                "review_iterations": 0,
+                "final_verdict": "policy-forced-leaf",
+                "plan_artifact": str(artifact),
+            },
+            inspected_artifacts=(
+                f"policy:implementable/{work_item_type}",
+                f"file:{artifact}",
+            ),
+        )
+
     def _planner_prompt(iteration: int):
         def _prompt(ctx):
             item = ctx.completed["fetch_item"]["value"]
@@ -1330,7 +1436,7 @@ def build_workflow() -> Workflow:
             .edge("depth_gate", on="needs_human:proceed", to="fetch_item")
             .edge("depth_gate", on="needs_human:abort", to="fail_end")
         .script("fetch_item", verb="fetch_item")
-            .edge("fetch_item", on="success", to="planner_1")
+            .edge("fetch_item", on="success", to="policy_classifier")
             .edge(
                 "fetch_item",
                 on="permanent_failure:twig_not_found",
@@ -1344,6 +1450,28 @@ def build_workflow() -> Workflow:
             # Any other permanent_failure (verb.crash from an unexpected
             # exception in the twig seam, etc.) → narrated crash terminal.
             .edge("fetch_item", on="permanent_failure", to="fail_end_crash")
+        .script("policy_classifier", verb="policy_classifier")
+            # ADR-0025 Gap A: implementable types short-circuit to a
+            # synthesised leaf without any LLM call. All other tiers
+            # (decomposable, unknown, unset) flow into the planner as
+            # before — branch_decomposable retains authority over the
+            # decomp-vs-leaf decision in those cases.
+            .edge("policy_classifier", on="success", to="planner_1")
+            .edge(
+                "policy_classifier",
+                on="permanent_failure:short_circuit_implementable",
+                to="record_leaf_from_policy",
+            )
+            # Any other permanent_failure (verb crash from a malformed
+            # config snapshot, etc.) → narrated terminal.
+            .edge("policy_classifier", on="permanent_failure", to="fail_end_crash")
+        .script("record_leaf_from_policy", verb="record_leaf_from_policy")
+            .edge("record_leaf_from_policy", on="success", to="end")
+            .edge(
+                "record_leaf_from_policy",
+                on="permanent_failure",
+                to="fail_end_crash",
+            )
         .human_gate(
             "twig_gate",
             prompt="Twig returned an unrecognised failure. Proceed or abort?",
@@ -1772,7 +1900,11 @@ def project_plan_result(completed: dict) -> PlanResult | None:
     ``record_plan`` value carries) are reconstructed as nested
     ``PlanResult`` instances; the tree is fully recursive.
     """
-    rec = completed.get("record_plan") or completed.get("record_needs_human")
+    rec = (
+        completed.get("record_plan")
+        or completed.get("record_needs_human")
+        or completed.get("record_leaf_from_policy")
+    )
     if not rec:
         return None
     v = rec.get("value") or {}

@@ -259,7 +259,39 @@ Closes the first of three gaps documented in ADR-0025."
 
 ### STATUS
 
-**STATUS: not started**
+**STATUS: shipped 2026-06-17** (commit: this one).
+- New `policy_classifier` verb runs after `fetch_item` and reads
+  `_effective_config(ctx).tier_for_type(work_item_type)`. When
+  the tier is `implementable`, returns
+  `PermanentFailure(error_kind="short_circuit_implementable")`
+  which the workflow routes to a new `record_leaf_from_policy`
+  verb (uses the established `permanent_failure:<error_kind>`
+  routing convention from `branch_decomposable`'s `recurse` branch).
+- `record_leaf_from_policy` synthesises a planner-shape dict
+  (summary = item title, decomposable=False, children=[],
+  estimated_complexity="unknown", rationale citing the policy),
+  writes the sidecar via the existing `_write_plan_sidecar` helper,
+  and returns a `record_plan`-shape Success value with
+  `policy_tier="implementable"` and `final_verdict="policy-forced-leaf"`.
+- `project_plan_result` extended to read `record_leaf_from_policy`
+  as a third candidate (alongside `record_plan` and
+  `record_needs_human`) so downstream consumers reconstruct the
+  PlanResult identically regardless of which path produced it.
+- 4 new regression tests in `tests/test_planning_type_policy.py`:
+  - `test_implementable_type_skips_planner_and_reviewer_entirely`
+    — load-bearing pin: empty scripts on both agents, asserts
+    `provider.calls == []` and the plan reaches `end`.
+  - `test_implementable_type_skip_records_policy_artifact` —
+    inspected_artifacts must include `policy:implementable/<type>`
+    and must NOT include `agent:planner/*` or `agent:plan_reviewer/*`.
+  - `test_decomposable_type_still_calls_planner_no_regression` —
+    Scenario root with Task children: 1 planner + 1 reviewer call
+    for root only, Task children short-circuit per Gap A.
+  - `test_no_tier_policy_still_calls_planner_no_regression` —
+    polyphony default config (no implementable_types): planner
+    runs as before for all types.
+- 11/11 type-policy tests green (was 7); 168 passed + 2 skipped
+  across the broad surface — no regressions.
 
 ---
 

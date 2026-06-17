@@ -277,3 +277,195 @@ async def test_config_snapshot_threads_into_children(log_dir: Path):
     # Both children were forced to leaves by the threaded policy.
     assert all(c.decomposable is False for c in plan.children)
     assert all(c.children == [] for c in plan.children)
+
+
+# ---- ADR-0025 Gap A: implementable types skip planner+reviewer entirely ----
+#
+# When the type policy already says "this is an implementable leaf, do
+# not decompose," there is no useful work for the planner or reviewer to
+# do. The pre-Gap-A flow ran them anyway and then overrode the verdict,
+# paying for two LLM calls to produce a decision the config already
+# made — AND surfacing reviewer escalations on leaves the reviewer has
+# no authority to refine. The 2026-06-17 SKU-fallback dogfood failed
+# exactly this way: 5/7 Task leaves planned cleanly, 2 escalated as
+# "vague," cascade killed the whole tree, commit_plan never fired.
+#
+# Gap A's short-circuit: at the policy classifier stage, if
+# tier_for_type == "implementable", route directly to record_plan with
+# a synthesised leaf PlanResult. ZERO LLM calls. The breadcrumb
+# inspected_artifact is `policy:implementable/<work_item_type>` to make
+# the policy-driven nature legible in the event log.
+
+
+async def test_implementable_type_skips_planner_and_reviewer_entirely(
+    log_dir: Path,
+):
+    """ADR-0025 Gap A load-bearing pin. When the root's type is in
+    implementable_types, NO planner call AND NO reviewer call is made;
+    the plan goes straight to recorded-as-leaf."""
+    cfg = ProcessConfig(implementable_types=frozenset({"Task"}))
+    # Empty scripts on both agents — if either gets called we'll see
+    # fake.exhausted PermanentFailure (which surfaces as a non-success
+    # outcome and our assertion below will catch it loud).
+    provider = FakeProvider(scripts={"planner": [], "plan_reviewer": []})
+    twig = _twig({ROOT_ID: "Task"})
+    engine = build_engine(
+        log_dir,
+        item_id=ROOT_ID,
+        twig=twig,
+        provider=provider,
+        process_config=cfg,
+    )
+    result = await engine.run("gap-a-impl")
+    assert isinstance(result, Completed), result
+    assert result.final_node == "end", (
+        f"implementable-type root should reach 'end' without LLM calls; "
+        f"got final_node={result.final_node!r}"
+    )
+
+    # Hard assertion: ZERO LLM calls of any kind.
+    assert provider.calls == [], (
+        f"implementable type should skip planner+reviewer entirely; "
+        f"got calls: {provider.calls}"
+    )
+
+    # The plan record exists and is shaped correctly.
+    plan = project_plan_result(completed_from_log(engine.log_path("gap-a-impl")))
+    assert plan is not None
+    assert plan.decomposable is False
+    assert plan.children == []
+    # The synthesised summary echoes the work-item title from twig.
+    assert plan.summary == f"Item {ROOT_ID}"
+
+
+async def test_implementable_type_skip_records_policy_artifact(
+    log_dir: Path,
+):
+    """The short-circuit must leave a `policy:implementable/<type>`
+    breadcrumb in inspected_artifacts so an operator reading the event
+    log can tell this leaf was policy-driven, not planner-driven.
+    Without this breadcrumb the audit story is broken — you can't
+    distinguish 'planner said leaf' from 'policy forced leaf'."""
+    cfg = ProcessConfig(implementable_types=frozenset({"Task"}))
+    provider = FakeProvider(scripts={"planner": [], "plan_reviewer": []})
+    twig = _twig({ROOT_ID: "Task"})
+    engine = build_engine(
+        log_dir,
+        item_id=ROOT_ID,
+        twig=twig,
+        provider=provider,
+        process_config=cfg,
+    )
+    result = await engine.run("gap-a-artifact")
+    assert isinstance(result, Completed)
+    assert result.final_node == "end"
+
+    # Walk the event log to find the policy:implementable artifact.
+    from requiem.persistence import replay
+    log_path = engine.log_path("gap-a-artifact")
+    found_policy_artifact = False
+    found_agent_artifact = False
+    for ev in replay(log_path):
+        if ev.get("kind") != "verb_completed":
+            continue
+        oc = (ev.get("payload") or {}).get("outcome", {}) or {}
+        artifacts = oc.get("inspected_artifacts") or []
+        for a in artifacts:
+            if a.startswith("policy:implementable/"):
+                found_policy_artifact = True
+                assert "Task" in a, (
+                    f"breadcrumb should name the work_item_type: {a!r}"
+                )
+            if a.startswith("agent:planner/") or a.startswith("agent:plan_reviewer/"):
+                found_agent_artifact = True
+    assert found_policy_artifact, (
+        "implementable-type short-circuit should leave a "
+        "policy:implementable/<type> breadcrumb in inspected_artifacts"
+    )
+    assert not found_agent_artifact, (
+        "no agent artifacts should appear; we skipped planner+reviewer"
+    )
+
+
+async def test_decomposable_type_still_calls_planner_no_regression(
+    log_dir: Path,
+):
+    """ADR-0025 Gap A guard against the short-circuit accidentally
+    swallowing the decomposable path. When the root is a decomposable
+    type (e.g. Scenario), the planner+reviewer pair DOES run exactly as
+    before — the short-circuit is implementable-only."""
+    cfg = ProcessConfig(
+        decomposable_types=frozenset({"Scenario"}),
+        implementable_types=frozenset({"Task"}),
+    )
+    provider = FakeProvider(
+        scripts={
+            "planner": [_decomp("childA", "childB")],
+            "plan_reviewer": [_approve()],
+        }
+    )
+    twig = _twig({ROOT_ID: "Scenario", ROOT_ID * 100 + 1: "Task", ROOT_ID * 100 + 2: "Task"})
+    engine = build_engine(
+        log_dir,
+        item_id=ROOT_ID,
+        twig=twig,
+        provider=provider,
+        process_config=cfg,
+    )
+    result = await engine.run("gap-a-decomp")
+    assert isinstance(result, Completed), result
+    assert result.final_node == "end"
+
+    # Both planner AND reviewer were called for the ROOT (Scenario).
+    # Each child (Task) skips planner+reviewer per the same short-circuit,
+    # so the call count is exactly 2 (one planner + one reviewer for root).
+    agent_names = [c["agent"] for c in provider.calls]
+    assert "planner" in agent_names, (
+        f"decomposable root must call planner; got: {agent_names}"
+    )
+    assert "plan_reviewer" in agent_names, (
+        f"decomposable root must call reviewer; got: {agent_names}"
+    )
+    # Exactly one of each — no recursion-driven LLM calls for the Task
+    # children (they short-circuit per Gap A).
+    assert agent_names.count("planner") == 1, agent_names
+    assert agent_names.count("plan_reviewer") == 1, agent_names
+
+    plan = project_plan_result(completed_from_log(engine.log_path("gap-a-decomp")))
+    assert plan is not None
+    assert plan.decomposable is True
+    assert len(plan.children) == 2
+    assert all(c.decomposable is False for c in plan.children), (
+        "Task children must be policy-driven leaves"
+    )
+
+
+async def test_no_tier_policy_still_calls_planner_no_regression(
+    log_dir: Path,
+):
+    """When no tier policy is configured (the polyphony default), the
+    short-circuit must not fire — planner runs as before for ALL types.
+    Pin against the short-circuit accidentally activating on default config."""
+    cfg = ProcessConfig()  # no implementable_types, no decomposable_types
+    provider = FakeProvider(
+        scripts={
+            "planner": [_leaf("atomic")],
+            "plan_reviewer": [_approve()],
+        }
+    )
+    twig = _twig({ROOT_ID: "Task"})  # Task root with NO policy
+    engine = build_engine(
+        log_dir,
+        item_id=ROOT_ID,
+        twig=twig,
+        provider=provider,
+        process_config=cfg,
+    )
+    result = await engine.run("gap-a-no-policy")
+    assert isinstance(result, Completed)
+    assert result.final_node == "end"
+
+    # planner + reviewer were both called (no short-circuit without policy).
+    agent_names = [c["agent"] for c in provider.calls]
+    assert "planner" in agent_names
+    assert "plan_reviewer" in agent_names
