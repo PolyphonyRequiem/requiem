@@ -2,56 +2,36 @@
 
 This is the type policy I (Daniel) use when running requiem against
 the `cloudvault-service-api` ADO repo. **It is not committed to that
-repo** by design — see ADR-0025 §1 for the disposition reasoning.
-This file is here so other operators can see the shape and adapt it
-for their own per-machine config.
-
-## Usage
-
-Save this somewhere outside the target repo (e.g. `~/.config/requiem/cvapi-process.yaml`)
-and pass it explicitly:
+repo** by design (see ADR-0025 §1 "Operator-only vs team-committed
+config"); it lives at `~/.config/requiem/cvapi-process.yaml` and is
+passed in explicitly:
 
 ```bash
 requiem-end-to-end \
-  --item 62759077 \
-  --board requiem-62759077-commit \
+  --item <id> \
   --ado-repo microsoft/CloudVault/cloudvault-service-api \
   --process-config ~/.config/requiem/cvapi-process.yaml \
-  --commit
+  ...
 ```
 
-The `--process-config <path>` flag (ADR-0025) overrides the default
-walking-up discovery of `.requiem-config/process.yaml` from `--repo`.
-A missing file or malformed YAML raises a clear error instead of
-silently falling back to defaults.
+## Why this shape
 
-## The config
+CVAPI's ADO work-item hierarchy is:
+
+```
+Objective → Key Result → Epic → Scenario → Feature → Task | Bug | User Story
+```
+
+The flat-tier model from ADR-0015 (and ADR-0025 Gap A) was structurally
+inadequate to encode the **Scenario → Feature → Task** chain: it could
+say "Task is implementable" but couldn't say "Scenarios produce Features,
+not Tasks directly." ADR-0026 introduces the per-type schema with
+facets and `decomposition_guidance` to make hierarchical intent
+machine-readable.
+
+## The config (current)
 
 ```yaml
-# Requiem process config for the CloudVault Service API repo.
-#
-# Requiem discovers this file by walking up from the run's repo_path; without
-# it, requiem falls back to its built-in polyphony-equivalent defaults
-# (root_parent_types=[Epic, Feature], no decomposable/implementable tier
-# enforcement) — which lets the LLM planner recurse to arbitrary depth on
-# any work-item type. That's wrong for CVAPI: our ADO hierarchy is
-#
-#   Objective → Key Result → Epic → Scenario → Task | Bug | User Story
-#
-# and our Tasks/Bugs/User Stories are always meant to be executable leaves,
-# never decomposed further. Without this file the planner happily produced
-# a 4-level recursive Task tree on a single Scenario (run #62759077, see
-# the SKU-fallback dogfood notes from 2026-06-17), with the reviewer
-# correctly escalating the depth-4 leaves as too vague.
-#
-# Reference: requiem ADR-0015 (process_config), src/requiem/process_config.py
-# Reference: requiem ADR-0010 (planning tier model)
-
-# Which parent-type roots qualify a work item as a dispatchable SDLC root.
-# A Task whose parent is one of these is a valid root for requiem; a Task
-# whose parent isn't on this list routes to a human gate. We list the full
-# ADO hierarchy above Task because CVAPI dispatches deliverables under all
-# of these levels in practice.
 root_parent_types:
   - Objective
   - Key Result
@@ -59,26 +39,107 @@ root_parent_types:
   - Scenario
   - Feature
 
-# Work-item types the planner MUST decompose (planner leaf → escalation_gate).
-# These are the strategic/intermediate types; ALL of them should produce
-# at least one child plan.
-decomposable_types:
-  - Objective
-  - Key Result
-  - Epic
-  - Scenario
-  - Feature
+types:
+  Objective:
+    facets: [plannable]
+    decomposition_guidance: |
+      Decompose into Key Results. ...
+    max_nesting_depth: 1
 
-# Work-item types the planner MUST treat as implementable leaves regardless
-# of the planner's `decomposable` flag. This is the structural cap on
-# recursion — when the planner proposes children for a Scenario, those
-# children become Tasks, and Task children of the recursion are then forced
-# to leaves WITHOUT calling the LLM again (branch_decomposable short-circuit).
-#
-# Skipping the LLM call at the Task level is what prevents the propagation
-# of vague depth-N+ planning that broke the SKU-fallback dogfood.
-implementable_types:
-  - Task
-  - Bug
-  - User Story
+  Key Result:
+    facets: [plannable]
+    decomposition_guidance: |
+      Decompose into Epics. ...
+    max_nesting_depth: 1
+
+  Epic:
+    facets: [plannable]
+    decomposition_guidance: |
+      Decompose into Scenarios. ...
+    max_nesting_depth: 1
+
+  Scenario:
+    facets: [plannable]
+    decomposition_guidance: |
+      Decompose into Features. NEVER decompose a Scenario directly
+      into Tasks — Features always sit between.
+    max_nesting_depth: 1
+
+  Feature:
+    facets: [plannable, implementable]
+    decomposition_guidance: |
+      Decompose into Tasks (the concrete implementation units).
+      Implement directly only when the Feature is small enough to
+      fit in a single PR (~500 LoC of net change).
+    max_nesting_depth: 1
+
+  Task:
+    facets: [implementable, actionable]
+    actionable_executor: requiem
+
+  Bug:
+    facets: [implementable, actionable]
+    actionable_executor: requiem
+
+  User Story:
+    facets: [implementable, actionable]
+    actionable_executor: requiem
+```
+
+The full file lives at `~/.config/requiem/cvapi-process.yaml` (with
+header commentary preserved).
+
+## What each facet does
+
+| Facet | Effect on workflow |
+|---|---|
+| `plannable` | Item invokes the planner. Type appears in derived `decomposable_types`. |
+| `implementable` | Item may be implemented directly. Type appears in derived `implementable_types` (unless also `plannable` — then it lives in `decomposable_types` and the planner is invoked, but a leaf verdict is honoured). |
+| `actionable` | Marks the item as something the executor backend named in `actionable_executor` picks up. Today only `requiem` is implemented (the in-process fanout). |
+
+## How Feature being bi-facet works (the escape hatch)
+
+CVAPI's Feature carries both `plannable` AND `implementable`. This
+means:
+
+1. When a Feature is the work item, the planner IS invoked (because
+   it has the `plannable` facet → tier_for_type returns `decomposable`).
+2. The planner SEES the `decomposition_guidance` (the prompt tells it
+   "Decompose into Tasks; implement directly only when the Feature is
+   small enough to fit in a single PR").
+3. The planner is FREE to return `decomposable=false`. The workflow
+   accepts that as a leaf because the type has the `implementable`
+   facet — no `config_requires_decomposition` violation.
+
+This matches polyphony's Issue type and gives operators a clean way
+to say "this tier is the planner's discretion."
+
+## What's NOT yet enforced
+
+`max_nesting_depth` is parsed and snapshotted, but
+`branch_decomposable` does not yet consume it for enforcement
+(ADR-0026 step 3 "deferred" note). The text in `decomposition_guidance`
+already steers the LLM toward the right shape; the structural cap
+becomes useful as a backstop only if guidance proves insufficient in
+practice. When that happens, the field is already in the data model
+ready for a follow-up commit to wire it through child_inputs.
+
+## How to apply it
+
+```bash
+# Verify config loads:
+python -c "
+from requiem.process_config import load_process_config
+cfg = load_process_config(r'$HOME/.config/requiem/cvapi-process.yaml')
+print('decomposable:', sorted(cfg.decomposable_types))
+print('implementable:', sorted(cfg.implementable_types))
+"
+
+# Use in a run:
+requiem-end-to-end \
+  --item <scenario_id> \
+  --ado-repo microsoft/CloudVault/cloudvault-service-api \
+  --base-branch main \
+  --process-config $HOME/.config/requiem/cvapi-process.yaml \
+  --commit
 ```
