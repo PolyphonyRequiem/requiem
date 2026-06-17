@@ -660,21 +660,59 @@ def cmd_clean(args: argparse.Namespace) -> int:
         _say("  (dry-run — nothing will actually be removed)", style="yellow")
 
     # ---- gather the artifacts -----------------------------------------
-    patterns = [
+    # Two pattern families:
+    #
+    #   1) ALWAYS-cleanable: ephemeral per-run state that is safe to
+    #      regenerate. Event logs (.events.jsonl) and the human-readable
+    #      plan sidecars (.plan.md, .plan.tree.json) at any recursion
+    #      depth.
+    #
+    #   2) IDEMPOTENCY state (commit manifest, leaf-pr-map): names ADO /
+    #      git side-effects from a prior run. PRESERVE BY DEFAULT so
+    #      retries can adopt prior children / leaf PRs (ADR-0026
+    #      follow-up: ADO doesn't preserve our HTML-comment markers, so
+    #      the manifest is the ONLY surviving cross-run idempotency
+    #      hook). Pass --include-manifest to nuke them too — that's the
+    #      explicit "I really want a fresh seed" path.
+    always_patterns = [
+        # top-level events + sidecars
         f"plan-{item_id}.events.jsonl",
         f"plan-{item_id}.plan.md",
+        f"plan-{item_id}.plan.tree.json",
+        # one-level subworkflows (planning recursion, fanout)
         f"plan-{item_id}__child_*.events.jsonl",
+        f"plan-{item_id}__child_*.plan.md",
+        f"plan-{item_id}__child_*.plan.tree.json",
         f"plan-{item_id}-plan-{item_id}__child_*.events.jsonl",
+        # deeper recursion (two+ levels — Scenario → Feature → Task)
+        f"plan-{item_id}__child_*__child_*.events.jsonl",
+        f"plan-{item_id}__child_*__child_*.plan.md",
+        f"plan-{item_id}__child_*__child_*.plan.tree.json",
+        f"plan-{item_id}__child_*__child_*__child_*.events.jsonl",
+        f"plan-{item_id}__child_*__child_*__child_*.plan.md",
+        f"plan-{item_id}__child_*__child_*__child_*.plan.tree.json",
+        f"plan-{item_id}__child_*__child_*__child_*__child_*.events.jsonl",
+        f"plan-{item_id}__child_*__child_*__child_*__child_*.plan.md",
+        f"plan-{item_id}__child_*__child_*__child_*__child_*.plan.tree.json",
+        # commit/trunk/exec/leafpr/featurepr event logs
         f"commit-{item_id}.events.jsonl",
-        f"commit-{item_id}.plan.committed.json",
         f"trunk-{item_id}.events.jsonl",
         f"exec-{item_id}.events.jsonl",
         f"fanout-{item_id}.events.jsonl",
         f"fanout-{item_id}__leaf-*.events.jsonl",
         f"leafpr-{item_id}.events.jsonl",
         f"featurepr-{item_id}.events.jsonl",
+    ]
+    manifest_patterns = [
+        # commit_plan's idempotency manifest — preserve by default
+        # so retries can recognise prior ADO children.
+        f"commit-{item_id}.plan.committed.json",
+        # leaf-pr-map — points at real PR numbers
         f"leaf-pr-map-{item_id}.json",
     ]
+    patterns = list(always_patterns)
+    if getattr(args, "include_manifest", False):
+        patterns.extend(manifest_patterns)
     matched: list[Path] = []
     if log_dir.exists():
         for pat in patterns:
@@ -882,6 +920,20 @@ def _build_parser() -> argparse.ArgumentParser:
             "Override the in-flight-PR safety check. Default behaviour "
             "refuses to clean an item whose leaf-pr-map shows real PR "
             "numbers (cleaning would lose the linkage)."
+        ),
+    )
+    cl.add_argument(
+        "--include-manifest", action="store_true",
+        help=(
+            "ALSO delete the commit_plan idempotency manifest "
+            "(commit-{N}.plan.committed.json) and the leaf-pr-map. "
+            "Default behaviour preserves them so retries can adopt "
+            "prior ADO children / leaf PRs (ADR-0026: ADO doesn't "
+            "preserve our HTML-comment markers, so the manifest is "
+            "the only surviving cross-run idempotency hook). Set "
+            "this flag for the explicit \"I want a truly fresh seed\" "
+            "case — next run will create NEW ADO children instead of "
+            "adopting the prior ones."
         ),
     )
     cl.set_defaults(func=cmd_clean)

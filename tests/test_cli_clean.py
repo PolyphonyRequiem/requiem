@@ -16,28 +16,77 @@ cli_main = _sys.modules["requiem.cli.main"]
 # ---- helpers ----------------------------------------------------------
 
 
-def _seed_full_run(log_dir: Path, item_id: int, *, with_subworkflows: bool = True) -> list[Path]:
+def _seed_full_run(
+    log_dir: Path,
+    item_id: int,
+    *,
+    with_subworkflows: bool = True,
+    with_deep_recursion: bool = False,
+) -> list[Path]:
     """Create the full set of artifacts the end-to-end driver writes for
     one item. Returns the list of paths created so tests can check each.
+
+    Per ADR-0026, the commit_plan manifest and leaf-pr-map are
+    *preserved by default* (they encode cross-run idempotency state
+    that ADO doesn't preserve via HTML-comment markers). To check
+    both groups together, use ``_seed_ephemeral`` + ``_seed_manifest``
+    helpers separately, or inspect the returned list element-by-element.
     """
+    ephemeral, manifest = _seed_ephemeral(
+        log_dir,
+        item_id,
+        with_subworkflows=with_subworkflows,
+        with_deep_recursion=with_deep_recursion,
+    ), _seed_manifest(log_dir, item_id)
+    return ephemeral + manifest
+
+
+def _seed_ephemeral(
+    log_dir: Path,
+    item_id: int,
+    *,
+    with_subworkflows: bool = True,
+    with_deep_recursion: bool = False,
+) -> list[Path]:
+    """Files that ``requiem clean`` removes by default."""
     paths = [
         log_dir / f"plan-{item_id}.events.jsonl",
         log_dir / f"plan-{item_id}.plan.md",
+        log_dir / f"plan-{item_id}.plan.tree.json",
         log_dir / f"commit-{item_id}.events.jsonl",
-        log_dir / f"commit-{item_id}.plan.committed.json",
         log_dir / f"trunk-{item_id}.events.jsonl",
         log_dir / f"exec-{item_id}.events.jsonl",
         log_dir / f"fanout-{item_id}.events.jsonl",
         log_dir / f"leafpr-{item_id}.events.jsonl",
         log_dir / f"featurepr-{item_id}.events.jsonl",
-        log_dir / f"leaf-pr-map-{item_id}.json",
     ]
     if with_subworkflows:
         paths.extend([
             log_dir / f"plan-{item_id}__child_1.events.jsonl",
             log_dir / f"plan-{item_id}__child_2.events.jsonl",
+            log_dir / f"plan-{item_id}__child_1.plan.tree.json",
             log_dir / f"fanout-{item_id}__leaf-7777.events.jsonl",
         ])
+    if with_deep_recursion:
+        # Scenario → Feature → Task spawns plan-N__child_X__child_Y.*
+        # ADR-0026 dogfood: these were noted as not cleaned previously.
+        paths.extend([
+            log_dir / f"plan-{item_id}__child_1__child_1.events.jsonl",
+            log_dir / f"plan-{item_id}__child_1__child_2.events.jsonl",
+            log_dir / f"plan-{item_id}__child_1__child_1.plan.md",
+            log_dir / f"plan-{item_id}__child_2__child_3.plan.tree.json",
+        ])
+    for p in paths:
+        p.write_text("{}", encoding="utf-8")
+    return paths
+
+
+def _seed_manifest(log_dir: Path, item_id: int) -> list[Path]:
+    """Files that ``requiem clean`` preserves by default (ADR-0026)."""
+    paths = [
+        log_dir / f"commit-{item_id}.plan.committed.json",
+        log_dir / f"leaf-pr-map-{item_id}.json",
+    ]
     for p in paths:
         p.write_text("{}", encoding="utf-8")
     return paths
@@ -57,7 +106,7 @@ def test_clean_dry_run_lists_artifacts_without_removing(
     log_dir: Path, capsys: pytest.CaptureFixture[str]
 ):
     """--dry-run prints what would be removed but leaves the files alone."""
-    paths = _seed_full_run(log_dir, item_id=42)
+    paths = _seed_ephemeral(log_dir, item_id=42)
     rc = cli_main.main([
         "clean", "--item", "42", "--log-dir", str(log_dir), "--dry-run",
     ])
@@ -87,11 +136,13 @@ def test_clean_dry_run_with_no_matches_is_quiet(
 # ---- destructive (default) -------------------------------------------
 
 
-def test_clean_removes_all_artifacts_for_one_item(
+def test_clean_removes_ephemeral_artifacts_for_one_item(
     log_dir: Path, capsys: pytest.CaptureFixture[str]
 ):
-    """Default `clean` removes every per-item artifact + subworkflow log."""
-    paths = _seed_full_run(log_dir, item_id=42)
+    """Default `clean` removes every EPHEMERAL per-item artifact + subworkflow
+    log, but PRESERVES the commit-plan manifest and leaf-pr-map (ADR-0026)."""
+    ephemeral = _seed_ephemeral(log_dir, item_id=42)
+    manifest = _seed_manifest(log_dir, item_id=42)
     # Also seed an UNRELATED item's artifacts to prove we don't touch them.
     other = log_dir / "plan-999.events.jsonl"
     other.write_text("{}", encoding="utf-8")
@@ -100,10 +151,51 @@ def test_clean_removes_all_artifacts_for_one_item(
         "clean", "--item", "42", "--log-dir", str(log_dir),
     ])
     assert rc == 0
-    for p in paths:
-        assert not p.exists(), f"clean should have removed {p}"
+    for p in ephemeral:
+        assert not p.exists(), f"clean should have removed ephemeral file {p}"
+    for p in manifest:
+        assert p.exists(), (
+            f"clean (without --include-manifest) MUST preserve manifest "
+            f"file {p} per ADR-0026 (cross-run idempotency)"
+        )
     # Unrelated item untouched.
     assert other.exists(), "clean must not touch artifacts for other items"
+
+
+def test_clean_include_manifest_removes_everything(log_dir: Path):
+    """--include-manifest opts into nuking the manifest + leaf-pr-map too,
+    for the explicit "I want a truly fresh seed" path."""
+    ephemeral = _seed_ephemeral(log_dir, item_id=42)
+    manifest = _seed_manifest(log_dir, item_id=42)
+    rc = cli_main.main([
+        "clean", "--item", "42", "--log-dir", str(log_dir),
+        "--include-manifest",
+    ])
+    assert rc == 0
+    for p in ephemeral + manifest:
+        assert not p.exists(), (
+            f"--include-manifest should have removed {p}"
+        )
+
+
+def test_clean_finds_deep_recursion_subworkflow_logs(log_dir: Path):
+    """ADR-0026: Scenario → Feature → Task creates two-level subworkflow
+    logs (plan-N__child_X__child_Y.events.jsonl). These weren't matched
+    by the original glob; the fix added explicit deeper-recursion patterns."""
+    ephemeral = _seed_ephemeral(
+        log_dir, item_id=42, with_deep_recursion=True
+    )
+    rc = cli_main.main([
+        "clean", "--item", "42", "--log-dir", str(log_dir),
+    ])
+    assert rc == 0
+    for p in ephemeral:
+        assert not p.exists(), f"deep recursion file not cleaned: {p}"
+    # And there's nothing left matching the deep glob.
+    leftover = list(log_dir.glob("plan-42__child_*__child_*"))
+    assert leftover == [], (
+        f"deep subworkflow logs not fully cleaned: {leftover}"
+    )
 
 
 def test_clean_finds_subworkflow_logs(log_dir: Path):
@@ -153,8 +245,12 @@ def test_clean_refuses_when_leaf_pr_map_has_real_pr_numbers(
 
 
 def test_clean_force_overrides_in_flight_pr_check(log_dir: Path):
-    """--force lets the operator clean even when leaf-pr-map has PR refs."""
-    paths = _seed_full_run(log_dir, item_id=42)
+    """--force lets the operator clean even when leaf-pr-map has PR refs.
+    Note: --force only bypasses the in-flight safety check, NOT the
+    default manifest-preservation; combine with --include-manifest to
+    nuke everything."""
+    ephemeral = _seed_ephemeral(log_dir, item_id=42)
+    manifest = _seed_manifest(log_dir, item_id=42)
     map_path = log_dir / "leaf-pr-map-42.json"
     map_path.write_text(json.dumps({
         "item_id": 42,
@@ -165,14 +261,21 @@ def test_clean_force_overrides_in_flight_pr_check(log_dir: Path):
         "clean", "--item", "42", "--log-dir", str(log_dir), "--force",
     ])
     assert rc == 0
-    for p in paths:
-        assert not p.exists(), f"--force should have removed {p}"
+    for p in ephemeral:
+        assert not p.exists(), f"--force should have removed ephemeral {p}"
+    # Manifest still preserved (--force ≠ --include-manifest).
+    for p in manifest:
+        assert p.exists(), (
+            f"--force should NOT touch manifest {p}; "
+            f"only --include-manifest does that"
+        )
 
 
 def test_clean_leaf_pr_map_without_pr_numbers_is_fine(log_dir: Path):
     """A leaf-pr-map with null pr_number values (dry-run state) is NOT
-    in-flight and should clean without --force."""
-    paths = _seed_full_run(log_dir, item_id=42)
+    in-flight and should clean ephemeral files without --force.
+    The manifest+leaf-pr-map itself is still preserved per ADR-0026."""
+    ephemeral = _seed_ephemeral(log_dir, item_id=42)
     map_path = log_dir / "leaf-pr-map-42.json"
     map_path.write_text(json.dumps({
         "item_id": 42,
@@ -181,8 +284,12 @@ def test_clean_leaf_pr_map_without_pr_numbers_is_fine(log_dir: Path):
 
     rc = cli_main.main(["clean", "--item", "42", "--log-dir", str(log_dir)])
     assert rc == 0
-    for p in paths:
+    for p in ephemeral:
         assert not p.exists()
+    # leaf-pr-map preserved (manifest semantics) even though pr_number was null.
+    assert map_path.exists(), (
+        "leaf-pr-map preserved by default; nullable pr_number doesn't change that"
+    )
 
 
 def test_clean_corrupt_leaf_pr_map_is_tolerated(
