@@ -90,6 +90,7 @@ from requiem import seam as _seam
 from requiem import branch_model
 from requiem.clients.fs import FilesystemClient, FsClientError, FsGitError
 from requiem.clients.gh import GhClient, GhClientError
+from requiem.clients.azuredevops import AdoClientError
 from requiem.clients.twig import (
     TwigClient,
     TwigClientError,
@@ -443,6 +444,23 @@ def build_verb_registry(
                 message="implementation workflow requires toolbelt.gh",
             )
         return gh
+
+    def _require_repo_platform(ctx):
+        """ADR-0024 step 6 (2026-06-17): prefer toolbelt.repo (the
+        RepoPlatform protocol — works for both GitHub and ADO),
+        falling back to toolbelt.gh for back-compat with the existing
+        GitHub-only call sites and tests. Mirrors the helper in
+        leaf_pr.py."""
+        repo_client = ctx.toolbelt.repo or ctx.toolbelt.gh
+        if repo_client is None:
+            return PermanentFailure(
+                error_kind="toolbelt.missing_client",
+                message=(
+                    "implementation workflow requires a repo client "
+                    "(set toolbelt.repo, or toolbelt.gh for back-compat)"
+                ),
+            )
+        return repo_client
 
     # ---- start --------------------------------------------------------
 
@@ -856,7 +874,7 @@ def build_verb_registry(
                 "pr_url": None,
                 "dry_run": True,
             })
-        gh = _require_gh(ctx)
+        gh = _require_repo_platform(ctx)
         if isinstance(gh, PermanentFailure):
             return gh
 
@@ -884,17 +902,19 @@ def build_verb_registry(
         # Idempotency: if a PR already exists on this head branch
         # (we crashed between create_pr and link_pr_to_item on a
         # prior run) reuse it instead of creating a duplicate.
+        # ADR-0024 step 6: use find_open_pr_for_branch (structured search,
+        # platform-neutral) instead of pr_search (free-form, GitHub-only
+        # text search syntax). The structured form has both GitHub and ADO
+        # implementations and is what the protocol mandates.
         try:
-            existing = await gh.pr_search(
-                inputs.repo,
-                query=f"head:{branch_name} state:open",
-                limit=5,
+            existing = await gh.find_open_pr_for_branch(
+                inputs.repo, head=branch_name, limit=5,
             )
-        except GhClientError as e:
+        except (GhClientError, AdoClientError) as e:
             # Search failing is not the same as "no PR" — escalate.
             return PermanentFailure(
                 error_kind="pr.search_failed",
-                message=f"gh pr list failed: {e}",
+                message=f"repo client pr search failed: {e}",
                 details={"error": str(e)},
             )
         for pr in existing:
@@ -916,10 +936,10 @@ def build_verb_registry(
                 head=branch_name,
                 base=inputs.base_branch,
             )
-        except GhClientError as e:
+        except (GhClientError, AdoClientError) as e:
             return PermanentFailure(
                 error_kind="pr.create_failed",
-                message=f"gh pr create failed: {e}",
+                message=f"repo client pr create failed: {e}",
                 details={"error": str(e)},
             )
         return Success(

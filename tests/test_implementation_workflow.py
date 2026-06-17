@@ -104,6 +104,20 @@ class FakeGh:
             raise self.raise_on_search
         return list(self.existing_prs)
 
+    async def find_open_pr_for_branch(
+        self, repo: str, *, head: str, limit: int = 30
+    ):
+        """ADR-0024 step 6 (2026-06-17): RepoPlatform protocol's
+        structured PR search by head branch. Mirrors leaf_pr.py's
+        existing FakeRepoPlatform shape — returns only OPEN PRs
+        whose head matches."""
+        if self.raise_on_search is not None:
+            raise self.raise_on_search
+        return [
+            pr for pr in self.existing_prs
+            if pr.head == head and pr.state in ("open", "OPEN")
+        ]
+
     async def pr_create(
         self, repo: str, *, title: str, body: str, head: str, base: str
     ):
