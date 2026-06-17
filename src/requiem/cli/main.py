@@ -621,6 +621,166 @@ def _print_run_footer(result: Any, log_path: Path, elapsed_ms: float) -> None:
     _say(f"log: {log_path}", style="dim")
 
 
+def cmd_clean(args: argparse.Namespace) -> int:
+    """Reset state for one item so the next run starts from scratch.
+
+    Removes all artifacts the end-to-end driver writes under ``<log-dir>``
+    for the named ``--item``: plan/commit/trunk/exec/fanout/leafpr/featurepr
+    events.jsonl, the plan.md sidecar, leaf-pr-map JSON, committed plan
+    JSON, and any ``__child_*`` / ``__leaf-*`` subworkflow logs.
+
+    With ``--ado-delete``, also deletes the work item itself from ADO via
+    twig (unparenting first if needed). Use this for scratch/test
+    Scenarios that should NOT survive cleanup; production items should
+    almost never use this flag.
+
+    With ``--keep-artifacts``, only deletes durable side-effects (twig
+    work item, leaf-pr-map referencing real PR numbers) and preserves
+    the event-log artifacts so an operator can still inspect the
+    transcript. The default is to nuke everything under the log dir.
+
+    Never touches the repo working tree. Never deletes seeded ADO
+    children (that needs a separate `--cascade-children` flag, deliberately
+    not added in v0 because it's a footgun — operator should confirm
+    each child individually).
+
+    Refuses to clean if a leaf PR appears in the leaf-pr-map (that's a
+    real PR in flight; cleaning would lose the linkage). Pass
+    ``--force`` to override.
+    """
+    item_id = args.item
+    log_dir = Path(args.log_dir).resolve()
+    dry_run = args.dry_run
+    keep_artifacts = args.keep_artifacts
+    ado_delete = args.ado_delete
+    force = args.force
+
+    _say(f"requiem clean — item {item_id}, log_dir={log_dir}", style="bold")
+    if dry_run:
+        _say("  (dry-run — nothing will actually be removed)", style="yellow")
+
+    # ---- gather the artifacts -----------------------------------------
+    patterns = [
+        f"plan-{item_id}.events.jsonl",
+        f"plan-{item_id}.plan.md",
+        f"plan-{item_id}__child_*.events.jsonl",
+        f"plan-{item_id}-plan-{item_id}__child_*.events.jsonl",
+        f"commit-{item_id}.events.jsonl",
+        f"commit-{item_id}.plan.committed.json",
+        f"trunk-{item_id}.events.jsonl",
+        f"exec-{item_id}.events.jsonl",
+        f"fanout-{item_id}.events.jsonl",
+        f"fanout-{item_id}__leaf-*.events.jsonl",
+        f"leafpr-{item_id}.events.jsonl",
+        f"featurepr-{item_id}.events.jsonl",
+        f"leaf-pr-map-{item_id}.json",
+    ]
+    matched: list[Path] = []
+    if log_dir.exists():
+        for pat in patterns:
+            matched.extend(sorted(log_dir.glob(pat)))
+
+    # ---- safety: in-flight leaf PRs check -----------------------------
+    leaf_pr_map_path = log_dir / f"leaf-pr-map-{item_id}.json"
+    in_flight_prs: list[tuple[str, int]] = []
+    if leaf_pr_map_path.exists():
+        try:
+            payload = json.loads(leaf_pr_map_path.read_text(encoding="utf-8"))
+            for leaf in payload.get("leaves", []):
+                pr_num = leaf.get("pr_number")
+                if pr_num:
+                    in_flight_prs.append((leaf.get("leaf_id", "?"), int(pr_num)))
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+
+    if in_flight_prs and not force:
+        _say(
+            f"\nrefusing to clean: {len(in_flight_prs)} leaf PR(s) recorded:",
+            style="red",
+        )
+        for leaf_id, pr_num in in_flight_prs:
+            _say(f"  • leaf {leaf_id}: PR #{pr_num}", style="red")
+        _say(
+            "\nPass --force to clean anyway (loses the leaf↔PR linkage).",
+            style="dim",
+        )
+        return EXIT_CODE_FAILED
+
+    # ---- report what we'd touch ---------------------------------------
+    if not matched:
+        _say(f"  (no artifacts matched for item {item_id})", style="dim")
+    else:
+        _say(f"  {len(matched)} artifact(s) to remove:")
+        for p in matched:
+            kind = "subworkflow log" if "__" in p.name else "artifact"
+            _say(f"    {kind:18s} {p.relative_to(log_dir)}", style="bright_black")
+
+    if ado_delete:
+        _say(
+            f"  ado-delete: will call `twig delete {item_id} --force`",
+            style="yellow",
+        )
+
+    if dry_run:
+        _say("\n(dry-run complete; nothing removed)", style="yellow")
+        return EXIT_CODE_OK
+
+    # ---- destructive section ------------------------------------------
+    removed = 0
+    if not keep_artifacts:
+        for p in matched:
+            try:
+                p.unlink()
+                removed += 1
+            except OSError as e:
+                _say(f"  ! failed to remove {p}: {e}", style="red")
+
+    if ado_delete:
+        rc = _twig_delete(item_id)
+        if rc != 0:
+            _say(
+                f"  ! twig delete failed (rc={rc}); local artifacts already removed",
+                style="red",
+            )
+            return EXIT_CODE_FAILED
+
+    _say(
+        f"\n✓ cleaned item {item_id}: "
+        f"{removed} artifact(s) removed"
+        + ("; ADO item deleted" if ado_delete else "")
+        + ("; artifacts kept" if keep_artifacts else ""),
+        style="green",
+    )
+    return EXIT_CODE_OK
+
+
+def _twig_delete(item_id: int) -> int:
+    """Invoke `twig delete <id> --force`, unparenting first if needed.
+
+    Twig refuses to delete an item that has parent or other links; this
+    helper performs the minimum unparenting required.
+    """
+    import subprocess
+    # Set active first (twig link unparent operates on the active item).
+    subprocess.run(
+        ["twig", "set", str(item_id)],
+        capture_output=True, text=True, timeout=30,
+    )
+    # Best-effort unparent (no-op if already unparented).
+    subprocess.run(
+        ["twig", "link", "unparent"],
+        capture_output=True, text=True, timeout=30,
+    )
+    # Now delete.
+    result = subprocess.run(
+        ["twig", "delete", str(item_id), "--force"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        _say(f"  twig stderr: {result.stderr.strip()}", style="red")
+    return result.returncode
+
+
 # ---- argparse plumbing ---------------------------------------------
 
 
@@ -687,6 +847,44 @@ def _build_parser() -> argparse.ArgumentParser:
         help="free-text reason recorded in the cancel_requested event payload",
     )
     cn.set_defaults(func=cmd_cancel)
+
+    cl = sub.add_parser(
+        "clean",
+        help="reset state for one item — nuke per-item event logs + artifacts",
+    )
+    cl.add_argument(
+        "--item", type=int, required=True,
+        help="ADO work-item id to clean up state for.",
+    )
+    cl.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR))
+    cl.add_argument(
+        "--ado-delete", action="store_true",
+        help=(
+            "Also delete the work item from ADO via `twig delete`. "
+            "DESTRUCTIVE; use for scratch/test Scenarios only."
+        ),
+    )
+    cl.add_argument(
+        "--keep-artifacts", action="store_true",
+        help=(
+            "Keep the event-log files (don't remove them). Useful when "
+            "you want to keep a forensic copy of the run transcript "
+            "but still need to re-run from scratch."
+        ),
+    )
+    cl.add_argument(
+        "--dry-run", action="store_true",
+        help="Print what WOULD be removed without actually removing anything.",
+    )
+    cl.add_argument(
+        "--force", action="store_true",
+        help=(
+            "Override the in-flight-PR safety check. Default behaviour "
+            "refuses to clean an item whose leaf-pr-map shows real PR "
+            "numbers (cleaning would lose the linkage)."
+        ),
+    )
+    cl.set_defaults(func=cmd_clean)
 
     return p
 
