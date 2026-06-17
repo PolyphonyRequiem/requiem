@@ -236,6 +236,46 @@ async def test_pinned_proposal_is_reused_not_created(log_dir: Path):
 # ---- artifact guards (load_tree) ---------------------------------------
 
 
+async def test_policy_forced_leaf_child_passes_validation(log_dir: Path):
+    """ADR-0025 Gap A* regression pin: when the planning workflow's
+    short-circuit produces a child with `final_verdict='policy-forced-leaf'`,
+    commit_plan's load_tree validator must accept it as terminal. Pre-fix,
+    the validator only allowed None and 'approved', rejecting any
+    short-circuited child as 'not approved' and aborting the entire
+    commit_plan run (this is what broke the SKU-fallback dogfood run 6,
+    2026-06-17 — top-level plan reached commit_plan but load_tree rejected
+    every Gap-A-short-circuited Task child)."""
+    tree = {
+        "schema_version": 2, "plan_id": "plan-pf", "item_id": ROOT,
+        "decomposable": True, "verdict": "approved",
+        "proposals": [
+            {"title": "Implementable Task", "description": "d", "work_item_type": "Task"},
+        ],
+        "children": [
+            {
+                "item_id": ROOT * 100 + 1, "plan_id": "p",
+                "decomposable": False,
+                "summary": "Implementable Task",
+                "review_iterations": 0,
+                # The synthetic verdict from the Gap A short-circuit.
+                "final_verdict": "policy-forced-leaf",
+                "proposals": [], "children": [],
+            },
+        ],
+    }
+    path = _write_tree(log_dir, tree, name="pf")
+    engine = build_engine(
+        log_dir, plan_tree_path=path, dry_run=False, twig=_twig_with_root()
+    )
+    result = await engine.run("pf")
+    assert isinstance(result, Completed)
+    # The whole point: don't fail at load_tree on validation_failed.
+    assert result.final_node != "end_failed", (
+        f"policy-forced-leaf must be accepted by load_tree; "
+        f"final={result.final_node}"
+    )
+
+
 async def test_missing_artifact_routes_to_end_failed(log_dir: Path):
     engine = build_engine(log_dir, plan_tree_path=log_dir / "nope.json", dry_run=False, twig=_twig_with_root())
     result = await engine.run("missing")

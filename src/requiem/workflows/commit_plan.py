@@ -265,7 +265,12 @@ def _validate_node(
                     f"!= expected synth {synth}"
                 )
             fv = child.get("final_verdict")
-            if fv not in (None, "approved"):
+            # ``policy-forced-leaf`` is the synthetic verdict written by
+            # the planning workflow's ADR-0025 Gap A short-circuit
+            # (implementable types skip planner+reviewer entirely).
+            # Treat it as terminal-approved for commit_plan's purposes —
+            # the policy IS the approval.
+            if fv not in (None, "approved", "policy-forced-leaf"):
                 errors.append(
                     f"depth {depth}: child[{i}] final_verdict {fv!r} is not approved"
                 )
