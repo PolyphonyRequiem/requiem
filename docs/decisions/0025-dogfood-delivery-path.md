@@ -524,9 +524,48 @@ attractive but premature.
   `implementation.py` workflow as it exists today has an
   `invoke_coder` verb that calls a coder agent — is that already
   CopilotProvider-driven? Audit during Gap C scoping.
+- **Should `ITER_CAP` be configurable per-run?** Bumped 3→5 in
+  2b1979e (2026-06-17) as a temporary lever after the SKU-fallback
+  dogfood retry showed complex Scenarios genuinely need more
+  iterations to converge. The right shape is an `iter_cap` param on
+  `build_engine` + a `--max-plan-iterations` CLI flag so operators
+  can dial up complex Scenarios without paying the cost on every
+  plan. ITER_CAP is referenced in 8 places across `planning.py`;
+  threading a parameter through is its own refactor. Follow-up after
+  Gap B/C land.
+- **Reviewer charter improvements.** The dogfood run 5 reviewer
+  produced genuinely substantive feedback — dependency analysis,
+  scope overlap detection, cross-cutting concerns. Still escalated
+  at iter 5 because the planner couldn't fully converge. The
+  reviewer's escalation feedback ("Task 3 and Task 4 still have
+  unresolved overlap on rollout controls") is the kind of thing a
+  human reviewer would either (a) accept and tell implementation to
+  resolve, or (b) explicitly re-scope. Neither path is currently
+  expressible from the reviewer's structured output. Worth a
+  separate ADR after we have more data on which feedback shapes
+  actually block convergence vs which represent acceptable scope.
 
 ## STATUS log
 
 - **2026-06-17 PROPOSED.** Plan written; no code committed against
   this ADR yet. Three gaps identified; Gap A is the immediate next
   session's work.
+- **2026-06-17 §1 SHIPPED** (8fea529). `--process-config <path>`
+  CLI flag + `_resolve_process_config` helper + 8 tests. Operator
+  state: `.requiem-config/` ignored at CVAPI bare repo level,
+  config lives at `~/.config/requiem/cvapi-process.yaml`.
+- **2026-06-17 Gap A SHIPPED** (785a4b2). `policy_classifier` +
+  `record_leaf_from_policy` short-circuit; 4 new tests; 168 passed
+  in the broad sweep.
+- **2026-06-17 Gap A* SHIPPED** (6d8bbb5). Post-Gap-A finding from
+  dogfood retry: reviewer prompt rendered `children: N proposed`
+  (just the count) which forced reviewers to escalate as
+  "cannot evaluate". Fix renders full child list (title + type +
+  description, capped at 400 chars) so reviewer can do real
+  evaluation. 1 new test + extended `FakeProvider.calls` to record
+  `user_message` for end-to-end prompt content assertions.
+- **2026-06-17 ITER_CAP bump SHIPPED** (2b1979e). 3→5 iterations
+  after the reviewer-prompt fix unlocked substantive per-iteration
+  feedback that the planner needed more rounds to fully address.
+  Temporary lever; configurable per-run is a follow-up (see open
+  questions).
