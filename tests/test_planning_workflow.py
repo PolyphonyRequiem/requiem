@@ -30,9 +30,11 @@ from requiem.workflows.planning import (
     FakeTwigClient,
     ITER_CAP,
     PlanResult,
+    VALID_ESCALATION_POLICIES,
     build_engine,
     build_workflow,
     completed_from_log,
+    make_escalation_policy_handler,
     project_plan_result,
     verdict_card,
 )
@@ -778,3 +780,166 @@ async def test_planner_agent_crash_also_narrates(log_dir: Path):
     assert card is not None
     assert "planner_1" in card
     assert "verb.crash" in card
+
+
+# ============================================================
+# ADR-0027: reviewer escalation handling
+# ============================================================
+
+
+def test_make_escalation_policy_handler_rejects_invalid_policy():
+    """Policy names are validated at construction time, not at fire time."""
+    import pytest
+    with pytest.raises(ValueError, match="invalid escalation policy"):
+        make_escalation_policy_handler("hallucinated-policy")
+
+
+def test_make_escalation_policy_handler_accepts_all_valid_policies():
+    """All three documented policies must construct successfully."""
+    for policy in VALID_ESCALATION_POLICIES:
+        h = make_escalation_policy_handler(policy)
+        assert callable(h)
+        assert getattr(h, "__requiem_auto__", False) is True
+        assert getattr(h, "__requiem_escalation_policy__", None) == policy
+
+
+def test_escalation_policy_handler_only_intercepts_escalation_gate():
+    """Other gates must fall through to the fallback handler. This is
+    the safety property that lets ADR-0027 ship without affecting
+    bad_output_gate, type_policy_gate, recursion_depth_gate, etc."""
+    fallback_calls: list[tuple[str, str, tuple[str, ...]]] = []
+
+    def fallback(node_id, prompt, options):
+        fallback_calls.append((node_id, prompt, options))
+        return "abort"
+
+    h = make_escalation_policy_handler("accept-last", fallback=fallback)
+    # escalation_gate is intercepted with proceed.
+    assert h("escalation_gate", "p", ("proceed", "abort")) == "proceed"
+    assert fallback_calls == []
+    # Other gates delegate.
+    assert h("bad_output_gate", "p", ("abort",)) == "abort"
+    assert fallback_calls == [("bad_output_gate", "p", ("abort",))]
+
+
+def test_escalation_policy_escalate_is_pass_through():
+    """policy=escalate (default) delegates EVERY gate to fallback —
+    behavior is byte-identical to today's pre-ADR-0027 code path."""
+    calls: list[str] = []
+
+    def fallback(node_id, prompt, options):
+        calls.append(node_id)
+        return "proceed" if "proceed" in options else "abort"
+
+    h = make_escalation_policy_handler("escalate", fallback=fallback)
+    h("escalation_gate", "p", ("proceed", "abort"))
+    h("bad_output_gate", "p", ("abort",))
+    assert calls == ["escalation_gate", "bad_output_gate"]
+
+
+def test_escalation_policy_abort_auto_aborts_escalation_only():
+    """policy=abort: escalation_gate auto-aborts; other gates fall through."""
+    fallback_calls: list[str] = []
+
+    def fallback(node_id, prompt, options):
+        fallback_calls.append(node_id)
+        return "abort"
+
+    h = make_escalation_policy_handler("abort", fallback=fallback)
+    assert h("escalation_gate", "p", ("proceed", "abort")) == "abort"
+    assert fallback_calls == []  # didn't fall through
+    h("bad_output_gate", "p", ("abort",))
+    assert fallback_calls == ["bad_output_gate"]
+
+
+def test_escalation_policy_defensive_when_option_set_changes():
+    """If the gate's option set ever changes such that 'proceed' is no
+    longer offered, accept-last must NOT silently pick something else;
+    it falls through to the fallback handler instead."""
+    fallback_calls: list[str] = []
+
+    def fallback(node_id, prompt, options):
+        fallback_calls.append(node_id)
+        return "abort"
+
+    h = make_escalation_policy_handler("accept-last", fallback=fallback)
+    # Gate that doesn't offer 'proceed' — must delegate.
+    assert h("escalation_gate", "p", ("abort", "alternative")) == "abort"
+    assert fallback_calls == ["escalation_gate"]
+
+
+async def test_escalation_writes_sidecar_with_reviewer_feedback(log_dir: Path):
+    """ADR-0027 Shape B: the escalation-feedback sidecar is written by
+    record_needs_human whenever it fires from an escalation_gate route.
+    Content must include the reviewer's last verdict + feedback so the
+    operator has the open questions in durable markdown form."""
+    REVIEWER_FEEDBACK = (
+        "Plan is mostly fine but Task #3 needs explicit dependency on "
+        "Task #1 — clarify before shipping."
+    )
+    provider = FakeProvider(
+        scripts={
+            "planner": [_leaf_planner_output()] * ITER_CAP,
+            "plan_reviewer": [
+                {"verdict": "revise", "feedback": REVIEWER_FEEDBACK},
+            ]
+            * ITER_CAP,
+        }
+    )
+    engine = build_engine(
+        log_dir,
+        item_id=ITEM_ID,
+        twig=_twig(),
+        provider=provider,
+        gate_handler=_proceed_handler,
+    )
+    result = await engine.run("escalate-sidecar")
+    assert isinstance(result, Completed), result
+
+    # Sidecar file exists at the documented path.
+    sidecar = log_dir / "escalate-sidecar.escalation-feedback.md"
+    assert sidecar.exists(), (
+        f"escalation-feedback sidecar should be written when "
+        f"record_needs_human fires; expected at {sidecar}"
+    )
+    body = sidecar.read_text(encoding="utf-8")
+
+    # Must contain the reviewer's actual feedback text.
+    assert REVIEWER_FEEDBACK in body, (
+        f"sidecar body should embed the reviewer's last feedback; "
+        f"body was:\n{body}"
+    )
+    # Must name the run and the iteration cap.
+    assert "escalate-sidecar" in body
+    assert f"iteration {ITER_CAP}" in body
+    # Must include the "what to do next" guidance.
+    assert "What to do next" in body
+    assert "--on-escalate=accept-last" in body
+
+
+async def test_escalation_sidecar_listed_in_plan_record(log_dir: Path):
+    """The plan record returned by record_needs_human MUST reference
+    the sidecar path so callers (end_to_end.py, dashboards) can find
+    it without re-scanning log_dir."""
+    provider = FakeProvider(
+        scripts={
+            "planner": [_leaf_planner_output()] * ITER_CAP,
+            "plan_reviewer": [
+                {"verdict": "revise", "feedback": "needs more"},
+            ]
+            * ITER_CAP,
+        }
+    )
+    engine = build_engine(
+        log_dir,
+        item_id=ITEM_ID,
+        twig=_twig(),
+        provider=provider,
+        gate_handler=_proceed_handler,
+    )
+    await engine.run("sidecar-in-record")
+    completed = completed_from_log(engine.log_path("sidecar-in-record"))
+    record = completed["record_needs_human"]["value"]
+    assert "escalation_artifact" in record
+    assert record["escalation_artifact"] is not None
+    assert "escalation-feedback.md" in record["escalation_artifact"]

@@ -1219,6 +1219,34 @@ def build_verb_registry(
             recursive_children=children,
             needs_human=True,
         )
+        # ADR-0027 Shape B: always write the escalation-feedback sidecar
+        # when record_needs_human fires from an escalation_gate route.
+        # The reviewer at the same iteration as the planner is the one
+        # whose verdict drove the escalation (escalation_gate routes
+        # `proceed`→record_needs_human after the last reviewer escalated).
+        reviewer_block = ctx.completed.get(f"reviewer_{approved_iter}", {})
+        reviewer_parsed = (reviewer_block.get("value") or {}).get("parsed") or {}
+        escalation_artifact: Path | None = None
+        try:
+            escalation_artifact = _write_escalation_sidecar(
+                log_dir=log_dir,
+                run_id=ctx.run_id,
+                item=item,
+                planner=planner,
+                iteration=approved_iter,
+                reviewer_feedback=reviewer_parsed.get("feedback", "") or "",
+                reviewer_verdict=reviewer_parsed.get("verdict", "unknown"),
+                recursive_children=children,
+            )
+        except OSError:
+            # Sidecar is best-effort durability; the plan record itself
+            # is the authoritative output. Don't fail the run if the
+            # filesystem is unhappy.
+            pass
+
+        inspected: tuple[str, ...] = (f"file:{artifact}",)
+        if escalation_artifact is not None:
+            inspected = inspected + (f"file:{escalation_artifact}",)
         return Success(
             value={
                 "plan_id": plan_id,
@@ -1234,8 +1262,13 @@ def build_verb_registry(
                 "review_iterations": approved_iter,
                 "final_verdict": "needs_human",
                 "plan_artifact": str(artifact),
+                "escalation_artifact": (
+                    str(escalation_artifact)
+                    if escalation_artifact is not None
+                    else None
+                ),
             },
-            inspected_artifacts=(f"file:{artifact}",),
+            inspected_artifacts=inspected,
         )
 
     return verbs
@@ -1418,6 +1451,92 @@ def _write_plan_sidecar(
             body.append(line)
     path.write_text("\n".join(body) + "\n", encoding="utf-8")
     return path
+
+
+# ---- escalation sidecar -------------------------------------------------
+
+
+def _write_escalation_sidecar(
+    *,
+    log_dir: Path,
+    run_id: str,
+    item: dict,
+    planner: dict,
+    iteration: int,
+    reviewer_feedback: str,
+    reviewer_verdict: str,
+    recursive_children: list[dict[str, Any]] | None,
+) -> Path:
+    """Write a human-readable escalation summary alongside the plan tree.
+
+    ADR-0027 Shape B: ALWAYS written on escalation regardless of
+    ``--on-escalate`` policy. This is the durable artifact the
+    operator reads to either (a) act on the reviewer's blocking
+    questions and re-run, or (b) confirm the plan that ``accept-last``
+    auto-shipped is the one they want.
+
+    Path: ``<log_dir>/<run_id>.escalation-feedback.md``. Co-located
+    with ``<run_id>.events.jsonl`` and ``<run_id>.plan.tree.json`` so
+    a single ``ls`` shows the full forensic set.
+    """
+    sidecar_path = log_dir / f"{run_id}.escalation-feedback.md"
+
+    children_block = "\n".join(
+        f"  {i}. [{c.get('work_item_type', '?')}] {c.get('title', '?')}"
+        for i, c in enumerate(planner.get("children") or [], 1)
+    ) or "  (none — planner returned a leaf plan)"
+
+    recursive_block = ""
+    if recursive_children:
+        recursive_block = "\n".join(
+            f"  {i}. [{c.get('work_item_type', '?')}] {c.get('title', '?')} "
+            f"(final_verdict={c.get('final_verdict', '?')!r})"
+            for i, c in enumerate(recursive_children, 1)
+        )
+
+    body = (
+        f"# Escalation feedback — run `{run_id}`\n\n"
+        f"**Root work item:** AB#{item.get('item_id', '?')} — "
+        f"{item.get('title', '(no title)')!r} "
+        f"(type={item.get('work_item_type', '?')})\n\n"
+        f"**Escalated at:** iteration {iteration} of {ITER_CAP}\n"
+        f"**Reviewer verdict:** {reviewer_verdict}\n"
+        f"**Plan disposition:** "
+        f"`needs_human` (the last planner output is recorded as the plan; "
+        f"the operator must decide whether to ship it as-is or revise the "
+        f"work item and re-run)\n\n"
+        f"## Reviewer feedback (open questions)\n\n"
+        f"{reviewer_feedback or '(empty — reviewer emitted no feedback text)'}\n\n"
+        f"## Last planner output\n\n"
+        f"**Decomposable:** {planner.get('decomposable', '?')}\n\n"
+        f"**Summary:** {planner.get('summary', '(none)')}\n\n"
+        f"**Estimated complexity:** "
+        f"{planner.get('estimated_complexity', 'unknown')}\n\n"
+        f"**Proposed children ({len(planner.get('children') or [])}):**\n\n"
+        f"{children_block}\n"
+    )
+    if recursive_block:
+        body += (
+            f"\n## Recursive sub-plans (already produced)\n\n"
+            f"{recursive_block}\n"
+        )
+    body += (
+        f"\n## Forensic links\n\n"
+        f"- Event log: `{log_dir / f'{run_id}.events.jsonl'}`\n"
+        f"- Plan tree (if decomposable): "
+        f"`{log_dir / f'{run_id}.plan.tree.json'}`\n"
+        f"\n## What to do next\n\n"
+        f"1. Read the reviewer feedback above.\n"
+        f"2. If the open questions need product/PM input, resolve them in "
+        f"the work item description (or a comment) and re-run.\n"
+        f"3. If the plan as proposed is good enough to ship, re-run with "
+        f"`--on-escalate=accept-last` (the sidecar will still be written "
+        f"for audit but the run will proceed past planning).\n"
+        f"4. If the plan is fundamentally wrong, file follow-up items and "
+        f"start fresh against a tighter scope.\n"
+    )
+    sidecar_path.write_text(body, encoding="utf-8")
+    return sidecar_path
 
 
 # ---- agent registry -----------------------------------------------------
@@ -1968,6 +2087,71 @@ def _default_gate_handler(node_id: str, prompt: str, options: tuple[str, ...]) -
 
 
 _default_gate_handler.__requiem_auto__ = True  # type: ignore[attr-defined]
+
+
+# ---- ADR-0027 escalation-policy gate handler ---------------------------
+
+
+VALID_ESCALATION_POLICIES = ("escalate", "accept-last", "abort")
+"""Allowed values for the `--on-escalate` CLI flag. Default is `escalate`
+(current behavior pre-ADR-0027); `accept-last` answers `proceed` to
+ship the last planner output as needs-human; `abort` answers `abort`."""
+
+
+def make_escalation_policy_handler(
+    policy: str,
+    *,
+    fallback: Any = None,
+) -> Any:
+    """Build a gate handler that enforces an escalation policy.
+
+    Per ADR-0027 Shape B, the policy ONLY affects ``escalation_gate``;
+    all other gates (``bad_output_gate``, ``type_policy_gate``,
+    ``recursion_depth_gate``, etc.) are delegated to ``fallback`` (the
+    operator's interactive handler, or a test-supplied stub).
+
+    ``policy=escalate`` (default): delegate the escalation gate too —
+    behavior is identical to today, except the sidecar gets written by
+    ``record_needs_human`` whenever the operator picks ``proceed``.
+
+    ``policy=accept-last``: auto-answer ``proceed`` at escalation_gate.
+    The workflow records the last planner output as needs-human, the
+    sidecar captures the reviewer's escalation rationale, and the run
+    continues (run_pipeline must allow needs_human past the planning
+    phase when policy is accept-last — see end_to_end.py).
+
+    ``policy=abort``: auto-answer ``abort`` at escalation_gate. Run
+    terminates; sidecar is NOT written (no record_needs_human path).
+    Useful for batch / CI contexts where you'd rather fail fast than
+    ship a needs-human plan.
+    """
+    if policy not in VALID_ESCALATION_POLICIES:
+        raise ValueError(
+            f"invalid escalation policy {policy!r}; valid: "
+            f"{VALID_ESCALATION_POLICIES}"
+        )
+    fallback_fn = fallback or _default_gate_handler
+
+    def _handler(node_id: str, prompt: str, options: tuple[str, ...]) -> str:
+        if node_id != "escalation_gate":
+            return fallback_fn(node_id, prompt, options)
+        if policy == "accept-last":
+            if "proceed" not in options:
+                # Defensive: if the gate's option set ever changes,
+                # don't silently pick a wrong option.
+                return fallback_fn(node_id, prompt, options)
+            return "proceed"
+        if policy == "abort":
+            if "abort" not in options:
+                return fallback_fn(node_id, prompt, options)
+            return "abort"
+        # policy == "escalate": delegate to fallback (interactive
+        # prompt for the operator, or test stub).
+        return fallback_fn(node_id, prompt, options)
+
+    _handler.__requiem_auto__ = True  # type: ignore[attr-defined]
+    _handler.__requiem_escalation_policy__ = policy  # type: ignore[attr-defined]
+    return _handler
 
 
 def build_engine(

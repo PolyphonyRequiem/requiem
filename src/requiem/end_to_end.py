@@ -457,6 +457,7 @@ async def run_pipeline(
     dispatch_backend: str = "kanban",
     repo_path: Path | None = None,
     fanout_parallel: bool = False,
+    escalation_policy: str = "escalate",
     planning_factory: PlanningFactory = planning_mod.build_engine,
     commit_factory: CommitFactory = commit_plan_mod.build_engine,
     executor_factory: ExecutorFactory = executor_mod.build_engine,
@@ -507,12 +508,31 @@ async def run_pipeline(
     plan_outcome = await plan_engine.run(plan_run)
     plan_record = _plan_record(_completed_map(log_dir, plan_run))
 
-    if plan_record is None or plan_record.get("final_verdict") != "approved":
-        verdict = (plan_record or {}).get("final_verdict", "unknown")
+    # ADR-0027: which final verdicts are allowed past the planning
+    # phase. Default `escalate` allows only `approved` (today's
+    # behavior). `accept-last` ALSO allows `needs_human` — the
+    # workflow's record_needs_human path captures the last planner
+    # output AND writes the escalation-feedback sidecar, so the
+    # operator has both the plan and the reviewer's open questions
+    # in a durable form.
+    allowed_verdicts: set[str] = {"approved"}
+    if escalation_policy == "accept-last":
+        allowed_verdicts.add("needs_human")
+
+    verdict = (plan_record or {}).get("final_verdict")
+    if plan_record is None or verdict not in allowed_verdicts:
+        verdict_repr = verdict or "unknown"
         return PipelineResult(
             item_id=item_id, stage="planning", status="paused",
-            detail=f"planning did not approve a plan (verdict={verdict!r}); "
-                   "resolve the plan before dispatching.",
+            detail=(
+                f"planning did not approve a plan (verdict={verdict_repr!r}); "
+                "resolve the plan before dispatching."
+                + (
+                    " (run with --on-escalate=accept-last to ship as needs-human)"
+                    if verdict == "needs_human" and escalation_policy == "escalate"
+                    else ""
+                )
+            ),
             decomposable=(plan_record or {}).get("decomposable"),
             plan_artifact=(plan_record or {}).get("plan_artifact"),
         )
@@ -991,6 +1011,25 @@ def _build_arg_parser():
                         "repo's real default branch via the RepoPlatform Protocol.")
     p.add_argument("--poll-interval", type=float, default=5.0)
     p.add_argument("--max-polls", type=int, default=120)
+    # ADR-0027: reviewer escalation handling. Default `escalate`
+    # preserves today's behavior (interactive prompt at escalation_gate);
+    # `accept-last` auto-answers `proceed` so a good-enough plan ships
+    # as needs_human and the run continues; `abort` auto-terminates.
+    # The escalation-feedback sidecar is written on every escalation
+    # regardless of this flag (when record_needs_human fires).
+    p.add_argument(
+        "--on-escalate",
+        choices=["escalate", "accept-last", "abort"],
+        default="escalate",
+        help=(
+            "What to do when the planner/reviewer loop hits escalation_gate. "
+            "escalate (default): operator must answer interactively. "
+            "accept-last: ship the last planner output as needs_human and "
+            "continue past the planning phase. "
+            "abort: terminate the run. "
+            "See ADR-0027 for the failure-mode taxonomy this policy maps to."
+        ),
+    )
     return p
 
 
@@ -1052,6 +1091,15 @@ def main(argv: list[str] | None = None) -> int:
         explicit_path=args.process_config, repo_path=args.repo,
     )
 
+    # ADR-0027: build the gate handler from the --on-escalate policy.
+    # The handler ONLY auto-responds at escalation_gate; other gates
+    # fall through to the default (today: abort, the safe choice for
+    # batch context — operators can override via a custom handler
+    # passed programmatically). The factory raises ValueError on an
+    # unknown policy; argparse `choices=...` prevents that path.
+    from requiem.workflows.planning import make_escalation_policy_handler
+    gate_handler = make_escalation_policy_handler(args.on_escalate)
+
     result = asyncio.run(run_pipeline(
         args.item,
         log_dir=args.log_dir,
@@ -1068,6 +1116,8 @@ def main(argv: list[str] | None = None) -> int:
         process_config=process_config,
         poll_interval_s=args.poll_interval,
         max_polls=args.max_polls,
+        gate_handler=gate_handler,
+        escalation_policy=args.on_escalate,
     ))
 
     print(f"[{result.stage}] {result.status}: {result.detail}")
