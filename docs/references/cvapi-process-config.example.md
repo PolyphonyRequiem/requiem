@@ -14,20 +14,49 @@ requiem-end-to-end \
   ...
 ```
 
+## How I discovered the right shape (anti-pattern alert)
+
+My first attempt encoded `Feature` as the Scenario→child intermediate
+because I copied polyphony's `Epic → Issue → Task` pattern and
+assumed Feature was the standard ADO equivalent of Issue. **That was
+wrong.** CVAPI's convention is **Deliverable**, not Feature.
+
+Discovery query that produced the right hierarchy (run BEFORE
+encoding type names into your process.yaml):
+
+```bash
+# Count items of each candidate type in the area path:
+twig query --type "Deliverable" \
+  --area-path "OS\Azure Core\Azure Core CTO\Azure Engineering Systems\CloudVault"
+# → count: 25+ (the conventional intermediate)
+
+twig query --type "Feature" \
+  --area-path "OS\Azure Core\Azure Core CTO\Azure Engineering Systems\CloudVault"
+# → count: 7 (mostly synthetic / outliers)
+```
+
+When the count for one type is an order of magnitude larger than
+alternatives in your team's area path, that's the convention. Use it.
+
+Reference: requiem ADR-0026 establishes that requiem itself is
+type-agnostic; type names live exclusively in your process.yaml.
+ADR-0015 §9 #1 codifies that the engine never names ADO types in code.
+
 ## Why this shape
 
-CVAPI's ADO work-item hierarchy is:
+CVAPI's ADO work-item hierarchy (per `twig process` + the area-path
+discovery query above):
 
 ```
-Objective → Key Result → Epic → Scenario → Feature → Task | Bug | User Story
+Objective → Key Result → Epic → Scenario → Deliverable → Task | Bug | User Story
 ```
 
 The flat-tier model from ADR-0015 (and ADR-0025 Gap A) was structurally
-inadequate to encode the **Scenario → Feature → Task** chain: it could
-say "Task is implementable" but couldn't say "Scenarios produce Features,
-not Tasks directly." ADR-0026 introduces the per-type schema with
-facets and `decomposition_guidance` to make hierarchical intent
-machine-readable.
+inadequate to encode the **Scenario → Deliverable → Task** chain: it
+could say "Task is implementable" but couldn't say "Scenarios produce
+Deliverables, not Tasks directly." ADR-0026 introduces the per-type
+schema with facets and `decomposition_guidance` to make hierarchical
+intent machine-readable.
 
 ## The config (current)
 
@@ -37,7 +66,7 @@ root_parent_types:
   - Key Result
   - Epic
   - Scenario
-  - Feature
+  - Deliverable
 
 types:
   Objective:
@@ -61,15 +90,16 @@ types:
   Scenario:
     facets: [plannable]
     decomposition_guidance: |
-      Decompose into Features. NEVER decompose a Scenario directly
-      into Tasks — Features always sit between.
+      Decompose into Deliverables. NEVER decompose a Scenario directly
+      into Tasks — Deliverables always sit between. Do NOT use 'Feature'
+      as the child type; CVAPI's convention is Deliverable.
     max_nesting_depth: 1
 
-  Feature:
+  Deliverable:
     facets: [plannable, implementable]
     decomposition_guidance: |
       Decompose into Tasks (the concrete implementation units).
-      Implement directly only when the Feature is small enough to
+      Implement directly only when the Deliverable is small enough to
       fit in a single PR (~500 LoC of net change).
     max_nesting_depth: 1
 
@@ -97,16 +127,17 @@ header commentary preserved).
 | `implementable` | Item may be implemented directly. Type appears in derived `implementable_types` (unless also `plannable` — then it lives in `decomposable_types` and the planner is invoked, but a leaf verdict is honoured). |
 | `actionable` | Marks the item as something the executor backend named in `actionable_executor` picks up. Today only `requiem` is implemented (the in-process fanout). |
 
-## How Feature being bi-facet works (the escape hatch)
+## How Deliverable being bi-facet works (the escape hatch)
 
-CVAPI's Feature carries both `plannable` AND `implementable`. This
-means:
+CVAPI's Deliverable carries both `plannable` AND `implementable`.
+This means:
 
-1. When a Feature is the work item, the planner IS invoked (because
-   it has the `plannable` facet → tier_for_type returns `decomposable`).
-2. The planner SEES the `decomposition_guidance` (the prompt tells it
-   "Decompose into Tasks; implement directly only when the Feature is
-   small enough to fit in a single PR").
+1. When a Deliverable is the work item, the planner IS invoked
+   (because it has the `plannable` facet → tier_for_type returns
+   `decomposable`).
+2. The planner SEES the `decomposition_guidance` (the prompt tells
+   it "Decompose into Tasks; implement directly only when the
+   Deliverable is small enough to fit in a single PR").
 3. The planner is FREE to return `decomposable=false`. The workflow
    accepts that as a leaf because the type has the `implementable`
    facet — no `config_requires_decomposition` violation.
