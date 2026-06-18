@@ -772,6 +772,133 @@ async def test_planner_prompt_omits_guidance_for_implementable_types(
 # ============================================================
 
 
+async def test_planner_proposed_unknown_type_routes_to_type_policy_gate(
+    log_dir: Path,
+):
+    """ADR-0015 §9 #1 (type-agnostic engine) + ADR-0026: when the
+    operator's process.yaml declares `types`, every planner-proposed
+    child must have a work_item_type the operator has declared.
+
+    Without enforcement, a hallucinated type (e.g. the planner outputs
+    'Spike' when CVAPI doesn't have Spike) would silently flow to
+    commit_plan and twig's `new --type Spike` would fail at the ADO
+    boundary with a confusing error. Better: catch it at the planning
+    layer and route to type_policy_gate with the actual unknown types.
+
+    The pin: planner proposes a child with type 'Spike' (not in cfg.types);
+    workflow routes to type_policy_gate with the proceed_handler
+    accepting as needs-human.
+    """
+    cfg = ProcessConfig(
+        types={
+            "Scenario": TypeConfig(facets=("plannable",)),
+            "Task": TypeConfig(facets=("implementable",)),
+        }
+    )
+    provider = FakeProvider(
+        scripts={
+            # Planner proposes ONE child of type "Spike" — not in cfg.types.
+            "planner": [{
+                "summary": "decomposable",
+                "decomposable": True,
+                "children": [{
+                    "title": "rogue child",
+                    "description": "type not in operator config",
+                    "work_item_type": "Spike",  # not declared
+                }],
+                "estimated_complexity": "medium",
+                "rationale": "test",
+            }],
+            "plan_reviewer": [_approve()],
+        }
+    )
+    twig = _twig({ROOT_ID: "Scenario"})
+    engine = build_engine(
+        log_dir,
+        item_id=ROOT_ID,
+        twig=twig,
+        provider=provider,
+        process_config=cfg,
+        gate_handler=_proceed_handler,
+    )
+    result = await engine.run("unknown-type")
+    assert isinstance(result, Completed), result
+    # Inspect events for the unknown_child_work_item_type signal.
+    import json
+    log_path = log_dir / "unknown-type.events.jsonl"
+    events = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    unknown_signals = [
+        ev for ev in events
+        if (
+            ev.get("kind") == "verb_completed"
+            and ev.get("node_id") == "branch_decomposable"
+            and (ev.get("payload", {}).get("outcome", {}) or {}).get("error_kind")
+            == "unknown_child_work_item_type"
+        )
+    ]
+    assert unknown_signals, (
+        f"branch_decomposable should have emitted "
+        f"'unknown_child_work_item_type' for the Spike child; "
+        f"events seen: "
+        f"{[(ev.get('kind'), ev.get('node_id')) for ev in events[:25]]}"
+    )
+    # type_policy_gate should have been entered.
+    entered_gate = [
+        ev for ev in events
+        if ev.get("kind") == "node_entered"
+        and ev.get("node_id") == "type_policy_gate"
+    ]
+    assert entered_gate, "should have routed to type_policy_gate"
+
+
+async def test_planner_proposed_known_types_pass_validation(log_dir: Path):
+    """Sanity sibling: when every proposed child has a known type, the
+    new validation gate is NOT triggered. Pin so future schema changes
+    don't accidentally false-positive."""
+    cfg = ProcessConfig(
+        types={
+            "Scenario": TypeConfig(facets=("plannable",)),
+            "Task": TypeConfig(facets=("implementable",)),
+        }
+    )
+    provider = FakeProvider(
+        scripts={
+            "planner": [_decomp("legit", child_type="Task")],
+            "plan_reviewer": [_approve()],
+        }
+    )
+    twig = _twig({ROOT_ID: "Scenario", ROOT_ID * 100 + 1: "Task"})
+    engine = build_engine(
+        log_dir,
+        item_id=ROOT_ID,
+        twig=twig,
+        provider=provider,
+        process_config=cfg,
+    )
+    result = await engine.run("known-types")
+    assert isinstance(result, Completed), result
+    # No type_policy_gate entered.
+    import json
+    log_path = log_dir / "known-types.events.jsonl"
+    events = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    entered_gate = [
+        ev for ev in events
+        if ev.get("kind") == "node_entered"
+        and ev.get("node_id") == "type_policy_gate"
+    ]
+    assert not entered_gate, (
+        f"type_policy_gate should NOT have fired; entries: {entered_gate}"
+    )
+
+
 async def test_max_nesting_depth_per_type_blocks_recursion(
     log_dir: Path,
 ):

@@ -208,21 +208,18 @@ class PlanResult:
 class ChildPlan(BaseModel):
     title: str
     description: str
-    # ADR-0026 step 3 (2026-06-17): the Literal was originally
-    # ``["Task", "Bug", "User Story"]`` because the flat-tier model
-    # assumed Feature was always at the decomposable tier and never
-    # appeared as a *child* type. With per-type config, Feature is
-    # plannable+implementable and IS a legitimate child type
-    # (Scenarios decompose into Features per CVAPI). Expanded to
-    # cover the standard ADO process-template types. Any type the
-    # operator's TypeConfig declares should appear here; we list the
-    # common set explicitly so Pydantic still catches typos at parse
-    # time. The downstream workflow does the policy-driven semantic
-    # validation against ProcessConfig.types.
-    work_item_type: Literal[
-        "Task", "Bug", "User Story", "Feature",
-        "Scenario", "Epic", "Key Result", "Objective",
-    ]
+    # ADR-0015 §9 non-negotiable #1: requiem is TYPE-AGNOSTIC. The
+    # engine must not name ADO work-item types in code. The Literal
+    # whitelist `["Task", "Bug", "User Story"]` was wrong (ChildPlan
+    # could never produce a Feature/Deliverable/Story even when the
+    # operator's process.yaml listed them); widening it to a bigger
+    # Literal (commit 6f68888) was wrong in the same direction. The
+    # correct shape: ``str`` at the Pydantic layer, validated at the
+    # workflow layer against ``ProcessConfig.types`` (the operator's
+    # source of truth). A planner-emitted type the operator hasn't
+    # declared routes to ``type_policy_gate`` for human resolution
+    # rather than being silently accepted or hard-rejected at parse.
+    work_item_type: str
     item_id: int | None = None
     """Optional pinned ADO id for the child.
 
@@ -747,6 +744,7 @@ def build_verb_registry(
         * ``PermanentFailure("too_many_children")``        → too_many_children_gate
         * ``PermanentFailure("config_requires_decomposition")`` → type_policy_gate
         * ``PermanentFailure("missing_work_item_type_for_policy")`` → type_policy_gate
+        * ``PermanentFailure("unknown_child_work_item_type")`` → type_policy_gate
 
         The process config's tier policy (``implementable_types`` /
         ``decomposable_types``) is *authoritative* over the planner's
@@ -799,6 +797,44 @@ def build_verb_registry(
                     "discarded_child_count": child_count if planner_decomposable else 0,
                 },
             )
+
+        # ADR-0015 §9 #1 + ADR-0026: when the operator's process.yaml
+        # declares `types`, every planner-proposed child must have a
+        # work_item_type the operator has declared. The planner is free-
+        # text (ChildPlan.work_item_type is `str`, not Literal — see
+        # the docstring there); this is where we enforce the operator
+        # contract. Unknown types route to type_policy_gate for human
+        # resolution rather than being silently accepted (which would
+        # let the planner invent types the seed step couldn't create
+        # on ADO) or hard-rejected at parse (which would block typo
+        # recovery via the gate).
+        if cfg.has_tier_policy() and planner_decomposable and child_count > 0:
+            known_types = set(cfg.types.keys())
+            if known_types:
+                unknown: list[tuple[int, str]] = []
+                for i, ch in enumerate(children, start=1):
+                    raw = (ch.get("work_item_type") or "").strip()
+                    norm = cfg.normalize_type(raw)
+                    if norm not in known_types:
+                        unknown.append((i, raw))
+                if unknown:
+                    return PermanentFailure(
+                        error_kind="unknown_child_work_item_type",
+                        message=(
+                            f"planner proposed {len(unknown)} child(ren) with "
+                            f"work_item_type not declared in the operator's "
+                            f"process config; known types: {sorted(known_types)}; "
+                            f"unknown: {[(i, t) for i, t in unknown]}"
+                        ),
+                        details={
+                            "approved_iteration": approved_iter,
+                            "unknown_children": [
+                                {"slot": i, "work_item_type": t} for i, t in unknown
+                            ],
+                            "known_types": sorted(known_types),
+                            "work_item_type": work_item_type,
+                        },
+                    )
 
         # Decomposable types MUST break down; a planner leaf (or zero proposed
         # children) is an unsatisfiable policy → fail closed to a human gate.
@@ -1712,6 +1748,15 @@ def build_workflow() -> Workflow:
             .edge(
                 "branch_decomposable",
                 on="permanent_failure:missing_work_item_type_for_policy",
+                to="type_policy_gate",
+            )
+            # ADR-0015 §9 #1: planner proposed a child with a type not
+            # in the operator's process.yaml — fail closed to the same
+            # human gate so the operator can either correct the planner
+            # output OR add the type to their process config.
+            .edge(
+                "branch_decomposable",
+                on="permanent_failure:unknown_child_work_item_type",
                 to="type_policy_gate",
             )
             # Catch-all (verb.crash, unexpected errors) → narrated terminal.
