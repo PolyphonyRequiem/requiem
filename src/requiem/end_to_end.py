@@ -1011,6 +1011,51 @@ def _build_arg_parser():
                         "repo's real default branch via the RepoPlatform Protocol.")
     p.add_argument("--poll-interval", type=float, default=5.0)
     p.add_argument("--max-polls", type=int, default=120)
+    # ADR-0021 / ADR-0022: in-process dispatch backend. The default
+    # `kanban` backend posts leaves to a Hermes board for an external
+    # worker fleet to pick up — production-shaped but requires a fleet
+    # to actually exist. `fanout` runs each leaf in-process via
+    # requiem.workflows.implementation, against --repo-path; single
+    # process, no fleet needed, the dogfood path until a fleet stands
+    # up. Honours --fanout-parallel for per-leaf git-worktree isolation.
+    p.add_argument(
+        "--backend",
+        choices=["kanban", "fanout"],
+        default="kanban",
+        dest="dispatch_backend",
+        help=(
+            "Leaf dispatch backend. "
+            "kanban (default): post leaves to the --board for a Hermes "
+            "worker fleet. Requires the fleet to be running. "
+            "fanout: dispatch each leaf in-process against --repo-path "
+            "via requiem.workflows.implementation. Single process, no "
+            "fleet needed. Coder agent runs against the default provider "
+            "(GitHub Copilot when GH_TOKEN is set)."
+        ),
+    )
+    p.add_argument(
+        "--repo-path",
+        type=Path,
+        default=None,
+        help=(
+            "Working-tree path the fanout backend operates against. "
+            "Required when --backend=fanout. Each leaf creates branch "
+            "impl/<root>-<leaf> here; in --fanout-parallel mode each "
+            "leaf gets its own sibling worktree (ADR-0022)."
+        ),
+    )
+    p.add_argument(
+        "--fanout-parallel",
+        action="store_true",
+        help=(
+            "Dispatch fanout leaves in parallel via per-leaf git "
+            "worktrees (ADR-0022). Default is sequential (one leaf at "
+            "a time, reusing --repo-path). Parallel mode trades disk "
+            "and per-worktree git-refs load for wall-clock speed; "
+            "useful when leaf coder calls are slow (CopilotProvider). "
+            "Ignored when --backend != fanout."
+        ),
+    )
     # ADR-0027: reviewer escalation handling. Default `escalate`
     # preserves today's behavior (interactive prompt at escalation_gate);
     # `accept-last` auto-answers `proceed` so a good-enough plan ships
@@ -1118,6 +1163,10 @@ def main(argv: list[str] | None = None) -> int:
         max_polls=args.max_polls,
         gate_handler=gate_handler,
         escalation_policy=args.on_escalate,
+        # ADR-0021/0022: in-process fanout backend wiring.
+        dispatch_backend=args.dispatch_backend,
+        repo_path=args.repo_path,
+        fanout_parallel=args.fanout_parallel,
     ))
 
     print(f"[{result.stage}] {result.status}: {result.detail}")
