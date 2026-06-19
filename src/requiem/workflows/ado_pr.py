@@ -128,20 +128,43 @@ ADO_RESOURCE = "499b84ac-1321-427f-aa17-267ca6975798"
 
 
 def _resolve_default_credential():
-    """Try to construct an :class:`AzureCliCredential` (the documented v0
-    default for ADO auth per ADR-0024 + ADR-0007 Q4).
+    """Construct requiem's preferred default credential for ADO.
 
-    Lazy-imports ``azure.identity`` so non-ADO users don't pay for the
-    dependency. Raises :class:`AdoPrError` with a clear remediation hint if
-    the package isn't installed.
+    Resolution order (ADR-0028):
+
+    1. :class:`MsalRefreshCredential` — requiem's bootstrap-once chain
+       (twig/polyphony ``.refresh-token`` → MSAL cache → direct AAD HTTP
+       refresh). Survives CAE eviction. **The new default.**
+    2. :class:`AzureCliCredential` from ``azure-identity`` — kept as final
+       fallback for environments where (a) the user explicitly ran
+       ``az login`` AND (b) no twig/polyphony RT is on disk to bootstrap
+       from. Mainly a back-compat path; previously the only default.
+
+    Raises :class:`AdoPrError` only if both paths fail (``azure-identity``
+    not installed AND requiem's chain has no bootstrap source). The error
+    text guides the user to the recovery commands.
     """
+    # Path 1: requiem's chain. Lazy-imported because the auth package has
+    # a couple of small stdlib-only modules — we'd rather import them on
+    # demand than make this file's import-time cost depend on them.
+    try:
+        from requiem.clients.auth import MsalRefreshCredential
+        return MsalRefreshCredential()
+    except ImportError:
+        # Should not happen (the auth package is in-tree), but if someone
+        # has hand-deleted it we fall through to AzureCliCredential.
+        pass
+
+    # Path 2: AzureCliCredential. Lazy-imports azure-identity so non-ADO
+    # users don't pay for the dependency.
     try:
         from azure.identity import AzureCliCredential
     except ImportError as e:
         raise AdoPrError(
-            "AzureCliCredential default requires the `azure-identity` "
-            "package. Install with `pip install requiem[ado]`, or pass "
-            "`pat=...` / set `ADO_PAT` for backward-compat PAT auth."
+            "No usable ADO credential. requiem's MsalRefreshCredential is "
+            "in-tree but failed to import; AzureCliCredential requires the "
+            "`azure-identity` package. Install with `pip install requiem[ado]`, "
+            "or set ADO_PAT for legacy PAT auth."
         ) from e
     return AzureCliCredential()
 

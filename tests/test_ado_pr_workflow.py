@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from requiem.kernel import Completed
 from requiem.persistence import replay
 from requiem.toolbelt import Toolbelt
@@ -217,41 +219,76 @@ async def test_explicit_pat_wins_over_env(monkeypatch):
     assert decoded == ":explicit-wins"
 
 
-async def test_default_credential_lazy_resolves_to_azure_cli_when_no_pat(monkeypatch):
+async def test_default_credential_lazy_resolves_when_no_pat(monkeypatch):
     """With no explicit credential, no pat arg, and no ADO_PAT env: the
-    toolkit must defer to AzureCliCredential (the ADR-0024 v0 default).
-    This proves the lazy-import path works AND that az-cli is the default
-    rather than a silent Basic-with-empty-pat header (which would 401 in
-    confusing ways)."""
+    toolkit must defer to whatever ``_resolve_default_credential`` returns
+    (post ADR-0028 that's :class:`MsalRefreshCredential`, with
+    :class:`AzureCliCredential` as fallback).
+
+    This proves the lazy-import path works AND that *some* credential is
+    the default rather than a silent Basic-with-empty-pat header (which
+    would 401 in confusing ways).
+    """
     monkeypatch.delenv("ADO_PAT", raising=False)
     tk = ado_pr.RealAdoPrToolkit()
     # The sentinel is in place pre-call (lazy):
     assert tk._credential is ado_pr._LazyDefault
-    # Monkey-patch the resolver to avoid an actual az-cli subprocess in CI.
-    sentinel_credential = _StubCredential(token_value="from-azurecli")
+    # Monkey-patch the resolver to avoid the real chain (and the network
+    # call inside MsalRefreshCredential) in CI.
+    sentinel_credential = _StubCredential(token_value="from-default-chain")
     monkeypatch.setattr(ado_pr, "_resolve_default_credential",
                         lambda: sentinel_credential)
     header = await tk._auth_header()
-    assert header == "Bearer from-azurecli"
+    assert header == "Bearer from-default-chain"
     # Sentinel has been replaced with the resolved credential — second call
     # reuses it instead of re-resolving.
     assert tk._credential is sentinel_credential
     header2 = await tk._auth_header()
-    assert header2 == "Bearer from-azurecli"
+    assert header2 == "Bearer from-default-chain"
     assert len(sentinel_credential.calls) == 2  # one per _auth_header call
 
 
-def test_missing_azure_identity_raises_with_actionable_message(monkeypatch):
-    """When azure-identity isn't installed, the default-credential path must
-    raise an AdoPrError naming the [ado] extra — not a bare ImportError that
-    operators have to chase."""
+def test_default_credential_resolves_to_msal_refresh_chain():
+    """Post ADR-0028: the default credential is :class:`MsalRefreshCredential`
+    (the bootstrap-once chain that survives CAE eviction), not
+    :class:`AzureCliCredential` (which dies on Status_AccountUnusable).
+
+    ``AzureCliCredential`` is kept as a final fallback only if the
+    in-tree auth package has been hand-deleted from ``requiem.clients``.
+    """
+    from requiem.clients.auth import MsalRefreshCredential
+    cred = ado_pr._resolve_default_credential()
+    assert isinstance(cred, MsalRefreshCredential), (
+        f"expected MsalRefreshCredential (ADR-0028 default), got {type(cred).__name__}"
+    )
+
+
+def test_default_credential_falls_back_when_msal_chain_unavailable(monkeypatch):
+    """If the in-tree ``requiem.clients.auth`` package somehow fails to
+    import (e.g. hand-deleted by the user), the resolver must fall back
+    to :class:`AzureCliCredential` rather than producing a Bearer-with-
+    no-token. And if azure-identity is also missing, we surface a single
+    actionable :class:`AdoPrError` mentioning both recovery paths.
+    """
     import sys
-    import pytest
-    # Simulate the package missing by injecting an ImportError into sys.modules.
-    monkeypatch.setitem(sys.modules, "azure.identity", None)
+    import builtins
+    real_import = builtins.__import__
+
+    def _fake_import(name, *args, **kwargs):
+        # Block the requiem auth package — simulates hand-deletion.
+        if name == "requiem.clients.auth" or name.startswith("requiem.clients.auth."):
+            raise ImportError(f"simulated: {name} unavailable")
+        # Also block azure.identity to force the final error path.
+        if name == "azure.identity":
+            raise ImportError("simulated: azure-identity not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+    # The error must mention all three recovery routes so the operator
+    # can pick one without grepping the source.
     with pytest.raises(ado_pr.AdoPrError) as exc:
         ado_pr._resolve_default_credential()
     msg = str(exc.value)
     assert "azure-identity" in msg
     assert "requiem[ado]" in msg
-    assert "ADO_PAT" in msg  # mentions the backward-compat fallback
+    assert "ADO_PAT" in msg
