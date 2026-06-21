@@ -276,6 +276,86 @@ async def test_policy_forced_leaf_child_passes_validation(log_dir: Path):
     )
 
 
+async def test_needs_human_decomposable_child_passes_validation(log_dir: Path):
+    """ADR-0027 regression pin: when --on-escalate=accept-last fires on a
+    decomposable child, the planning workflow ships the last planner output
+    as final_verdict='needs_human'. The child carries the planner's
+    proposals (e.g. 5 grandchildren the reviewer kept rejecting) but ZERO
+    committed children — the workflow short-circuited before recursing.
+
+    commit_plan's load_tree validator must:
+      1. Accept 'needs_human' as terminal (don't reject as 'not approved')
+      2. NOT descend into a needs_human child (its `children: []` is
+         intentional, not 'missing 5 proposals'-misalignment)
+
+    This is exactly what broke SKU-fallback dogfood run 21 (2026-06-21):
+    one of the five Deliverables had reviewer escalate, accept-last fired,
+    children remained empty, and load_tree errored with both
+    \"final_verdict 'needs_human' is not approved\" AND
+    \"0 children != 5 proposals — artifact misaligned\".
+    """
+    tree = {
+        "schema_version": 2, "plan_id": "plan-nh", "item_id": ROOT,
+        "decomposable": True, "verdict": "approved",
+        "proposals": [
+            # Two siblings: one cleanly approved, one needs_human.
+            {"title": "Clean Deliverable", "description": "d",
+             "work_item_type": "Deliverable"},
+            {"title": "Contentious Deliverable", "description": "d",
+             "work_item_type": "Deliverable"},
+        ],
+        "children": [
+            {
+                "item_id": ROOT * 100 + 1, "plan_id": "p1",
+                "decomposable": True,
+                "summary": "Clean Deliverable",
+                "review_iterations": 1,
+                "final_verdict": "approved",
+                "proposals": [
+                    {"title": "Task 1", "description": "d", "work_item_type": "Task"},
+                ],
+                "children": [
+                    {
+                        "item_id": (ROOT * 100 + 1) * 100 + 1, "plan_id": "p1c1",
+                        "decomposable": False, "summary": "Task 1",
+                        "review_iterations": 0, "final_verdict": "policy-forced-leaf",
+                        "proposals": [], "children": [],
+                    },
+                ],
+            },
+            {
+                "item_id": ROOT * 100 + 2, "plan_id": "p2",
+                "decomposable": True,
+                "summary": "Contentious Deliverable",
+                "review_iterations": 8,  # hit ITER_CAP
+                # The accept-last verdict written by ADR-0027.
+                "final_verdict": "needs_human",
+                # Planner's last output: 5 proposed Tasks the reviewer
+                # kept escalating. NEVER expanded into children because
+                # accept-last short-circuits before recursion.
+                "proposals": [
+                    {"title": f"Task {i}", "description": "d",
+                     "work_item_type": "Task"}
+                    for i in range(1, 6)
+                ],
+                "children": [],  # intentionally empty
+            },
+        ],
+    }
+    path = _write_tree(log_dir, tree, name="nh")
+    engine = build_engine(
+        log_dir, plan_tree_path=path, dry_run=False, twig=_twig_with_root()
+    )
+    result = await engine.run("nh")
+    assert isinstance(result, Completed)
+    # The whole point: don't fail at load_tree validation.
+    assert result.final_node != "end_failed", (
+        f"needs_human decomposable child must be accepted by load_tree "
+        f"AND its empty children must NOT be flagged as misaligned; "
+        f"final={result.final_node}"
+    )
+
+
 async def test_missing_artifact_routes_to_end_failed(log_dir: Path):
     engine = build_engine(log_dir, plan_tree_path=log_dir / "nope.json", dry_run=False, twig=_twig_with_root())
     result = await engine.run("missing")

@@ -265,16 +265,23 @@ def _validate_node(
                     f"!= expected synth {synth}"
                 )
             fv = child.get("final_verdict")
-            # ``policy-forced-leaf`` is the synthetic verdict written by
-            # the planning workflow's ADR-0025 Gap A short-circuit
-            # (implementable types skip planner+reviewer entirely).
-            # Treat it as terminal-approved for commit_plan's purposes —
-            # the policy IS the approval.
-            if fv not in (None, "approved", "policy-forced-leaf"):
+            # Two synthetic verdicts are also terminal for commit_plan:
+            #   * ``policy-forced-leaf`` (ADR-0025 Gap A): planning workflow
+            #     short-circuited an implementable-type node entirely. The
+            #     policy IS the approval; no planner/reviewer ran.
+            #   * ``needs_human`` (ADR-0027 `--on-escalate accept-last`): the
+            #     planner produced output but the reviewer escalated and the
+            #     operator policy is "ship the last planner output anyway."
+            #     The node carries proposals but NO committed children — by
+            #     design. The escalation sidecar carries the open questions
+            #     for follow-up. We seed the node itself and stop descending.
+            if fv not in (None, "approved", "policy-forced-leaf", "needs_human"):
                 errors.append(
                     f"depth {depth}: child[{i}] final_verdict {fv!r} is not approved"
                 )
-            if child.get("decomposable"):
+            # Decomposable AND approved → descend. needs_human / policy-forced-leaf
+            # are terminal in commit_plan's view (we seed the node, stop here).
+            if child.get("decomposable") and fv != "needs_human":
                 total += _validate_node(
                     child, parent_synth=synth, depth=depth + 1, errors=errors
                 )
