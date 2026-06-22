@@ -127,10 +127,15 @@ def test_cancel_writes_event_and_resume_short_circuits(tmp_path: Path):
     assert result.error_kind == "cancelled"
     assert "test" in result.message
 
-    # Step 4: log ends with run_completed(cancelled).
+    # Step 4: log ends with run_completed(cancelled) + run_cost_summary.
+    # ADR-0030 §3a: run_cost_summary is emitted as a peer summary AFTER
+    # run_completed on every terminal disposition. The contract is that
+    # a run_completed exists in the log (and is the last terminal-state
+    # event); run_cost_summary may follow as cost telemetry.
     events = list(replay(engine2.log_path("cancel-run")))
-    assert events[-1]["kind"] == "run_completed"
-    assert events[-1]["payload"]["terminal"] == "cancelled"
+    rc_events = [e for e in events if e["kind"] == "run_completed"]
+    assert len(rc_events) == 1
+    assert rc_events[-1]["payload"]["terminal"] == "cancelled"
     # And exactly one cancel_requested in the middle.
     cancels = [e for e in events if e["kind"] == "cancel_requested"]
     assert len(cancels) == 1

@@ -336,6 +336,28 @@ def _r_run_completed(ev: dict[str, Any], cx: RenderContext) -> RenderResult:
     return [f"{GLYPH_END} {terminal} — {wf}{suffix}"]
 
 
+@_register("agent_call_started")
+def _r_agent_call_started(ev: dict[str, Any], cx: RenderContext) -> RenderResult:
+    """Suppressed in the narrated demo stream — internal accounting only.
+
+    ADR-0030 §3a: this event records the resolved (provider, model, role)
+    for each agent call so resume reads back the same model attribution
+    and the cost rollup can attribute tokens to roles. It is mechanism,
+    not story — operators read the cost block at the end of the run.
+    """
+    return []
+
+
+@_register("run_cost_summary")
+def _r_run_cost_summary(ev: dict[str, Any], cx: RenderContext) -> RenderResult:
+    """Suppressed in the per-event stream; rendered by ``cmd_events`` as a
+    closing block (ADR-0030 §3b). Returning [] here keeps the per-event
+    timeline focused on workflow transitions; the cost block is a final
+    aggregate that belongs at the bottom of the output, not interleaved.
+    """
+    return []
+
+
 # ---- public surface -----------------------------------------------
 
 

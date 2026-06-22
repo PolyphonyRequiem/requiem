@@ -36,6 +36,13 @@ class AgentSpec:
     charter: str
     response_model: type[BaseModel]
     model: str = "fake"
+    role: str | None = None
+    """Optional Requiem role tag (``planner``, ``reviewer``, ``implementer``,
+    ``closer``, ``judge``, …). When set, the kernel asks
+    :func:`requiem.model_routing.resolve_model_for_role` for an override
+    against the loaded :class:`~requiem.process_config.ProcessConfig`.
+    When ``None`` (default), the kernel uses ``model`` as-is — backward-
+    compatible with every existing workflow (ADR-0030 §2)."""
 
 
 @dataclass(frozen=True)

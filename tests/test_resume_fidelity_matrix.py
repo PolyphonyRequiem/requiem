@@ -159,12 +159,17 @@ def _write_truncated(log_path: Path, events: list[dict[str, Any]]) -> None:
 
 def _is_re_emit_truncation(events: list[dict[str, Any]]) -> bool:
     """Re-emit-prone cursor states (see test_resume_fidelity._is_re_emit_truncation
-    for full taxonomy). For these fixtures, the only re-emit kind is
-    ``node_entered`` — none of the fixtures use teams or retries, so
-    ``team_dispatched`` / ``team_branch_completed`` cannot appear."""
+    for full taxonomy). For these fixtures, re-emit kinds are
+    ``node_entered`` (re-enter on resume) and ``agent_call_started``
+    (ADR-0030 §3a: kernel re-emits before each provider invocation on
+    resume when no recorded event matches the (node_id, attempt) tuple
+    — which is exactly the truncation case).
+
+    None of the fixtures use teams or retries, so ``team_dispatched`` /
+    ``team_branch_completed`` cannot appear."""
     if not events:
         return False
-    return events[-1]["kind"] == "node_entered"
+    return events[-1]["kind"] in {"node_entered", "agent_call_started"}
 
 
 @pytest.mark.parametrize(

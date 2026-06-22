@@ -346,6 +346,7 @@ Parts 1 and 2 are independently shippable; the ADR documents both because they t
 ## STATUS log
 
 - **2026-06-22 PROPOSED.** Plan written; no code committed. Implementation order recorded in §Sequencing. Parts 1 (model routing + token rollup) can begin immediately in parallel with ADR-0025 Gap B. Part 2 (per-leaf AGENTS.md) waits on Gap C's worker-backend choice.
+- **2026-06-22 PART 1 SHIPPED on feat/adr0030-model-routing-cost-rollup.** §2 model routing + §3 cost rollup: `model_routing.py` resolver with `models.<role>` > `models.default` > empty precedence; `AgentSpec.role` field added; kernel emits `agent_call_started` (recording role/provider/model) BEFORE each provider invocation, with resume-idempotency (recorded event wins on resume); `cost.py` `summarize_costs(events)` pure projection; `run_cost_summary` event emitted ONCE after every terminal `run_completed` (operator cancel, in-loop cancel, missing edge, Cancelled outcome, retry exhausted, success terminate, route miss, bad output, permanent failure); cost block rendered in `requiem events`. 36 new tests (13 model routing + 9 cost summary + 1 integration pin in test_planning_workflow.py + 13 test_resume_fidelity helpers updated to recognize agent_call_started as a re-emit kind); full suite 1001/1001 passing (1 deselected fanout-worktree-race flake, 150 skipped). Part 2 (per-leaf .requiem/AGENTS.md slice) is on sibling branch feat/adr0030-context-pack.
 
 ## References
 

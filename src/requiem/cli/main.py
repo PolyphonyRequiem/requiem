@@ -275,9 +275,73 @@ def cmd_events(args: argparse.Namespace) -> int:
         _tail_rendered(log_path, cx)
         return 0
 
-    for ev in replay(log_path):
+    events = list(replay(log_path))
+    for ev in events:
         _emit_lines(render_event(ev, cx))
+    # ADR-0030 §3b: render the cost block after the timeline. Looks for
+    # the `run_cost_summary` event the kernel emits on terminal disposition
+    # and renders the totals + per-role + per-model breakdown.
+    _render_cost_block(events)
     return 0
+
+
+def _render_cost_block(events: list[dict[str, Any]]) -> None:
+    """Render the cost block from a run_cost_summary event if present.
+
+    ADR-0030 §3b shape::
+
+        ─── Cost ──────────────────────────────────────────────
+          42 agent calls · 19,134 tokens · 87.1s aggregate latency
+           planner:    8 calls · claude-opus-4.7    · 6,600 tok · 32.0s
+           reviewer:   9 calls · claude-sonnet-4    · 7,000 tok · 28.0s
+           ...
+        ───────────────────────────────────────────────────────
+    """
+    summary_event = next(
+        (e for e in events if e.get("kind") == "run_cost_summary"), None,
+    )
+    if summary_event is None:
+        return
+    p = summary_event.get("payload", {}) or {}
+    totals = p.get("totals", {}) or {}
+    per_role = p.get("per_role", {}) or {}
+    per_model = p.get("per_model", {}) or {}
+
+    total_tokens = (totals.get("input_tokens", 0) or 0) + (
+        totals.get("output_tokens", 0) or 0
+    )
+    latency_s = (totals.get("total_latency_ms", 0) or 0) / 1000.0
+    line = "─" * 55
+    _say(f"─── Cost {line[8:]}", style="dim")
+    _say(
+        f"  {totals.get('agent_call_count', 0)} agent calls · "
+        f"{total_tokens:,} tokens · {latency_s:.1f}s aggregate latency"
+    )
+    # For each role, find a representative model from per_model whose calls
+    # include this role's count. Simpler: just list per_role with role name.
+    for role in sorted(per_role.keys()):
+        r = per_role[role]
+        r_tokens = (r.get("input_tokens", 0) or 0) + (
+            r.get("output_tokens", 0) or 0
+        )
+        r_latency_s = (r.get("latency_ms", 0) or 0) / 1000.0
+        # Pick the model with the most calls attributed to this role for
+        # display. If no per-call role attribution flowed back, fall back
+        # to the highest-call model overall.
+        model_label = ""
+        if r.get("model"):
+            model_label = r["model"]
+        elif per_model:
+            model_label = max(
+                per_model.items(),
+                key=lambda kv: kv[1].get("calls", 0),
+            )[0]
+        _say(
+            f"   {role}: {r.get('calls', 0)} calls · "
+            f"{model_label} · {r_tokens:,} tok · {r_latency_s:.1f}s"
+        )
+    _say(line, style="dim")
+    return None
 
 
 def cmd_list_runs(args: argparse.Namespace) -> int:
