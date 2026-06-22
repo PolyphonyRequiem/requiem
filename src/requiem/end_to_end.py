@@ -310,6 +310,7 @@ async def _dispatch_in_process(
     trunk_branch: str | None,
     trunk_verdict: str | None,
     fanout_factory: Any,
+    process_config: Any | None = None,  # ADR-0030 §1: optional context-pack input
 ) -> "PipelineResult":
     """Phase 3 (in-process backend): dispatch leaves via requiem.workflows.fanout.
 
@@ -349,6 +350,14 @@ async def _dispatch_in_process(
         leaves=inline_leaves,
         plan_tree_path=Path(plan_artifact) if (decomposable and plan_artifact) else None,
         committed_path=committed_path if decomposable else None,
+        # ADR-0030 §1: thread process_config + doctrine into the fanout
+        # so each leaf can synthesise a curated AGENTS.md slice before
+        # invoke_coder runs. Both are best-effort: a missing config or
+        # doctrine returns None and the pack still builds (with empty
+        # process_config / empty doctrine), keeping the legacy prompt
+        # path available as fallback.
+        process_config=process_config,
+        doctrine=_resolve_doctrine_for_repo(repo_path),
     )
     fo_run = f"fanout-{item_id}"
     fo_engine = fanout_factory(
@@ -655,6 +664,7 @@ async def run_pipeline(
             gate_handler=gate_handler, live=live, fanout_parallel=fanout_parallel,
             trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
             fanout_factory=fanout_factory,
+            process_config=process_config,
         )
 
     real = Toolbelt.real()
@@ -973,6 +983,23 @@ def _resolve_process_config(
         # a path-bearing message on missing/malformed files.
         return load_process_config(explicit_path)
     return discover_process_config(repo_path)
+
+
+def _resolve_doctrine_for_repo(repo_path: Path) -> Any | None:
+    """Best-effort doctrine load for ADR-0030 §1 context-pack synthesis.
+
+    Walks up from ``repo_path`` looking for ``.requiem-config/doctrine.md``.
+    Returns ``None`` if nothing is found or the read fails — the pack
+    synthesiser tolerates a None doctrine (renders without the doctrine
+    section). This is a v0 best-effort lookup; a stricter resolver
+    belongs in a follow-up that owns the per-repo / per-tenant doctrine
+    selection policy.
+    """
+    try:
+        from requiem.doctrine import discover_doctrine
+        return discover_doctrine(repo_path, default=True)
+    except Exception:  # noqa: BLE001 — defensive
+        return None
 
 
 def _build_arg_parser():

@@ -33,6 +33,7 @@ EVENT_KINDS: frozenset[str] = frozenset({
     "subworkflow_started",
     "subworkflow_completed",
     "subworkflow_cancelled",
+    "context_pack_truncated",
     "run_completed",
 })
 """Sealed catalogue of kinds the kernel emits.
@@ -255,6 +256,33 @@ class EventEmitter:
             node_id=node_id,
             sub_run_id=sub_run_id,
             reason=reason,
+        )
+
+    def emit_context_pack_truncated(
+        self,
+        *,
+        leaf_id: str,
+        leaf_branch: str,
+        plan_hash: str,
+        cap_bytes: int,
+        node_id: str | None = None,
+    ) -> None:
+        """Doctrine slice for a leaf's context pack exceeded the cap.
+
+        Emitted by the orchestrator (fanout / kanban executor) after
+        :func:`requiem.context_pack.commit_context_pack` returns a receipt
+        whose ``doctrine_truncated`` flag is True. Observability only —
+        the truncation is benign (we slice at a section boundary), but
+        operators want to know the agent received less than the full
+        matching doctrine so they can grow the cap or trim the doctrine.
+        """
+        self._emit(
+            "context_pack_truncated",
+            node_id=node_id,
+            leaf_id=leaf_id,
+            leaf_branch=leaf_branch,
+            plan_hash=plan_hash,
+            cap_bytes=cap_bytes,
         )
 
     def emit_cancel_requested(

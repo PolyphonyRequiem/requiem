@@ -348,6 +348,14 @@ class ImplementationInputs:
     ``feature_pr``/``leaf_pr``). When ``None`` (a standalone/legacy run) the
     branch falls back to ``feature/<item_id>`` — the pre-ADR-0006 Option-B shape.
     """
+    context_pack: Any | None = None
+    """ADR-0030 §1: when set, the implementation workflow commits this
+    pack to the leaf branch right after ``create_branch`` and before
+    ``invoke_coder`` runs. Carried as ``Any`` to avoid importing
+    :class:`requiem.context_pack.ContextPack` at module load — the
+    commit verb resolves the type at call time. ``None`` (the default)
+    skips the commit step entirely; legacy / standalone runs keep
+    their pre-ADR-0030 behaviour."""
 
 
 # ---- test runner (deliberately not a Toolbelt client for v0) ----------
@@ -610,10 +618,74 @@ def build_verb_registry(
 
     # ---- prompts (agent inputs) --------------------------------------
 
+    @verbs.register("commit_context_pack")
+    async def _commit_context_pack(ctx):
+        """ADR-0030 §1: commit the curated `.requiem/AGENTS.md` slice
+        to the leaf branch before invoking the coder agent. No-op when
+        ``inputs.context_pack`` is None (legacy / standalone runs).
+
+        The pack is idempotent under (plan_hash) — re-running on the
+        same branch with the same hash returns ``committed=False,
+        reason='already_current'`` and writes nothing. This makes the
+        verb resume-safe in the same shape as ``create_branch``.
+
+        Emits ``context_pack_truncated`` when the doctrine slice was
+        truncated at the section cap (observability only — does not
+        change the outcome).
+        """
+        pack = inputs.context_pack
+        if pack is None:
+            # Legacy path. No pack to commit; pass through.
+            return Success(value={
+                "committed": False,
+                "reason": "no_pack_configured",
+                "leaf_id": str(inputs.item_id),
+                "dry_run": inputs.dry_run,
+            })
+
+        from requiem.context_pack import commit_context_pack as _verb
+        fs = _require_fs(ctx)
+        if isinstance(fs, PermanentFailure):
+            return fs
+        # Resolve the leaf branch the pack lands on. Same shape that
+        # `create_branch` produced above.
+        branch_value = ctx.completed.get("create_branch", {}).get("value", {})
+        leaf_branch = branch_value.get("branch_name") or branch_name
+
+        outcome = await _verb(
+            fs=fs,
+            repo_path=inputs.repo_path,
+            leaf_branch=leaf_branch,
+            pack=pack,
+            dry_run=inputs.dry_run,
+        )
+        # Surface the truncation event if the synthesised pack truncated
+        # the doctrine slice. Observability only.
+        if isinstance(outcome, Success):
+            value = outcome.value or {}
+            if value.get("doctrine_truncated"):
+                ctx.emitter.emit_context_pack_truncated(
+                    leaf_id=str(value.get("leaf_id") or inputs.item_id),
+                    leaf_branch=leaf_branch,
+                    plan_hash=str(value.get("plan_hash") or ""),
+                    cap_bytes=None,
+                    node_id=ctx.node_id,
+                )
+        return outcome
+
     @verbs.register("coder_prompt")
     def _coder_prompt(ctx):
         plan = ctx.completed["fetch_plan"]["value"]
-        return (
+        # ADR-0030 §1 read-side: if the context pack landed a curated
+        # AGENTS.md on the leaf branch, splice it into the coder prompt
+        # so the agent sees the planner's rationale, expected files,
+        # acceptance criteria, and doctrine slice — not just the raw
+        # plan_text. ``read_agents_md`` returns None when no pack was
+        # committed (legacy run / Hermes-fleet path where the pack
+        # commit hasn't shipped yet); the baseline prompt is preserved.
+        from requiem.context_pack import read_agents_md
+        pack_text = read_agents_md(inputs.repo_path)
+        base = (
             f"# Work item AB#{plan['item_id']}: {plan['title']}\n\n"
             f"## Plan\n\n{plan['plan_text']}\n\n"
             f"## Repository\n\n"
@@ -622,6 +694,13 @@ def build_verb_registry(
             "Return a CoderOutput with the minimal set of file_changes "
             "that satisfies the plan."
         )
+        if pack_text:
+            return (
+                base
+                + "\n\n## Curated context from Requiem\n\n"
+                + pack_text
+            )
+        return base
 
     @verbs.register("coder_revision_prompt")
     def _coder_revision_prompt(ctx):
@@ -1044,7 +1123,7 @@ def build_workflow() -> Workflow:
                 .edge("assert_clean_workspace", on="success", to="create_branch")
                 .edge("assert_clean_workspace", on="permanent_failure", to="end_failed")
             .script("create_branch", verb="create_branch")
-                .edge("create_branch", on="success", to="invoke_coder")
+                .edge("create_branch", on="success", to="commit_context_pack")
                 # ``branch.exists_foreign`` no longer exists as a
                 # permanent_failure; the verb now returns ``NeedsHuman``
                 # and the kernel suspends at the gate. The fallback
@@ -1054,6 +1133,12 @@ def build_workflow() -> Workflow:
                 .edge("create_branch", on="needs_human", to="end_needs_human")
                 .edge("create_branch", on="permanent_failure:branch.probe_failed", to="end_needs_human")
                 .edge("create_branch", on="permanent_failure", to="end_failed")
+            # ADR-0030 §1 — drop curated `.requiem/AGENTS.md` onto the
+            # leaf branch before invoke_coder. No-op when no pack was
+            # configured on inputs (legacy / pre-ADR-0030 paths).
+            .script("commit_context_pack", verb="commit_context_pack")
+                .edge("commit_context_pack", on="success", to="invoke_coder")
+                .edge("commit_context_pack", on="permanent_failure", to="end_failed")
             .agent("invoke_coder", agent="coder", prompt_verb="coder_prompt")
                 .edge("invoke_coder", on="success", to="apply_changes")
                 .edge("invoke_coder", on="bad_output", to="end_needs_human")
@@ -1109,6 +1194,7 @@ def build_workflow() -> Workflow:
                 "fetch_plan":              "Fetched plan from twig",
                 "assert_clean_workspace":  "Workspace clean",
                 "create_branch":           "Created feature branch",
+                "commit_context_pack":     "Committed Requiem context pack",
                 "invoke_coder":            "Coder agent (first pass)",
                 "apply_changes":           "Applied file changes",
                 "run_tests":               "Ran tests",

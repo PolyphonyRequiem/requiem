@@ -346,6 +346,7 @@ Parts 1 and 2 are independently shippable; the ADR documents both because they t
 ## STATUS log
 
 - **2026-06-22 PROPOSED.** Plan written; no code committed. Implementation order recorded in §Sequencing. Parts 1 (model routing + token rollup) can begin immediately in parallel with ADR-0025 Gap B. Part 2 (per-leaf AGENTS.md) waits on Gap C's worker-backend choice.
+- **2026-06-22 PART 2 SHIPPED on feat/adr0030-context-pack.** §1 per-leaf `.requiem/AGENTS.md` slice: pure synthesiser + idempotent commit verb in `src/requiem/context_pack.py` (736 lines); wired into `implementation` workflow as a new `commit_context_pack` script node between `create_branch` and `invoke_coder`; `coder_prompt` reads `.requiem/AGENTS.md` and appends as "Curated context from Requiem"; `fanout._build_leaf_context_pack` builds the pack from `FanoutLeaf` + `inputs.process_config` + `inputs.doctrine` (both threaded from `end_to_end.run_pipeline`); `context_pack_truncated` event registered; defensive throughout (a synthesiser exception returns None → leaf falls back to baseline prompt). 24 new tests (15 synthesiser + 7 commit verb + 2 integration); full suite 1027/1027 passing (1 deselected fanout-worktree-race flake, 150 skipped). Kanban-path integration deferred to follow-up (Gap C* — kanban needs a `RepoPlatform.commit_file` extension; dogfood today uses `--backend fanout` exclusively).
 
 ## References
 
