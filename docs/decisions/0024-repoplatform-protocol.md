@@ -547,6 +547,61 @@ async def run_pipeline(
      (one `az login` on the host + a reachable scratch ADO repo) —
      no code blocks an end-to-end CloudVault dogfood run anymore.
 
+6. **Per-leaf `implementation` workflow takes `RepoPlatform`** — the
+   last GitHub-only holdout after steps 1-5. The per-leaf
+   `implementation.py` (dispatched by fanout / kanban executor) still
+   hardcoded `_require_gh(ctx)` and called `gh.pr_search` / `gh.pr_create`
+   directly. Without this step, `--live` against an ADO repo would
+   crash inside each leaf's implementation engine trying to invoke `gh`
+   against an ADO target.
+   **STATUS: implementation refit landed 2026-06-17** (`7ee429a`,
+   `src/requiem/workflows/implementation.py`). **Executor toolbelt
+   propagation + load-bearing test landed 2026-06-22.** Concrete shape:
+   - `_require_repo_platform(ctx)` helper added alongside legacy
+     `_require_gh` (commit `7ee429a`); resolves `ctx.toolbelt.repo or
+     ctx.toolbelt.gh` exactly like leaf_pr.py. The legacy `_require_gh`
+     was kept for back-compat at the time and **removed 2026-06-22**
+     once the load-bearing ADO test confirmed no surviving callers.
+   - `create_pr` verb (`implementation.py:877-953`) uses
+     `_require_repo_platform`; except-clauses cover both `GhClientError`
+     and `AdoClientError`; idempotency check switched from `pr_search`
+     (GitHub-only free-form text query) to `find_open_pr_for_branch`
+     (structured Protocol method with both implementations).
+   - **Executor toolbelt propagation** (2026-06-22):
+     `end_to_end.py:660-678`'s `exec_toolbelt` build was missing
+     `repo=repo_client` — meaning the executor stage's
+     `Toolbelt.real()` derivation fell back to a GitHub `repo` field
+     regardless of whether the driver was passed `--ado-repo`. Future
+     kanban backend workers and the in-process fanout path that runs
+     per-leaf `implementation` engines both depend on `toolbelt.repo`
+     carrying the right impl. The fix mirrors `_topology_toolbelt`'s
+     pattern: `repo=repo_client if repo_client is not None else real.repo`
+     plus the matching gh fallback.
+   - **Load-bearing tests** (`tests/test_implementation_workflow_against_ado.py`,
+     6 tests, all green): each is the proof that the workflow truly
+     depends on the Protocol, not on `GhClient` as a concrete type.
+     Wires `Toolbelt(repo=FakeAdoClient(), gh=None, ...)` and asserts:
+     happy path (PR opened against FakeAdoClient at expected head/base
+     + twig-linked + marker file on disk), merge-group root produces
+     `impl/<root>-<item>` branch naming (Option-D regardless of
+     platform), PR-create failure surfaces as `end_needs_human` (not
+     uncaught exception), PR-search failure surfaces as
+     `end_needs_human`, no-repo-client fail-closed at create_pr, and
+     the GitHub-only back-compat path (`Toolbelt(gh=FakeGh, repo=None)`)
+     still works. Plus `tests/test_end_to_end_ado.py
+     ::test_ado_repo_threads_repo_client_to_executor_toolbelt` pins
+     the executor-toolbelt propagation regression separately.
+   - 39 tests across the affected surface (the original
+     `test_implementation_workflow.py` 33 + the new 6 ADO-path tests)
+     still green; 11 tests in `test_end_to_end_ado.py` still green
+     including the new exec-toolbelt repo-propagation pin.
+   - After this step, the chain that was \"code-complete with one live
+     gate\" after step 5 is now **provably end-to-end across both
+     backends** — every workflow in the topology + the per-leaf engine
+     runs against `FakeAdoClient`. The remaining gate is still
+     operational, but the per-leaf code path is no longer a hidden
+     `GhClient` dependency waiting to crash a `--commit` run.
+
 Each step is shippable on its own; the chain ends with a live ADO
 scratch run becoming possible.
 

@@ -385,7 +385,45 @@ Stub:
 
 ### STATUS
 
-**STATUS: not started**
+**STATUS: SHIPPED 2026-06-22.**
+
+- **Implementation refit landed 2026-06-17** (commit `7ee429a`,
+  `src/requiem/workflows/implementation.py`). Per-leaf workflow now
+  uses `_require_repo_platform(ctx)` (preferring `toolbelt.repo` and
+  falling back to `toolbelt.gh`); `create_pr` calls
+  `find_open_pr_for_branch` (Protocol-surface, structured) instead of
+  `pr_search` (GitHub-only free-form text); except-clauses cover both
+  `GhClientError` and `AdoClientError`.
+- **Executor toolbelt propagation landed 2026-06-22**
+  (`src/requiem/end_to_end.py:660-678`). `exec_toolbelt` now threads
+  `repo=repo_client` through to the executor stage so future
+  kanban-backend workers and the in-process fanout path (running
+  per-leaf `implementation` engines) both see the right `RepoPlatform`
+  impl. Mirrors the `_topology_toolbelt` pattern from ADR-0024 step 5.
+  Without this, the executor's `Toolbelt.real()` fell back to a
+  GitHub `repo` regardless of `--ado-repo`.
+- **Load-bearing tests landed 2026-06-22**
+  (`tests/test_implementation_workflow_against_ado.py`, 6 tests; new
+  `tests/test_end_to_end_ado.py
+  ::test_ado_repo_threads_repo_client_to_executor_toolbelt`). Each is
+  the proof per the protocol-extraction-refactor skill §"don't skip
+  step 4 load-bearing test": wires
+  `Toolbelt(repo=FakeAdoClient(), gh=None, ...)` and runs the
+  per-leaf workflow end-to-end against ADO with `toolbelt.gh=None`.
+  Without these tests, the refactor would "compile" but a `--commit`
+  run might silently route through the legacy GitHub path.
+- **Cleanup landed 2026-06-22**: legacy `_require_gh` helper deleted
+  from `implementation.py` now that the load-bearing test confirms no
+  surviving callers. `GhClient` import retained (still referenced by
+  the CLI live path that constructs a real `GhClient`).
+- **39 tests across the surface green** (`test_implementation_workflow.py`
+  33 + new 6); **11 tests in `test_end_to_end_ado.py` green** including
+  the new exec-toolbelt propagation pin.
+
+After Gap B's full landing, the only remaining piece for a first real
+`--commit` end-to-end against CVAPI is **Gap C** (stand up a worker
+backend — recommendation `Path C1`, in-process fanout, is the path).
+The per-leaf code path is no longer the blocker.
 
 ---
 
@@ -569,3 +607,16 @@ attractive but premature.
   feedback that the planner needed more rounds to fully address.
   Temporary lever; configurable per-run is a follow-up (see open
   questions).
+- **2026-06-17 Gap B core SHIPPED** (7ee429a). Per-leaf
+  `implementation` workflow takes `RepoPlatform` Protocol —
+  `_require_repo_platform` helper, `create_pr` refit to
+  `find_open_pr_for_branch`, except-clauses cover `AdoClientError`.
+- **2026-06-22 Gap B closure SHIPPED.** Executor toolbelt now
+  propagates `repo=repo_client` (`end_to_end.py:660-678`); load-bearing
+  ADO tests landed (`tests/test_implementation_workflow_against_ado.py`,
+  6 tests; `tests/test_end_to_end_ado.py
+  ::test_ado_repo_threads_repo_client_to_executor_toolbelt`); legacy
+  `_require_gh` helper deleted. Gap B is now fully closed — the per-leaf
+  code path is no longer the blocker for a first `--commit` end-to-end
+  against an ADO repo. The remaining v0 blocker is Gap C (stand up a
+  worker backend; recommendation Path C1).

@@ -240,6 +240,47 @@ async def test_ado_repo_routes_topology_through_ado_client(tmp_path):
     assert captured["trunk_inputs"].repo == "Contoso/P/widgets"
 
 
+async def test_ado_repo_threads_repo_client_to_executor_toolbelt(tmp_path):
+    """ADR-0025 Gap B follow-up: the executor stage must also receive
+    ``repo=repo_client`` on its toolbelt so future kanban/in-process
+    workers can do ADO-side work (open per-leaf PRs, query branches)
+    without falling back to a fake GhClient or crashing.
+
+    Without this, the executor's `exec_toolbelt` was built from
+    `Toolbelt.real()` (GitHub-only `repo` field) regardless of whether
+    the driver was passed `ado_repo`. The kanban backend's eventual
+    real workers — and the in-process fanout path that already runs
+    per-leaf `implementation` engines — both need the ADO `repo` to
+    propagate through.
+    """
+    captured: dict = {}
+    pf, ef, tbf, lpf = _stub_factories(captured=captured)
+    ado = FakeAdoClient(refs={("Contoso/P/widgets", "main"): "abc"})
+    await run_pipeline(
+        500,
+        log_dir=tmp_path,
+        board="requiem-500",
+        assignee="w",
+        live=True,
+        ado_repo="Contoso/P/widgets",
+        repo_client=ado,
+        base_branch="main",
+        planning_factory=pf,
+        executor_factory=ef,
+        trunk_bootstrap_factory=tbf,
+        leaf_pr_factory=lpf,
+    )
+    # The executor's toolbelt carries the same FakeAdoClient at .repo —
+    # the same identity the trunk_bootstrap + leaf_pr stages received.
+    exec_tbs = captured.get("executor_toolbelts", [])
+    assert exec_tbs, "executor_factory was never invoked"
+    exec_tb = exec_tbs[0]
+    assert exec_tb.repo is ado, (
+        "executor toolbelt missing repo=AdoClient — workers would fall "
+        "back to Toolbelt.real()'s GhClient and crash against an ADO repo"
+    )
+
+
 async def test_github_repo_path_still_projects_github_field(tmp_path):
     """Back-compat: the original github_repo path still populates
     PipelineResult.github_repo and leaves ado_repo None."""

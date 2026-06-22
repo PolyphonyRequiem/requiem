@@ -661,6 +661,18 @@ async def run_pipeline(
     exec_toolbelt = Toolbelt(
         git=real.git, files=real.files, twig=twig if twig is not None else real.twig,
         kanban=kanban if kanban is not None else real.kanban,
+        # ADR-0025 Gap B follow-up: when run_pipeline received a repo_client
+        # (the ADO or GitHub client the trunk-topology stages use), thread
+        # it into the executor's toolbelt at .repo too. Future kanban /
+        # in-process workers need the same `RepoPlatform` impl to operate
+        # against the right backend — without this, exec workers fell back
+        # to Toolbelt.real()'s GhClient regardless of --ado-repo.
+        repo=repo_client if repo_client is not None else real.repo,
+        # Preserve gh propagation too: any worker that still reaches for
+        # the concrete GitHub client gets the real one when no explicit
+        # repo_client was supplied; the topology workflows themselves
+        # prefer toolbelt.repo over toolbelt.gh (ADR-0024 step 4).
+        gh=gh if gh is not None else real.gh,
     )
     exec_run = f"exec-{item_id}"
     exec_engine = executor_factory(

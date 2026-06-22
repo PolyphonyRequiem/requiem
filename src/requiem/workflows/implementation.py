@@ -436,21 +436,19 @@ def build_verb_registry(
             )
         return twig
 
-    def _require_gh(ctx) -> GhClient | PermanentFailure:
-        gh = ctx.toolbelt.gh
-        if gh is None:
-            return PermanentFailure(
-                error_kind="toolbelt.missing_client",
-                message="implementation workflow requires toolbelt.gh",
-            )
-        return gh
-
     def _require_repo_platform(ctx):
         """ADR-0024 step 6 (2026-06-17): prefer toolbelt.repo (the
         RepoPlatform protocol — works for both GitHub and ADO),
         falling back to toolbelt.gh for back-compat with the existing
         GitHub-only call sites and tests. Mirrors the helper in
-        leaf_pr.py."""
+        leaf_pr.py.
+
+        The legacy `_require_gh` helper was removed 2026-06-22 once
+        every caller migrated to this helper (see
+        `tests/test_implementation_workflow_against_ado.py` for the
+        load-bearing proof that the workflow runs against
+        FakeAdoClient via toolbelt.repo with toolbelt.gh=None).
+        """
         repo_client = ctx.toolbelt.repo or ctx.toolbelt.gh
         if repo_client is None:
             return PermanentFailure(
