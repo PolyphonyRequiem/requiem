@@ -342,10 +342,10 @@ def build_verb_registry(inputs: CommitPlanInputs, *, twig: Any, log_dir: Path) -
                 ),
                 details={"path": str(path), "schema_version": sv},
             )
-        if tree.get("verdict") != "approved":
+        if tree.get("verdict") not in ("approved", "needs_human"):
             return PermanentFailure(
                 error_kind=EK_NOT_APPROVED,
-                message=f"plan verdict is {tree.get('verdict')!r}, not 'approved'",
+                message=f"plan verdict is {tree.get('verdict')!r}, not 'approved' or 'needs_human'",
                 details={"verdict": tree.get("verdict")},
             )
         if not tree.get("decomposable"):

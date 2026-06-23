@@ -540,6 +540,24 @@ def build_verb_registry(
                 message=f"could not read git status: {e}",
                 details={"error": str(e)},
             )
+        # ADR-0030 §1: `.requiem/` holds the context-pack bookkeeping
+        # (AGENTS.md + rationale.md + acceptance.md + .plan_hash). It's
+        # requiem-internal state, not developer-authored implementation
+        # content. In dry_run mode `commit_context_pack` writes these
+        # files without committing them, so the workspace would always
+        # show them as uncommitted on a sequential fanout's subsequent
+        # leaves. Filter them out before deciding the workspace is
+        # dirty — they are owned by the framework, not the leaf.
+        def _is_requiem_internal(porcelain_line: str) -> bool:
+            # git porcelain v1: " M path", "?? path", "A  path", etc.
+            # First 2 cols are status; col 3 is a space; rest is path.
+            if len(porcelain_line) < 4:
+                return False
+            path = porcelain_line[3:].strip().strip('"')
+            return path.startswith(".requiem/") or path == ".requiem"
+        dirty_lines = [
+            line for line in dirty_lines if not _is_requiem_internal(line)
+        ]
         if dirty_lines:
             return PermanentFailure(
                 error_kind="workspace.dirty",

@@ -1374,7 +1374,19 @@ def _write_plan_sidecar(
         and effective_decomposable is False
     )
     rec_children = list(recursive_children or [])
-    if decomposable and not needs_human:
+    # ADR-0027 (accept-last) + ADR-0006 (decomposable trees): when the
+    # planner produced a decomposable plan, ALWAYS write the JSON tree
+    # sidecar — even when the operator escalation routed through
+    # record_needs_human. The verdict field captures the operator's
+    # decision; commit_plan's load_tree accepts both `approved` and
+    # `needs_human` verdicts (the escalation policy already gated entry).
+    # The pre-ADR-0027 behavior of suppressing the tree on needs_human
+    # broke the `--on-escalate accept-last` dogfood path because commit_plan
+    # received a `.plan.md` and rejected it with `bad_artifact` (not
+    # JSON). Writing the tree unconditionally for decomposable plans
+    # preserves the operator's audit (verdict carries the escalation)
+    # while restoring commit_plan's input.
+    if decomposable:
         path = log_dir / f"{run_id}.plan.tree.json"
         path.write_text(
             json.dumps(
