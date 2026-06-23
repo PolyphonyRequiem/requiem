@@ -147,7 +147,12 @@ async def test_different_plan_hash_forces_fresh_commit(repo: Path, fs: Filesyste
 # ---- dry-run ------------------------------------------------------------
 
 
-async def test_dry_run_writes_nothing_and_commits_nothing(repo: Path, fs: FilesystemClient) -> None:
+async def test_dry_run_writes_files_but_commits_nothing(repo: Path, fs: FilesystemClient) -> None:
+    """ADR-0030 §1 (revised): dry_run writes the pack files to the
+    worktree so coder_prompt's read_agents_md can splice them in, but
+    skips the git commit. The on-disk pack is the read-side payload;
+    the git commit is only the durable record (and gets skipped for
+    non-``--live`` dogfood runs)."""
     pack = _pack(plan_hash="abc123")
     before = subprocess.check_output(["git", "rev-list", "--count", "HEAD"], cwd=repo).decode().strip()
     outcome = await commit_context_pack(
@@ -157,9 +162,15 @@ async def test_dry_run_writes_nothing_and_commits_nothing(repo: Path, fs: Filesy
     assert isinstance(outcome, Success)
     assert outcome.value["committed"] is False
     assert outcome.value["reason"] == "dry_run"
+    # No new commit landed.
     assert int(after) == int(before)
-    # No .requiem dir created.
-    assert not (repo / ".requiem").exists()
+    # BUT the files DID land on disk — that's the contract the
+    # coder_prompt depends on.
+    assert (repo / ".requiem" / "AGENTS.md").exists()
+    assert (repo / ".requiem" / "rationale.md").exists()
+    assert (repo / ".requiem" / "acceptance.md").exists()
+    # files_changed reflects what was written (4 files including sentinel).
+    assert len(outcome.value["files_changed"]) == 4
 
 
 # ---- doctrine_truncated surfacing --------------------------------------

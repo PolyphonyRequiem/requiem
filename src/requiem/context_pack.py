@@ -638,31 +638,31 @@ async def commit_context_pack(
     pack
         The :class:`ContextPack` from :func:`build_context_pack`.
     dry_run
-        When True, computes nothing more and returns immediately.
+        When True, writes the pack files to ``repo_path/.requiem/`` so
+        the coder_prompt's ``read_agents_md`` can splice the curated
+        context into the prompt, but skips the git commit. This lets
+        a non-``--live`` dogfood run exercise the read-side wiring of
+        ADR-0030 §1 without polluting git history. Files are
+        overwritten on every call (idempotent in the data sense even
+        when not committed).
     """
-    if dry_run:
-        return Success(value={
-            "plan_hash": pack.plan_hash,
-            "leaf_branch": leaf_branch,
-            "leaf_id": pack.leaf_id,
-            "committed": False,
-            "files_changed": [],
-            "reason": "dry_run",
-            "doctrine_truncated": pack.doctrine_truncated,
-        })
-
-    # Idempotency probe — match the sentinel against the new hash.
-    existing = _read_existing_plan_hash(repo_path)
-    if existing is not None and existing == pack.plan_hash:
-        return Success(value={
-            "plan_hash": pack.plan_hash,
-            "leaf_branch": leaf_branch,
-            "leaf_id": pack.leaf_id,
-            "committed": False,
-            "files_changed": [],
-            "reason": "already_current",
-            "doctrine_truncated": pack.doctrine_truncated,
-        })
+    # Idempotency probe — only meaningful when a previous COMMITTED
+    # pack landed (the sentinel only matches when the previous run
+    # actually committed). In dry_run mode the sentinel may exist from
+    # a prior dry_run write, but we still re-write to make this verb
+    # safe under "same hash, different file content" edge cases.
+    if not dry_run:
+        existing = _read_existing_plan_hash(repo_path)
+        if existing is not None and existing == pack.plan_hash:
+            return Success(value={
+                "plan_hash": pack.plan_hash,
+                "leaf_branch": leaf_branch,
+                "leaf_id": pack.leaf_id,
+                "committed": False,
+                "files_changed": [],
+                "reason": "already_current",
+                "doctrine_truncated": pack.doctrine_truncated,
+            })
 
     files = _pack_files(pack)
     written_rel: list[str] = []
@@ -677,6 +677,25 @@ async def commit_context_pack(
             error_kind="context_pack.write_failed",
             message=f"could not write context pack file: {e}",
             details={"leaf_id": pack.leaf_id, "leaf_branch": leaf_branch},
+        )
+
+    # ADR-0030 §1 dry_run semantics (revised): the files DO land on the
+    # worktree so coder_prompt's read_agents_md picks them up; we just
+    # skip the git commit so dogfood doesn't pollute history. The pack
+    # is still readable, the coder still benefits, and the only thing
+    # missing is the durable git record.
+    if dry_run:
+        return Success(
+            value={
+                "plan_hash": pack.plan_hash,
+                "leaf_branch": leaf_branch,
+                "leaf_id": pack.leaf_id,
+                "committed": False,
+                "files_changed": written_rel,
+                "reason": "dry_run",
+                "doctrine_truncated": pack.doctrine_truncated,
+            },
+            inspected_artifacts=tuple(f"file:{p}" for p in written_rel),
         )
 
     try:
