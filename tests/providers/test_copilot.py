@@ -35,6 +35,7 @@ from requiem.outcomes import (
 )
 from requiem.providers.copilot import (
     CopilotProvider,
+    DEFAULT_COPILOT_MODEL,
     _build_prompt,
     _copilot_token_present,
     _extract_balanced_json,
@@ -214,7 +215,7 @@ async def test_success_path_parses_json_into_schema():
     # Receipts both on the typed .receipts field AND in .value (back-compat).
     assert len(outcome.receipts) == 1
     r = outcome.receipts[0]
-    assert r["model"] == "claude-sonnet-4.5"   # DEFAULT_COPILOT_MODEL
+    assert r["model"] == DEFAULT_COPILOT_MODEL  # whatever the current default is
     assert r["input_tokens"] == 42
     assert r["output_tokens"] == 7
     # Session was created exactly once AND deleted (no leak).
@@ -861,3 +862,123 @@ def test_session_uses_isolated_tool_preset():
             f"{forbidden!r} present in available_tools — would let the "
             f"model write the host worktree mid-session"
         )
+
+
+# ---- model bump + reasoning knobs (run-#27 follow-up) -----------------
+
+
+def test_default_copilot_model_is_sonnet_46():
+    """Pin the default model to ``claude-sonnet-4.6``.
+
+    Was ``4.5`` until 2026-06-24. Run #27 against AB#62759077 surfaced
+    a hard problem on 4.5: 600s sessions that emitted only 365 output
+    tokens because the model has no separate reasoning loop
+    (``supported_reasoning_efforts=None`` per ``list_models()``) and
+    apparently thinks slowly in-band on context-pack-dense prompts.
+    4.6 supports tunable reasoning effort (``low``/``medium``/``high``/
+    ``max``) and has 5× the prompt window (936K vs 168K), so it's
+    strictly better for the requiem coder agent."""
+    from requiem.providers.copilot import DEFAULT_COPILOT_MODEL
+    assert DEFAULT_COPILOT_MODEL == "claude-sonnet-4.6"
+
+
+def test_reasoning_effort_omitted_from_create_session_when_unset():
+    """When ``reasoning_effort=None`` (the constructor default), the
+    kwarg is OMITTED from ``create_session(...)`` entirely — not
+    passed as ``reasoning_effort=None``. Lets the SDK fall back to
+    the model's ``default_reasoning_effort`` (typically ``medium``)
+    without us second-guessing it."""
+    import asyncio
+    from requiem.providers.copilot import CopilotProvider, DEFAULT_COPILOT_MODEL
+
+    recorded: dict[str, object] = {}
+
+    class _StubSession:
+        session_id = "sess-stub"
+        def on(self, _cb): pass
+        async def send(self, _prompt): pass
+
+    class _StubAuthStatus:
+        isAuthenticated = True
+
+    class _StubClient:
+        async def get_auth_status(self): return _StubAuthStatus()
+        async def create_session(self, **kwargs):
+            recorded.update(kwargs)
+            return _StubSession()
+        async def delete_session(self, _sid): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+
+    provider = CopilotProvider(model=DEFAULT_COPILOT_MODEL, client=_StubClient())
+    spec = AgentSpec(name="t", charter="c", response_model=ToyResponse, model=DEFAULT_COPILOT_MODEL)
+    call = AgentCall(spec=spec, user_message="hi")
+
+    async def _drive():
+        provider.session_timeout_s = 0.05
+        await provider.invoke(call)
+
+    asyncio.run(_drive())
+
+    # The crucial assertion: the kwarg is NOT in recorded at all.
+    assert "reasoning_effort" not in recorded
+    assert "reasoning_summary" not in recorded
+    assert "context_tier" not in recorded
+
+
+def test_reasoning_effort_threaded_into_create_session_when_set():
+    """When the provider is constructed with ``reasoning_effort="low"``
+    (or any non-None value), the kwarg is passed through to
+    ``create_session(...)`` verbatim.
+
+    The forward-compatibility shape: ``reasoning_summary`` and
+    ``context_tier`` plumb through the same way. Operators tune
+    these on the provider once (or via per-role process.yaml in
+    follow-up work) and every session honors them."""
+    import asyncio
+    from requiem.providers.copilot import CopilotProvider, DEFAULT_COPILOT_MODEL
+
+    recorded: dict[str, object] = {}
+
+    class _StubSession:
+        session_id = "sess-stub"
+        def on(self, _cb): pass
+        async def send(self, _prompt): pass
+
+    class _StubAuthStatus:
+        isAuthenticated = True
+
+    class _StubClient:
+        async def get_auth_status(self): return _StubAuthStatus()
+        async def create_session(self, **kwargs):
+            recorded.update(kwargs)
+            return _StubSession()
+        async def delete_session(self, _sid): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+
+    provider = CopilotProvider(
+        model=DEFAULT_COPILOT_MODEL,
+        client=_StubClient(),
+        reasoning_effort="low",
+        reasoning_summary="none",
+        context_tier="standard",
+    )
+    spec = AgentSpec(name="t", charter="c", response_model=ToyResponse, model=DEFAULT_COPILOT_MODEL)
+    call = AgentCall(spec=spec, user_message="hi")
+
+    async def _drive():
+        provider.session_timeout_s = 0.05
+        await provider.invoke(call)
+
+    asyncio.run(_drive())
+
+    assert recorded.get("reasoning_effort") == "low"
+    assert recorded.get("reasoning_summary") == "none"
+    assert recorded.get("context_tier") == "standard"
+
+
+# ToyResponse for the reasoning-knob tests — these tests don't care
+# what the model returns, just what kwargs got passed to create_session.
+class ToyResponse(BaseModel):
+    x: int = 0
