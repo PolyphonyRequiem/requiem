@@ -959,6 +959,116 @@ async def test_context_pack_present_splices_into_coder_prompt(
     assert expected_marker in content
 
 
+def test_coder_prompt_places_schema_instruction_after_curated_context(
+    tmp_path: Path,
+) -> None:
+    """ADR-0030 §1 + run-#25 lesson: when AGENTS.md is present, the
+    "Return a CoderOutput …" schema instruction MUST appear at the
+    TAIL of the prompt, AFTER the curated context. Run #25 produced
+    19/19 leaves of `bad_output:schema_mismatch` because the schema
+    instruction sat ABOVE the ~1.7KB context splice; Claude-on-Copilot
+    read the rationale + acceptance + doctrine last and produced
+    thoughtful prose instead of structured JSON.
+
+    The fix: pin that the schema instruction comes AFTER the curated
+    context — keeping it as the most-recent in-context directive when
+    the model starts generating, even on context-pack-heavy prompts.
+    """
+    from requiem.workflows.implementation import (
+        ImplementationInputs, build_verb_registry,
+    )
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    # Drop a realistic AGENTS.md (the run-#25 leaves' packs averaged
+    # 1.5-2KB; we use a similar-sized synthetic).
+    pack_dir = repo_path / ".requiem"
+    pack_dir.mkdir()
+    pack_body = (
+        "# Context for leaf: 99999\n\n"
+        + "## Why this leaf exists\n\n"
+        + ("This leaf is a non-trivial slice. " * 30)
+        + "\n\n## Acceptance criteria\n\n"
+        + "- ship the DTOs\n- add tests\n- update telemetry\n\n"
+        + "## Doctrine relevant to this leaf\n\n"
+        + ("Keep contracts narrow. " * 20)
+    )
+    (pack_dir / "AGENTS.md").write_text(pack_body, encoding="utf-8")
+
+    inputs = ImplementationInputs(
+        item_id=12345, repo="org/r", repo_path=repo_path,
+    )
+    verbs = build_verb_registry(inputs)
+    verb = verbs.get("coder_prompt")
+
+    # The verb only consumes ctx.completed["fetch_plan"]["value"], plus
+    # the closure's `inputs`. Build a minimal ctx-like object.
+    class _Ctx:
+        completed = {
+            "fetch_plan": {
+                "value": {
+                    "item_id": 12345,
+                    "title": "Land the CapacityMetrics DTO",
+                    "plan_text": "Add DTO + tests.",
+                    "repo_path": str(repo_path),
+                    "repo": "org/r",
+                }
+            }
+        }
+
+    prompt = verb(_Ctx())
+
+    # Both pieces are present.
+    assert "## Curated context from Requiem" in prompt
+    assert "Return a CoderOutput" in prompt
+    # Ordering invariant: schema instruction comes AFTER the curated
+    # context, not before. The model's most-recent in-context
+    # directive must be the structured-output contract.
+    pack_idx = prompt.index("## Curated context from Requiem")
+    instr_idx = prompt.index("Return a CoderOutput")
+    assert instr_idx > pack_idx, (
+        "schema instruction must trail the curated context "
+        "(see run-#25 bad_output:schema_mismatch regression)"
+    )
+
+
+def test_coder_prompt_with_no_pack_preserves_schema_instruction(
+    tmp_path: Path,
+) -> None:
+    """When AGENTS.md is absent, the schema instruction still ships —
+    just without the curated-context preamble. Pins the no-pack
+    backward-compat behavior."""
+    from requiem.workflows.implementation import (
+        ImplementationInputs, build_verb_registry,
+    )
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    # NO .requiem/AGENTS.md on disk.
+
+    inputs = ImplementationInputs(
+        item_id=12345, repo="org/r", repo_path=repo_path,
+    )
+    verbs = build_verb_registry(inputs)
+    verb = verbs.get("coder_prompt")
+
+    class _Ctx:
+        completed = {
+            "fetch_plan": {
+                "value": {
+                    "item_id": 12345,
+                    "title": "leaf",
+                    "plan_text": "plan",
+                    "repo_path": str(repo_path),
+                    "repo": "org/r",
+                }
+            }
+        }
+
+    prompt = verb(_Ctx())
+    assert "Return a CoderOutput" in prompt
+    # No curated context section when no pack is present.
+    assert "## Curated context from Requiem" not in prompt
+
+
 async def test_commit_context_pack_verb_no_op_when_inputs_carry_no_pack(
     repo_path: Path, tmp_path: Path,
 ) -> None:

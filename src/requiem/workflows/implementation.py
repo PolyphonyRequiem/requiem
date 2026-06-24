@@ -701,24 +701,40 @@ def build_verb_registry(
         # plan_text. ``read_agents_md`` returns None when no pack was
         # committed (legacy run / Hermes-fleet path where the pack
         # commit hasn't shipped yet); the baseline prompt is preserved.
+        #
+        # ORDERING (post-run-#25): the "Return a CoderOutput …"
+        # instruction MUST appear LAST, after the curated context. Run
+        # #25 against AB#62759077 had 19/19 leaves time-out into
+        # `bad_output:schema_mismatch` because the original layout put
+        # the schema instruction BEFORE the ~1.7KB AGENTS.md splice;
+        # Claude-on-Copilot read the rich rationale + acceptance + doctrine
+        # last and produced thoughtful prose narrative instead of
+        # structured JSON. With the instruction at the tail, the model's
+        # most-recent in-context directive is the structured-output
+        # contract — preserving CoderOutput compliance even when the
+        # curated context is dense.
         from requiem.context_pack import read_agents_md
         pack_text = read_agents_md(inputs.repo_path)
-        base = (
+        header = (
             f"# Work item AB#{plan['item_id']}: {plan['title']}\n\n"
             f"## Plan\n\n{plan['plan_text']}\n\n"
             f"## Repository\n\n"
             f"Local path: {plan['repo_path']}\n"
             f"GitHub: {plan['repo']}\n\n"
+        )
+        tail_instruction = (
             "Return a CoderOutput with the minimal set of file_changes "
             "that satisfies the plan."
         )
         if pack_text:
             return (
-                base
-                + "\n\n## Curated context from Requiem\n\n"
+                header
+                + "## Curated context from Requiem\n\n"
                 + pack_text
+                + "\n\n"
+                + tail_instruction
             )
-        return base
+        return header + tail_instruction
 
     @verbs.register("coder_revision_prompt")
     def _coder_revision_prompt(ctx):
