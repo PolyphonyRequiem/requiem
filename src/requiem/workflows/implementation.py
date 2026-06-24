@@ -358,6 +358,23 @@ class ImplementationInputs:
     commit verb resolves the type at call time. ``None`` (the default)
     skips the commit step entirely; legacy / standalone runs keep
     their pre-ADR-0030 behaviour."""
+    process_config: Any | None = None
+    """ADR-0030 §2: the operator's :class:`ProcessConfig` (or None for
+    legacy/test runs). Threaded into ``Engine`` so the kernel's
+    ``_invoke_with_resolved_model`` can consult the ``models.<role>``
+    routing block when agent specs are tagged with ``role=``. Carried
+    as ``Any`` to dodge the circular import with
+    :mod:`requiem.process_config`.
+
+    Without this plumbed in, the kernel sees ``self.process_config is
+    None`` on every agent call and falls through to the provider's
+    default model — silently ignoring any operator-supplied
+    ``models:`` block in process.yaml. Run #28 against AB#62759077
+    caught this gap: ``models.implementer: claude-sonnet-4.6`` in the
+    operator yaml had zero effect on the coder agent because
+    ``fanout._dispatch_in_process`` built ``ImplementationInputs``
+    without the field, and ``implementation.build_engine`` constructed
+    the ``Engine`` without ``process_config=`` either."""
 
 
 # ---- test runner (deliberately not a Toolbelt client for v0) ----------
@@ -1608,6 +1625,13 @@ def build_engine(
         toolbelt=toolbelt,
         log_dir=log_dir,
         gate_handler=gate_handler or _default_gate_handler,
+        # ADR-0030 §2: thread the operator's ProcessConfig so the
+        # kernel can resolve `models.<role>` per agent call. Without
+        # this, role-tagged AgentSpecs (CODER_SPEC.role="implementer")
+        # silently fall through to the provider's constructor default.
+        # See `ImplementationInputs.process_config` for the full gap
+        # story (run #28).
+        process_config=inputs.process_config,
     )
 
 

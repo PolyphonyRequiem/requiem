@@ -1102,3 +1102,92 @@ async def test_commit_context_pack_verb_no_op_when_inputs_carry_no_pack(
     assert isinstance(result, Completed), result
     # No pack files landed on disk.
     assert not (repo_path / ".requiem").exists()
+
+
+# ---- ADR-0030 §2 plumbing: process_config reaches the Engine ---------
+
+
+def test_implementation_engine_receives_process_config():
+    """Pin: ``implementation.build_engine`` threads ``inputs.process_config``
+    into the ``Engine`` so the kernel can resolve ``models.<role>``.
+
+    Before this wiring fix, the Engine was constructed without
+    ``process_config=`` and the kernel always fell back to provider
+    defaults — silently ignoring operator-supplied ``models:`` in
+    process.yaml. Caught in run #28 against AB#62759077 (the
+    ``models.implementer: claude-sonnet-4.6`` block had zero effect)."""
+    import tempfile
+    from pathlib import Path
+    from requiem.workflows.implementation import (
+        ImplementationInputs, build_engine,
+    )
+    from requiem.process_config import ProcessConfig
+
+    cfg = ProcessConfig(
+        root_parent_types=frozenset({"Scenario"}),
+        type_aliases={},
+        decomposable_types=frozenset(),
+        implementable_types=frozenset(),
+        types={},
+        roles={},
+        models={"implementer": {"provider": "copilot", "model": "claude-sonnet-4.6"}},
+        source=None, sha256=None,
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        repo = Path(td) / "repo"
+        repo.mkdir()
+        logs = Path(td) / "logs"
+        logs.mkdir()
+        inputs = ImplementationInputs(
+            item_id=12345, repo="org/r", repo_path=repo,
+            process_config=cfg,
+        )
+        engine = build_engine(logs, inputs=inputs, demo=True)
+
+    assert engine.process_config is cfg, (
+        "Engine.process_config must equal inputs.process_config — "
+        "otherwise kernel._invoke_with_resolved_model falls back to "
+        "the provider default model on every agent call"
+    )
+
+
+def test_fanout_threads_process_config_into_leaf_implementation_inputs():
+    """Pin: fanout's per-leaf ``ImplementationInputs`` carries the
+    operator's ``ProcessConfig`` (not ``None``). Closes the gap
+    between fanout (which already had ``process_config`` on its
+    FanoutInputs from ADR-0030 §1) and the per-leaf implementation
+    engine (which silently ignored the config until this commit)."""
+    from requiem.workflows.fanout import FanoutInputs
+    from requiem.workflows import fanout as fanout_mod
+    from requiem.workflows import implementation as impl_mod
+    from requiem.process_config import ProcessConfig
+    from pathlib import Path
+    import inspect
+
+    # Sanity: ImplementationInputs has the field at all.
+    impl_field_names = {f.name for f in impl_mod.dataclasses.fields(impl_mod.ImplementationInputs)} \
+        if hasattr(impl_mod, "dataclasses") else None
+
+    if impl_field_names is None:
+        # Resolve via stdlib dataclasses instead
+        import dataclasses as _dc
+        impl_field_names = {f.name for f in _dc.fields(impl_mod.ImplementationInputs)}
+
+    assert "process_config" in impl_field_names, (
+        "ImplementationInputs must carry process_config; otherwise "
+        "fanout cannot thread it into per-leaf engines"
+    )
+
+    # Source-level pin: the line in fanout.py that constructs
+    # ImplementationInputs must include process_config=inputs.process_config.
+    src = inspect.getsource(fanout_mod._dispatch_in_process) \
+        if hasattr(fanout_mod, "_dispatch_in_process") else None
+    if src is None:
+        # Different module name — search the whole module
+        src = inspect.getsource(fanout_mod)
+    assert "process_config=inputs.process_config" in src, (
+        "fanout._dispatch_in_process must construct ImplementationInputs "
+        "with process_config=inputs.process_config to thread the "
+        "operator's routing policy into each leaf's implementation engine"
+    )

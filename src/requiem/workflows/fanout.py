@@ -326,6 +326,13 @@ def build_verb_registry(inputs: FanoutInputs) -> VerbRegistry:
             dry_run=inputs.dry_run,
             root=inputs.root_item_id,   # ADR-0006 (B3): impl/<root>-<leaf>
             context_pack=_build_leaf_context_pack(leaf, inputs),
+            # ADR-0030 §2: thread the operator's ProcessConfig into
+            # every per-leaf implementation engine so the coder agent's
+            # role="implementer" tag actually picks up the
+            # `models.implementer` routing block. Without this, every
+            # leaf falls back to the provider's default model (the run
+            # #28 gap that this commit closes).
+            process_config=inputs.process_config,
         )
         # Per-leaf toolbelt: serve THIS leaf's already-resolved plan via a
         # _LeafTwig (no live ADO re-fetch) and bind fs to the leaf's working
