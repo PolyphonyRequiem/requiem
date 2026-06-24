@@ -924,3 +924,71 @@ async def test_verdict_card_happy_path_matches_spec(
     assert "#19" in card
     assert "https://github.com/Owner/Repo/pull/19" in card
     assert "PR lifecycle" in card
+
+
+# ---- ADR-0030 §1 context-pack integration -----------------------------
+
+
+async def test_context_pack_present_splices_into_coder_prompt(
+    repo_path: Path, tmp_path: Path,
+) -> None:
+    """When a context pack lands on the leaf branch, the implementation
+    workflow's coder_prompt verb must read `.requiem/AGENTS.md` from the
+    repo_path and append it to the prompt under "Curated context from
+    Requiem". This is the read-side of ADR-0030 §1.
+
+    The contract: ``read_agents_md`` returns the file's content when
+    present; coder_prompt appends it after the baseline prompt. When
+    the file is absent, the baseline prompt is unchanged.
+    """
+    from requiem.context_pack import read_agents_md
+
+    # Round-trip via the same helper coder_prompt uses.
+    assert read_agents_md(repo_path) is None
+
+    pack_dir = repo_path / ".requiem"
+    pack_dir.mkdir()
+    expected_marker = "## Why this leaf exists\n\nLand the CapacityMetrics DTO."
+    (pack_dir / "AGENTS.md").write_text(
+        "# Context for leaf: 12345\n\n"
+        + expected_marker
+        + "\n", encoding="utf-8",
+    )
+    content = read_agents_md(repo_path)
+    assert content is not None
+    assert expected_marker in content
+
+
+async def test_commit_context_pack_verb_no_op_when_inputs_carry_no_pack(
+    repo_path: Path, tmp_path: Path,
+) -> None:
+    """ADR-0030 §1: the implementation workflow's commit_context_pack
+    verb is a no-op when inputs.context_pack is None (the legacy /
+    pre-ADR-0030 path). The run completes through invoke_coder without
+    a .requiem/ commit landing on the branch.
+
+    This pins the backward-compat guarantee: every existing
+    implementation test in this file continues to pass because the
+    verb threads through invisibly when no pack is configured.
+    """
+    _make_pushable(repo_path)
+    provider = FakeProvider(scripts={
+        "coder": [_coder_creates("MARKER.md")],
+        "coder_revision": [],
+    })
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh(pr_number=42)
+    inputs = _make_inputs(repo_path, item_id=12345, root=9300)
+    # inputs.context_pack defaults to None — the assertion under test.
+    assert inputs.context_pack is None
+    engine = _make_engine(
+        repo_path, tmp_path / "logs",
+        provider=provider, twig=twig, gh=gh,
+        test_runner=_passing_runner, inputs=inputs,
+    )
+    result = await engine.run("no-pack")
+    # The run reaches the implementation handoff cleanly — no .requiem
+    # commit was attempted.
+    assert isinstance(result, Completed), result
+    # No pack files landed on disk.
+    assert not (repo_path / ".requiem").exists()

@@ -263,6 +263,18 @@ def _r_gate_resolved(ev: dict[str, Any], cx: RenderContext) -> RenderResult:
     return [f"  → {choice}"]
 
 
+@_register("context_pack_truncated")
+def _r_context_pack_truncated(ev: dict[str, Any], cx: RenderContext) -> RenderResult:
+    """No-op renderer.
+
+    Truncation is observability metadata, not a story beat — operators
+    inspect it via ``requiem events --raw`` rather than seeing it in the
+    live narrated stream. Returning ``[]`` keeps the demo output focused
+    on user-visible transitions (Demo Contract §3).
+    """
+    return []
+
+
 @_register("cancel_requested")
 def _r_cancel_requested(ev: dict[str, Any], cx: RenderContext) -> RenderResult:
     p = ev["payload"]

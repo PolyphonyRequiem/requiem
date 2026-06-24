@@ -86,6 +86,13 @@ class FanoutInputs:
     leaves: tuple[FanoutLeaf, ...] = ()
     plan_tree_path: Path | None = None
     committed_path: Path | None = None
+    # ADR-0030 §1 (context-pack inputs): when present, each leaf's
+    # dispatch first commits a `.requiem/AGENTS.md` slice synthesised
+    # from these. None on either is tolerated — the pack still builds
+    # (process_config defaults to no policy; doctrine to empty), which
+    # keeps the dogfood loop unblocked while config bootstrap catches up.
+    process_config: Any | None = None  # ProcessConfig — avoiding circular import
+    doctrine: Any | None = None        # Doctrine
 
     def child_run_id(self, real_id: int) -> str:
         return f"fanout-{self.root_item_id}__leaf-{real_id}"
@@ -134,6 +141,48 @@ def _leaf_from_dict(d: dict[str, Any]) -> FanoutLeaf:
         title=str(d.get("title", "")),
         body=str(d.get("body", "")),
     )
+
+
+def _build_leaf_context_pack(leaf: FanoutLeaf, inputs: FanoutInputs) -> Any | None:
+    """ADR-0030 §1: synthesise the per-leaf context pack for the fanout
+    dispatch path. Returns the rendered :class:`ContextPack` so the
+    implementation workflow's ``commit_context_pack`` verb can land it
+    on the leaf branch before invoke_coder runs.
+
+    Defensive: any failure to build the pack returns ``None`` so the
+    leaf still gets its baseline coder prompt (the legacy pre-ADR-0030
+    behaviour). The pack is a context-engineering improvement, not a
+    blocking dependency — a missing process_config or a doctrine read
+    error must NOT torch a leaf's whole implementation run.
+    """
+    try:
+        from requiem.context_pack import (
+            ContextPackLeaf,
+            build_context_pack,
+        )
+    except ImportError:
+        return None
+    try:
+        leaf_proj = ContextPackLeaf.from_mapping({
+            "leaf_id": str(leaf.real_id),
+            "real_id": leaf.real_id,
+            "title": leaf.title,
+            "body": leaf.body,
+            # The planner's prose is in body for FanoutLeaf; mirror as
+            # rationale so AGENTS.md's "Why this leaf exists" section
+            # is populated for v0. Future enhancement: thread the
+            # full planner output through FanoutLeaf so rationale and
+            # body are separable.
+            "rationale": leaf.body,
+        })
+        return build_context_pack(
+            leaf=leaf_proj,
+            plan_payload={"item_id": leaf.real_id, "title": leaf.title},
+            process_config=inputs.process_config,
+            doctrine=inputs.doctrine,
+        )
+    except Exception:  # noqa: BLE001 — defensive: never break dispatch
+        return None
 
 
 def _terminal_disposition(log_path: Path) -> str | None:
@@ -276,6 +325,7 @@ def build_verb_registry(inputs: FanoutInputs) -> VerbRegistry:
             base_branch=inputs.base_branch,
             dry_run=inputs.dry_run,
             root=inputs.root_item_id,   # ADR-0006 (B3): impl/<root>-<leaf>
+            context_pack=_build_leaf_context_pack(leaf, inputs),
         )
         # Per-leaf toolbelt: serve THIS leaf's already-resolved plan via a
         # _LeafTwig (no live ADO re-fetch) and bind fs to the leaf's working

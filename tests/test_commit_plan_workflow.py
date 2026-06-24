@@ -372,13 +372,36 @@ async def test_unsupported_schema_routes_to_end_failed(log_dir: Path):
     assert result.final_node == "end_failed"
 
 
-async def test_not_approved_routes_to_end_failed(log_dir: Path):
+async def test_unknown_verdict_routes_to_end_failed(log_dir: Path):
+    """commit_plan accepts `verdict in {"approved", "needs_human"}` —
+    the `needs_human` verdict shipped by ``--on-escalate accept-last``
+    must NOT bounce here (the escalation policy already gated the
+    workflow at the planning phase; commit_plan trusts that decision).
+
+    Any OTHER verdict (e.g. ``"rejected"``, ``"abort"``, ``"unknown"``)
+    is still a hard fail at load_tree."""
+    tree = cp._demo_tree(ROOT)
+    tree["verdict"] = "rejected"
+    path = _write_tree(log_dir, tree, name="rejected")
+    engine = build_engine(log_dir, plan_tree_path=path, dry_run=False, twig=_twig_with_root())
+    result = await engine.run("rejected")
+    assert result.final_node == "end_failed"
+
+
+async def test_needs_human_verdict_proceeds_through_commit(log_dir: Path):
+    """ADR-0027 (accept-last): a tree with ``verdict=needs_human`` is
+    a valid commit_plan input. The operator's escalation policy already
+    decided to ship; commit_plan honors that and proceeds to seed.
+
+    This is the load-bearing path for the `--on-escalate accept-last`
+    dogfood: the planner's last-good plan rides through with a
+    needs_human verdict and commit_plan seeds ADO children as normal."""
     tree = cp._demo_tree(ROOT)
     tree["verdict"] = "needs_human"
     path = _write_tree(log_dir, tree, name="nh")
     engine = build_engine(log_dir, plan_tree_path=path, dry_run=False, twig=_twig_with_root())
     result = await engine.run("nh")
-    assert result.final_node == "end_failed"
+    assert result.final_node == "end_success"
 
 
 async def test_misaligned_tree_fails_validation(log_dir: Path):
