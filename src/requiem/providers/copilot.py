@@ -69,7 +69,12 @@ from requiem.providers._common import (
 
 
 DEFAULT_COPILOT_MODEL: Final[str] = "claude-sonnet-4.5"
-_SESSION_TIMEOUT_S: Final[float] = 180.0
+_SESSION_TIMEOUT_S: Final[float] = 600.0
+"""Default ceiling for one ``invoke`` call (overridable via
+``CopilotProvider(session_timeout_s=N)``). Raised from 180s on 2026-06-23
+after run #24 showed ADR-0030 §1 context-pack prompts pushing real
+successful Copilot calls past the 180s mark; ~70% of run #24's leaves
+hit the old timeout while Copilot was still working productively."""
 _SERVER_ERROR_AFTER_S: Final[int] = 30
 _TIMEOUT_AFTER_S: Final[int] = 15
 
@@ -96,11 +101,20 @@ class CopilotProvider:
       ``os.getcwd()``. Copilot only writes inside this directory when
       tools are enabled (we enable none), so the value is mostly a
       formality — but the SDK rejects ``None``.
+    * ``session_timeout_s`` — overall wait ceiling for one ``invoke``
+      call, in seconds. Defaults to ``_SESSION_TIMEOUT_S`` (600). Bigger
+      prompts (ADR-0030 §1 context pack adds ~2KB of curated context
+      per leaf) push genuine successful runs past the old 180s
+      ceiling; run #24 against AB#62759077 saw ~70% of leaves timing
+      out at exactly 180.0s while Copilot was still working. Set
+      higher on slow links / dense prompts; lower in CI / tests
+      where you want a fast-fail.
     """
 
     model: str = DEFAULT_COPILOT_MODEL
     client: Any = None  # copilot.CopilotClient | None — lazy
     working_directory: str | None = None
+    session_timeout_s: float = _SESSION_TIMEOUT_S
     # Internal: the CopilotClient may be entered as a context manager once;
     # we keep a flag so close() is idempotent.
     _started: bool = field(default=False, init=False, repr=False)
@@ -236,12 +250,12 @@ class CopilotProvider:
 
         try:
             await session.send(prompt)
-            await asyncio.wait_for(done.wait(), timeout=_SESSION_TIMEOUT_S)
+            await asyncio.wait_for(done.wait(), timeout=self.session_timeout_s)
         except asyncio.CancelledError:
             # INV-CANCEL-SHORT-CIRCUITS-RETRY: do not swallow.
             raise
         except asyncio.TimeoutError as e:
-            return _on_timeout(spec.name, call, e, model)
+            return _on_timeout(spec.name, call, e, model, self.session_timeout_s)
         except Exception as e:  # noqa: BLE001
             return _on_unknown(call, e, model)
         finally:
@@ -521,11 +535,12 @@ def _on_session_error(
 
 def _on_timeout(
     agent: str, call: AgentCall, e: Exception, model: str,
+    timeout_s: float = _SESSION_TIMEOUT_S,
 ) -> Outcome:
     receipt = make_receipt(model=model, error=f"network_timeout: {e}")
     return retryable_with(
         error_kind="network_timeout",
-        message=f"copilot session timeout (>{_SESSION_TIMEOUT_S}s): {e}",
+        message=f"copilot session timeout (>{timeout_s}s): {e}",
         retry_after_s=_TIMEOUT_AFTER_S,
         retry_key=call.retry_key or f"copilot:{agent}",
         attempt=1,

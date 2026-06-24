@@ -654,3 +654,48 @@ def test_strip_code_fence_back_compat_alias():
     assert _strip_code_fence('{"a": 1}') == '{"a": 1}'
     assert _strip_code_fence("plain text") == "plain text"
 
+
+
+# ---- session timeout knob (ADR-0030 §1 follow-up after run #24) ------
+
+
+def test_session_timeout_default_is_600_seconds():
+    """The default session timeout is 600s (raised from 180s on 2026-06-23).
+
+    Pin the value so a future drop-back to 180s doesn't silently
+    reintroduce the run-#24 failure mode (~70% of leaves timing out
+    while Copilot was still producing real output)."""
+    from requiem.providers.copilot import CopilotProvider, _SESSION_TIMEOUT_S
+    assert _SESSION_TIMEOUT_S == 600.0
+    # Construct without arguments — the field default plumbs through.
+    # We use object.__new__ to avoid pulling in the SDK at test time.
+    p = object.__new__(CopilotProvider)
+    p.session_timeout_s = _SESSION_TIMEOUT_S
+    assert p.session_timeout_s == 600.0
+
+
+def test_session_timeout_overridable_per_instance():
+    """The per-instance override is honored — process.yaml or test
+    harnesses can pin a tighter (CI) or looser (slow link) ceiling."""
+    from requiem.providers.copilot import CopilotProvider
+    p = object.__new__(CopilotProvider)
+    p.session_timeout_s = 30.0
+    assert p.session_timeout_s == 30.0
+
+
+def test_on_timeout_message_uses_supplied_timeout_not_module_constant():
+    """The error message reflects the actual configured timeout (so a
+    diagnostic at 30s doesn't say '>600s')."""
+    from requiem.providers.copilot import _on_timeout
+    from pydantic import BaseModel
+
+    class _M(BaseModel):
+        x: int = 0
+
+    from requiem.agent import AgentCall, AgentSpec
+    spec = AgentSpec(name="x", charter="t", response_model=_M, model="m")
+    call = AgentCall(spec=spec, user_message="p")
+    outcome = _on_timeout("agent", call, TimeoutError("boom"), "m", timeout_s=30.0)
+    # outcome.message contains the timeout
+    assert "30.0" in outcome.message
+    assert "600" not in outcome.message
