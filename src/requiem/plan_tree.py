@@ -107,9 +107,16 @@ def _validate_tree_header(tree: dict[str, Any]) -> None:
             "re-run planning to regenerate a self-describing artifact",
             kind="unsupported_schema",
         )
-    if tree.get("verdict") != "approved":
+    if tree.get("verdict") not in ("approved", "needs_human"):
+        # ADR-0027 accept-last (run #28): mirror the relaxation done
+        # in commit_plan.load_tree on 9898c68. When the operator
+        # accepted a needs_human planner output, the resulting tree
+        # carries verdict=needs_human; resolve_leaves must accept
+        # it too (the new _walk branch below handles the
+        # partially-decomposed shape).
         raise PlanArtifactError(
-            f"plan verdict is {tree.get('verdict')!r}, not 'approved'",
+            f"plan verdict is {tree.get('verdict')!r}, "
+            "not 'approved' or 'needs_human'",
             kind="not_approved",
         )
     if not tree.get("decomposable"):
@@ -184,9 +191,54 @@ def _walk(
 ) -> None:
     proposals = node.get("proposals") or []
     children = node.get("children") or []
-    # Within _walk every node is decomposable (the header guarantees the root
-    # is, and we only recurse into decomposable children), so children and
-    # proposals must align 1:1.
+    # ADR-0027 accept-last + ADR-0030 §1 follow-up (run #28):
+    # When a decomposable node was escalated and the operator accepted
+    # the planner's last output (final_verdict == "needs_human") BUT
+    # the planner never recursed into the children sub-workflows
+    # (because escalation_gate routed to record_needs_human BEFORE
+    # aggregate_children ran), the node carries `proposals` from the
+    # planner but `children` is empty. The 1:1 alignment check below
+    # would falsely flag the tree as misaligned.
+    #
+    # Two ways the tree gets into this shape:
+    #   (a) The node itself escalated at the parent's escalation_gate
+    #       — we should treat the node's PROPOSALS as leaves (one
+    #       leaf per proposal, each implementable). This is the
+    #       "accept-last didn't finish decomposing" semantic.
+    #   (b) The node's parent escalated — we'd never recurse into
+    #       this node at all (the parent would already be a leaf
+    #       per the caller). N/A here.
+    #
+    # When needs_human: emit one leaf PER proposal (synth IDs derived
+    # the same way as if children had been populated), pulling
+    # work_item_type/title/description from the proposal, and a real
+    # id from id_map (commit_plan DOES seed an ADO id for every
+    # synth in the planner's tree, including escalated-needs-human
+    # nodes — the manifest is the source of truth here).
+    if (node.get("final_verdict") == "needs_human") and not children and proposals:
+        for i, prop in enumerate(proposals):
+            if "title" not in prop or "work_item_type" not in prop:
+                raise PlanArtifactError(
+                    f"node synth {parent_synth}: needs_human proposal[{i}] "
+                    "missing title/work_item_type",
+                    kind="bad_proposal",
+                )
+            synth = _synth_of(prop, parent_synth, i)
+            out.append(
+                ResolvedLeaf(
+                    synth_id=synth,
+                    real_id=_map_real(prop, synth, id_map),
+                    title=str(prop["title"]),
+                    body=str(prop.get("description", "")),
+                    work_item_type=str(prop["work_item_type"]),
+                    review_group=prop.get("review_group"),
+                    depth=depth + 1,
+                )
+            )
+        return
+    # Normal path: within _walk every node is decomposable (the header
+    # guarantees the root is, and we only recurse into decomposable
+    # children), so children and proposals must align 1:1.
     if len(children) != len(proposals):
         raise PlanArtifactError(
             f"node synth {parent_synth}: {len(children)} children != "
