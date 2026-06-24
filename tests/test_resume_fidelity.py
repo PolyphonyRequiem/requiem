@@ -153,6 +153,13 @@ def _is_re_emit_truncation(events: list[dict[str, Any]]) -> bool:
         is byte-equivalent to the original here; not a re-emit).
       * Mid-team: ``team_dispatched`` / ``team_branch_completed`` leave the
         cursor at the team node, so the whole team re-runs.
+      * Mid-team-branch: ``agent_call_started`` (ADR-0030 §3a) emitted by
+        the kernel BEFORE each per-branch provider invocation. Truncation
+        between team_dispatched and team_branch_completed lands the cursor
+        on the team node and the entire team re-runs — including a fresh
+        round of agent_call_started events per branch. The single-agent
+        case re-emits agent_call_started too on resume (no recorded
+        provider/model lookup hit because the original was truncated off).
 
     ``node_entered`` truncation alone IS a re-emit, because the resumed
     loop will emit a second ``node_entered`` for the same node before
@@ -165,7 +172,12 @@ def _is_re_emit_truncation(events: list[dict[str, Any]]) -> bool:
     if not events:
         return False
     last = events[-1]["kind"]
-    return last in {"node_entered", "team_dispatched", "team_branch_completed"}
+    return last in {
+        "node_entered",
+        "team_dispatched",
+        "team_branch_completed",
+        "agent_call_started",
+    }
 
 
 def _expected_agent_calls(events: list[dict[str, Any]]) -> list[str]:

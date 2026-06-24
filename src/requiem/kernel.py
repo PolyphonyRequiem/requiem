@@ -27,6 +27,7 @@ committed action" special cases into a single `match`.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Union
@@ -236,10 +237,62 @@ class Engine:
     raised by the observer propagate (the kernel does not swallow renderer
     bugs — fail loud).
     """
+    process_config: Any = None
+    """Optional :class:`~requiem.process_config.ProcessConfig` consulted
+    by the role→model resolver (ADR-0030 §2). ``None`` means \"no
+    routing policy configured\" — agents fall back to their
+    :attr:`AgentSpec.model` default (backward-compatible default for
+    every existing workflow). Typed loosely to avoid an import cycle;
+    the resolver re-imports the concrete type."""
     _state: dict[str, str] = field(default_factory=dict)
 
     def log_path(self, run_id: str) -> Path:
         return self.log_dir / f"{run_id}.events.jsonl"
+
+    def _emit_cost_summary_once(
+        self, emitter: EventEmitter, run_id: str,
+    ) -> None:
+        """Emit ``run_cost_summary`` exactly once per run (ADR-0030 §3a).
+
+        Re-scans the log for an existing ``run_cost_summary`` event
+        first; if one is present (resume after the kernel already
+        wrote it), this is a no-op. Otherwise computes a fresh
+        :class:`~requiem.cost.CostSummary` and emits it as a single
+        event right after the just-emitted ``run_completed``.
+
+        Resume idempotency: a kill between ``run_completed`` and this
+        emit is harmless — the next resume sees the ``run_completed``,
+        re-reaches this call site, sees no ``run_cost_summary``, and
+        emits. A kill AFTER the cost summary lands sees both and skips.
+        """
+        from requiem.cost import summarize_costs
+        events = list(replay(self.log_path(run_id)))
+        if any(e.get("kind") == "run_cost_summary" for e in events):
+            return
+        summary = summarize_costs(events)
+        emitter.emit_run_cost_summary({
+            "totals": summary.totals,
+            "per_role": summary.per_role,
+            "per_model": summary.per_model,
+        })
+
+    def _emit_terminal_pair(
+        self,
+        emitter: EventEmitter,
+        terminal: str,
+        final_node: str,
+        run_id: str,
+    ) -> None:
+        """Emit ``run_completed`` followed by ``run_cost_summary``.
+
+        Single helper because the same pair fires from every terminal
+        disposition (operator cancel, in-loop cancel, missing edge,
+        Cancelled outcome, retry exhausted, success terminate, route
+        miss, bad output, permanent failure). Kept on Engine so the
+        log_path / replay are co-located.
+        """
+        emitter.emit_run_completed(terminal, final_node)
+        self._emit_cost_summary_once(emitter, run_id)
 
     async def run(self, run_id: str) -> RunResult:
         wf = self.workflow
@@ -284,6 +337,7 @@ class Engine:
             final = cursor.final_node
             self._propagate_cancel_at(final, nm, emitter, run_id, cursor.reason)
             emitter.emit_run_completed("cancelled", final)
+            self._emit_cost_summary_once(emitter, run_id)
             return Failed(run_id, final, "cancelled", f"operator cancel: {cursor.reason}")
 
         while True:
@@ -294,6 +348,14 @@ class Engine:
             # run_completed per resume. Must come BEFORE the pending-
             # cancel scan, which would otherwise re-fire on every resume.
             if isinstance(cursor, _Terminated):
+                # ADR-0030 §3a: a kill BETWEEN run_completed and the
+                # cost summary is harmless — on resume we re-reach this
+                # branch, see the run_completed is in the log, and emit
+                # the missing cost summary (the helper no-ops if it's
+                # already there). This preserves the resume-fidelity
+                # equality contract: every successful resume produces
+                # exactly one run_completed AND one run_cost_summary.
+                self._emit_cost_summary_once(emitter, run_id)
                 return Completed(
                     run_id, cursor.terminal, cursor.final_node,
                     _projection(list(replay(self.log_path(run_id))))
@@ -309,6 +371,7 @@ class Engine:
                     node_for_cancel, nm, emitter, run_id, cancel,
                 )
                 emitter.emit_run_completed("cancelled", node_for_cancel)
+                self._emit_cost_summary_once(emitter, run_id)
                 return Failed(
                     run_id, node_for_cancel, "cancelled",
                     f"operator cancel: {cancel}",
@@ -423,6 +486,7 @@ class Engine:
                     nxt_node = em.get((nid, key)) or em.get((nid, "needs_human"))
                     if nxt_node is None:
                         emitter.emit_run_completed("failed", nid)
+                        self._emit_cost_summary_once(emitter, run_id)
                         return Failed(
                             run_id, nid, "route.missing",
                             f"no edge from {nid} on {c}",
@@ -431,6 +495,90 @@ class Engine:
                     cursor = _AtNode(nxt_node, 1)
 
     # ---- per-node dispatch (the data-driven interpreter) -----------
+
+    async def _invoke_with_resolved_model(
+        self, call: AgentCall, ctx: VerbContext,
+    ) -> Outcome:
+        """Resolve role→model (ADR-0030 §2), emit ``agent_call_started``,
+        then invoke the provider.
+
+        Resume safety (ADR-0030 §Idempotency: "the recorded value wins"):
+        if a prior attempt for this ``(node_id, attempt)`` already wrote
+        an ``agent_call_started`` event, we prefer the recorded
+        provider/model over a fresh resolution — a ``process.yaml`` edit
+        mid-run cannot retroactively change which model a partially-
+        completed agent call attributes its cost to.
+
+        ``AgentSpec.role=None`` short-circuits the resolver entirely
+        (backward-compat with every workflow that has not yet opted into
+        role tagging).
+        """
+        spec = call.spec
+
+        # Resume idempotency: if a recorded agent_call_started event exists
+        # for this (node_id, attempt) tuple, prefer its provider/model AND
+        # do NOT re-emit. The original emission survives in the log; a
+        # second emit would inflate the event count on resume, breaking
+        # the resume-fidelity equality contract (the resumed log must be
+        # byte-equivalent to the canonical for non-re-emit truncations).
+        recorded = self._recorded_agent_call_started(
+            ctx.run_id, ctx.node_id, ctx.attempt,
+        )
+        if recorded is not None:
+            model_name = recorded.get("model")
+            if model_name and model_name != spec.model:
+                effective_call = dataclasses.replace(
+                    call, spec=dataclasses.replace(spec, model=model_name),
+                )
+            else:
+                effective_call = call
+            # Do NOT re-emit agent_call_started — the original is in the log.
+            return await self.provider.invoke(effective_call)
+
+        if spec.role is None:
+            ctx.emitter.emit_agent_call_started(
+                ctx.node_id, spec.name, None, None, spec.model,
+            )
+            return await self.provider.invoke(call)
+
+        # Resolve against the (possibly absent) process config.
+        from requiem.model_routing import resolve_model_for_role
+        resolved = resolve_model_for_role(spec.role, self.process_config)
+        if resolved.is_empty():
+            ctx.emitter.emit_agent_call_started(
+                ctx.node_id, spec.name, spec.role, None, spec.model,
+            )
+            return await self.provider.invoke(call)
+
+        derived_spec = dataclasses.replace(spec, model=resolved.model or spec.model)
+        derived_call = dataclasses.replace(call, spec=derived_spec)
+        ctx.emitter.emit_agent_call_started(
+            ctx.node_id, spec.name, spec.role,
+            resolved.provider, resolved.model or spec.model,
+        )
+        return await self.provider.invoke(derived_call)
+
+    def _recorded_agent_call_started(
+        self, run_id: str, node_id: str, attempt: int,
+    ) -> dict[str, Any] | None:
+        """Scan the log for an ``agent_call_started`` event recorded for
+        this ``(node_id, attempt)`` tuple. Returns the payload (with
+        ``provider``/``model``/``role``) or ``None`` if absent.
+
+        The tuple is keyed by attempt so a retry re-resolves with the
+        current policy — only a kill+resume between event emission and
+        provider invocation lands on the recorded value.
+        """
+        log_path = self.log_path(run_id)
+        for ev in replay(log_path):
+            if ev.get("kind") != "agent_call_started":
+                continue
+            if ev.get("node_id") != node_id:
+                continue
+            payload = ev.get("payload") or {}
+            if payload.get("attempt") == attempt:
+                return payload
+        return None
 
     async def _execute(self, node: Any, ctx: VerbContext) -> Outcome:
         try:
@@ -446,7 +594,7 @@ class Engine:
                     user_message=prompt,
                     retry_key=f"{ctx.run_id}:{ctx.node_id}#{ctx.attempt}",
                 )
-                return await self.provider.invoke(call)
+                return await self._invoke_with_resolved_model(call, ctx)
             if isinstance(node, TeamNode):
                 return await self._run_team(node, ctx)
             if isinstance(node, HumanGateNode):
@@ -464,6 +612,40 @@ class Engine:
                 message=f"{type(e).__name__}: {e}",
             )
 
+    async def _invoke_team_branch(
+        self, call: AgentCall, ctx: VerbContext,
+    ) -> Outcome:
+        """Resolve role→model + emit ``agent_call_started`` for one team
+        branch, then invoke the provider.
+
+        Distinct from :meth:`_invoke_with_resolved_model` because team
+        branches don't carry a per-branch ``attempt`` — the team's
+        single ``verb_completed`` is the resume boundary. We always
+        re-resolve (no recorded-payload lookup) and pass the branch's
+        agent name through ``agent_id`` on the event so cost attribution
+        can split by branch.
+        """
+        spec = call.spec
+        if spec.role is None:
+            ctx.emitter.emit_agent_call_started(
+                ctx.node_id, spec.name, None, None, spec.model,
+            )
+            return await self.provider.invoke(call)
+        from requiem.model_routing import resolve_model_for_role
+        resolved = resolve_model_for_role(spec.role, self.process_config)
+        if resolved.is_empty():
+            ctx.emitter.emit_agent_call_started(
+                ctx.node_id, spec.name, spec.role, None, spec.model,
+            )
+            return await self.provider.invoke(call)
+        derived_spec = dataclasses.replace(spec, model=resolved.model or spec.model)
+        derived_call = dataclasses.replace(call, spec=derived_spec)
+        ctx.emitter.emit_agent_call_started(
+            ctx.node_id, spec.name, spec.role,
+            resolved.provider, resolved.model or spec.model,
+        )
+        return await self.provider.invoke(derived_call)
+
     async def _run_team(self, node: TeamNode, ctx: VerbContext) -> Outcome:
         """`parallel_fork`: dispatch every branch concurrently."""
         ctx.emitter.emit_team_dispatched(
@@ -478,7 +660,13 @@ class Engine:
                 user_message=prompt,
                 retry_key=f"{ctx.run_id}:{node.node_id}:{branch.agent}",
             )
-            return branch.agent, await self.provider.invoke(call)
+            # Team branches run atomically (the team's verb_completed is
+            # one shot — a kill mid-team restarts the whole team), so we
+            # bypass the recorded-lookup path and emit a fresh
+            # agent_call_started for each branch. node_id stays the team
+            # node so renderers/projections see one logical node; the
+            # branch identity comes from the agent_id field.
+            return branch.agent, await self._invoke_team_branch(call, ctx)
 
         results = await asyncio.gather(*(_one(b) for b in node.branches))
 
@@ -669,6 +857,7 @@ class Engine:
             case Cancelled(cause=cause, at_step=step):
                 # INV-CANCEL-SHORT-CIRCUITS-RETRY: no retry consultation.
                 emitter.emit_run_completed("cancelled", node_id)
+                self._emit_cost_summary_once(emitter, run_id)
                 return _Halt(Failed(run_id, node_id, "cancelled", f"{cause} at {step}"))
 
             case RetryableFailure(error_kind=ek, message=msg, after=after):
@@ -701,6 +890,7 @@ class Engine:
                 nxt = em.get((node_id, "retry_exhausted"))
                 if nxt is None:
                     emitter.emit_run_completed("failed", node_id)
+                    self._emit_cost_summary_once(emitter, run_id)
                     return _Halt(Failed(run_id, node_id, ek, f"retry exhausted: {msg}"))
                 emitter.emit_route_taken(node_id, "retry_exhausted", nxt)
                 return _AtNode(nxt, 1)
@@ -718,6 +908,7 @@ class Engine:
                     emitter.emit_route_taken(node_id, "permanent_failure", nxt)
                     return _AtNode(nxt, 1)
                 emitter.emit_run_completed("failed", node_id)
+                self._emit_cost_summary_once(emitter, run_id)
                 return _Halt(Failed(run_id, node_id, ek, f"bad output: {'; '.join(ves)}"))
 
             case PermanentFailure(error_kind=ek, message=msg):
@@ -726,6 +917,7 @@ class Engine:
                 )
                 if nxt is None:
                     emitter.emit_run_completed("failed", node_id)
+                    self._emit_cost_summary_once(emitter, run_id)
                     return _Halt(Failed(run_id, node_id, ek, msg))
                 emitter.emit_route_taken(node_id, "permanent_failure", nxt)
                 return _AtNode(nxt, 1)
@@ -738,6 +930,7 @@ class Engine:
             case Success():
                 if isinstance(node, TerminateNode):
                     emitter.emit_run_completed(node.disposition, node_id)
+                    self._emit_cost_summary_once(emitter, run_id)
                     return _Halt(
                         Completed(
                             run_id,
@@ -749,6 +942,7 @@ class Engine:
                 nxt = em.get((node_id, "success"))
                 if nxt is None:
                     emitter.emit_run_completed("failed", node_id)
+                    self._emit_cost_summary_once(emitter, run_id)
                     return _Halt(
                         Failed(run_id, node_id, "route.missing",
                                f"no success edge from {node_id}")

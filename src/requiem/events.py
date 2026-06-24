@@ -34,6 +34,8 @@ EVENT_KINDS: frozenset[str] = frozenset({
     "subworkflow_completed",
     "subworkflow_cancelled",
     "run_completed",
+    "agent_call_started",
+    "run_cost_summary",
 })
 """Sealed catalogue of kinds the kernel emits.
 
@@ -187,6 +189,50 @@ class EventEmitter:
 
     def emit_run_completed(self, terminal: str, final_node: str) -> None:
         self._emit("run_completed", terminal=terminal, final_node=final_node)
+
+    def emit_agent_call_started(
+        self,
+        node_id: str,
+        agent_id: str,
+        role: str | None,
+        provider: str | None,
+        model: str,
+        *,
+        attempt: int = 1,
+    ) -> None:
+        """Record the model routing decision for one agent invocation
+        (ADR-0030 §2 / §Idempotency).
+
+        Emitted from the kernel BEFORE the provider.invoke call so a
+        kill+resume between this event and the verb_completed can
+        recover the resolved provider/model from the log rather than
+        re-running the resolver against a possibly-edited config.
+
+        ``provider`` is ``None`` when no policy override applied (caller
+        is using the default provider + the AgentSpec.model literal).
+        ``model`` is always populated — it's the literal that was (or
+        will be) passed to the provider.
+        """
+        self._emit(
+            "agent_call_started",
+            node_id=node_id,
+            agent_id=agent_id,
+            role=role,
+            provider=provider,
+            model=model,
+            attempt=attempt,
+        )
+
+    def emit_run_cost_summary(self, payload: dict[str, Any]) -> None:
+        """Emit the per-run token/latency rollup (ADR-0030 §3a).
+
+        Emitted exactly once per terminal disposition, right after the
+        corresponding ``run_completed`` event. Resume idempotency is
+        enforced kernel-side (see Engine._emit_cost_summary_once).
+        ``payload`` should carry ``totals``, ``per_role``, and
+        ``per_model`` keys; passed through verbatim into the envelope.
+        """
+        self._emit("run_cost_summary", **payload)
 
     def emit_subworkflow_started(
         self,

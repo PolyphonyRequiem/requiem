@@ -155,6 +155,10 @@ class ProcessConfig:
     ``decomposable_types``/``implementable_types`` drive the planning tier
     decision (see :meth:`tier_for_type`); ``type_aliases`` normalize type
     names on both. ``roles`` map Requiem roles to the Hermes fleet.
+    ``models`` maps Requiem roles to LLM provider/model bindings (ADR-0030
+    §2 — sibling of ``roles`` but on a different axis: ``roles`` answers
+    "which Hermes profile picks up this work", ``models`` answers "which
+    LLM does the agent inside any workflow use").
     ``source``/``sha256`` carry the provenance of the effective config so it
     can be snapshotted into the run.
     """
@@ -165,6 +169,7 @@ class ProcessConfig:
     implementable_types: frozenset[str] = frozenset()
     types: Mapping[str, TypeConfig] = field(default_factory=dict)
     roles: Mapping[str, RoleBinding] = field(default_factory=dict)
+    models: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     source: Path | None = None
     sha256: str | None = None
 
@@ -351,6 +356,7 @@ class ProcessConfig:
             "implementable_types": sorted(self.implementable_types),
             "types": {k: self.types[k].to_snapshot() for k in sorted(self.types)},
             "roles": {k: self.roles[k].to_snapshot() for k in sorted(self.roles)},
+            "models": {k: dict(self.models[k]) for k in sorted(self.models)},
             "source": str(self.source) if self.source is not None else None,
             "sha256": self.sha256,
         }

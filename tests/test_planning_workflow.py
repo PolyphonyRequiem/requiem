@@ -943,3 +943,51 @@ async def test_escalation_sidecar_listed_in_plan_record(log_dir: Path):
     assert "escalation_artifact" in record
     assert record["escalation_artifact"] is not None
     assert "escalation-feedback.md" in record["escalation_artifact"]
+
+
+# ---- ADR-0030 §3a integration ----------------------------------------
+
+
+async def test_run_emits_run_cost_summary_on_terminal_disposition(log_dir: Path):
+    """A complete planning run produces exactly ONE run_cost_summary event
+    after the run_completed event (ADR-0030 §3a). The summary aggregates
+    receipts attached to every verb_completed outcome.
+
+    This is the integration pin: the kernel hooks (`_emit_cost_summary_once`
+    on every emit_run_completed site) actually fire end-to-end against a
+    real planner+reviewer workflow, not just in isolation.
+    """
+    provider = FakeProvider(
+        scripts={
+            "planner": [_leaf_planner_output()],
+            "plan_reviewer": [{"verdict": "approve", "feedback": "LGTM."}],
+        }
+    )
+    engine = build_engine(
+        log_dir, item_id=ITEM_ID, twig=_twig(), provider=provider,
+    )
+    await engine.run("cost-pin")
+
+    from requiem.persistence import replay
+    events = list(replay(engine.log_path("cost-pin")))
+    summaries = [e for e in events if e["kind"] == "run_cost_summary"]
+    assert len(summaries) == 1, (
+        f"expected exactly one run_cost_summary; got {len(summaries)}. "
+        f"kinds: {[e['kind'] for e in events[-5:]]}"
+    )
+    # run_cost_summary comes AFTER run_completed (terminal then telemetry).
+    rc_idx = next(i for i, e in enumerate(events) if e["kind"] == "run_completed")
+    cs_idx = next(i for i, e in enumerate(events) if e["kind"] == "run_cost_summary")
+    assert cs_idx > rc_idx, "cost summary must follow run_completed"
+
+    # Payload shape contract.
+    payload = summaries[0]["payload"]
+    assert "totals" in payload
+    assert "per_role" in payload
+    assert "per_model" in payload
+    totals = payload["totals"]
+    assert "input_tokens" in totals
+    assert "output_tokens" in totals
+    assert "agent_call_count" in totals
+    assert "total_latency_ms" in totals
+    assert "retry_count" in totals
