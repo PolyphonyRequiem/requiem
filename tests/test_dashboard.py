@@ -547,3 +547,144 @@ def test_server_auto_resume_spawns_on_resolve(log_dir, monkeypatch):
     assert payload["auto_resume"] == "spawned"
     assert "resume" in spawned["argv"]
     assert "withauto" in spawned["argv"]
+
+
+# ---- ADR-0031 / R4: /api/state/<item_id> --------------------------------
+
+
+def _fake_state_provider(*, item_id: int, log_dir, ado_repo, github_repo):
+    """A deterministic in-memory state provider for the dashboard tests.
+
+    Returns a small but structurally complete projection payload. The
+    handler is supposed to JSON-encode this verbatim — we assert that
+    on the wire.
+    """
+    if item_id == 555:
+        # Simulate the "real twig.show_async raised KeyError" path —
+        # the handler maps it to 404 (item not found).
+        raise KeyError(f"no item {item_id}")
+    if item_id == 666:
+        # Any non-KeyError exception → 503 (projection failed).
+        raise RuntimeError("simulated provider failure")
+    return {
+        "root_item_id": item_id,
+        "computed_at": "2026-06-22T00:00:00+00:00",
+        "tree": {
+            "item_id": item_id,
+            "title": f"item {item_id}",
+            "work_item_type": "Scenario",
+            "state": "Active",
+            "start_date": "2026-06-01T00:00:00Z",
+            "target_date": "2026-06-30T00:00:00Z",
+            "finish_date": None,
+            "parent_id": None,
+            "impl_branch": f"impl/{item_id}/{item_id}",
+            "leaf_pr_number": None,
+            "leaf_pr_url": None,
+            "leaf_pr_state": None,
+            "children": [],
+        },
+        # Surface the query args back so tests can assert pass-through.
+        "_test_echo": {
+            "ado_repo": ado_repo,
+            "github_repo": github_repo,
+            "log_dir": str(log_dir),
+        },
+    }
+
+
+@pytest.fixture
+def state_server(log_dir):
+    httpd = build_server(
+        log_dir, host="127.0.0.1", port=0,
+        state_provider=_fake_state_provider,
+    )
+    import threading
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    host, port = httpd.socket.getsockname()
+    base = f"http://{host}:{port}"
+    try:
+        yield base
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        t.join(timeout=5)
+
+
+def test_state_route_returns_projection_json(state_server):
+    status, body = _get(state_server + "/api/state/42")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["root_item_id"] == 42
+    assert payload["tree"]["item_id"] == 42
+    assert payload["tree"]["title"] == "item 42"
+    assert payload["tree"]["state"] == "Active"
+    assert payload["tree"]["start_date"] == "2026-06-01T00:00:00Z"
+    # Default: no repo arg → echoed as None.
+    assert payload["_test_echo"]["ado_repo"] is None
+    assert payload["_test_echo"]["github_repo"] is None
+
+
+def test_state_route_threads_ado_repo_query_arg(state_server):
+    status, body = _get(
+        state_server + "/api/state/42?ado_repo=org/proj/repo"
+    )
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["_test_echo"]["ado_repo"] == "org/proj/repo"
+
+
+def test_state_route_threads_github_repo_query_arg(state_server):
+    status, body = _get(state_server + "/api/state/42?github_repo=Owner/Repo")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["_test_echo"]["github_repo"] == "Owner/Repo"
+
+
+def test_state_route_400_on_non_integer_item(state_server):
+    import urllib.error
+    with pytest.raises(urllib.error.HTTPError) as ei:
+        _get(state_server + "/api/state/not-an-int")
+    assert ei.value.code == 400
+    body = json.loads(ei.value.read())
+    assert "not an integer" in body["error"]
+
+
+def test_state_route_400_when_both_repo_args_set(state_server):
+    import urllib.error
+    with pytest.raises(urllib.error.HTTPError) as ei:
+        _get(
+            state_server
+            + "/api/state/42?ado_repo=a/b/c&github_repo=X/Y"
+        )
+    assert ei.value.code == 400
+    body = json.loads(ei.value.read())
+    assert "mutually exclusive" in body["error"]
+
+
+def test_state_route_404_on_unknown_item(state_server):
+    """Provider raises KeyError → 404 (item genuinely doesn't exist)."""
+    import urllib.error
+    with pytest.raises(urllib.error.HTTPError) as ei:
+        _get(state_server + "/api/state/555")
+    assert ei.value.code == 404
+
+
+def test_state_route_503_on_provider_failure(state_server):
+    """Any non-KeyError exception → 503 with the error in the body.
+
+    The point: a missing twig binary / expired token MUST NOT crash
+    the dashboard process. The server keeps serving other routes.
+    """
+    import urllib.error
+    with pytest.raises(urllib.error.HTTPError) as ei:
+        _get(state_server + "/api/state/666")
+    assert ei.value.code == 503
+    body = json.loads(ei.value.read())
+    assert "projection failed" in body["error"]
+    assert "RuntimeError" in body["error"]
+    # Verify the server is still alive after the 503.
+    status, _ = _get(state_server + "/healthz")
+    assert status == 200
+

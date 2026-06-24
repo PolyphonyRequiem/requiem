@@ -621,6 +621,124 @@ def _print_run_footer(result: Any, log_path: Path, elapsed_ms: float) -> None:
     _say(f"log: {log_path}", style="dim")
 
 
+def cmd_state(args: argparse.Namespace) -> int:
+    """Print the R4 read-only work-state projection for one item (ADR-0031).
+
+    Walks the ADO Hierarchy-Forward tree from ``--item``, fetches each
+    node via :class:`TwigClient`, and (when a repo target is given)
+    surfaces the per-leaf impl branch + leaf-PR state for any branch
+    that has been opened. ``--json`` emits the full
+    :class:`WorkStateProjection.to_dict()` payload — the same shape the
+    ``/api/state/<item_id>`` dashboard endpoint returns. The default
+    output is a rich tree (operator-friendly), falling back to plain
+    text when ``rich`` isn't importable.
+
+    Repo targeting is OPTIONAL: with neither ``--ado-repo`` nor
+    ``--github-repo`` the projection still produces the full tree but
+    leaves ``leaf_pr_*`` unpopulated — useful as a pure ADO read.
+    """
+    item_id = int(args.item)
+    log_dir = Path(args.log_dir).resolve() if args.log_dir else None
+
+    # Lazy imports — keeps `requiem --help` fast and avoids pulling
+    # twig/azure-identity at every CLI invocation.
+    from requiem.clients.twig import TwigClient
+    from requiem.end_to_end import _resolve_repo_target
+    from requiem.projections import compute_work_state
+
+    try:
+        repo_id, repo_client = _resolve_repo_target(
+            github_repo=args.github_repo,
+            ado_repo=args.ado_repo,
+            gh=None,
+        )
+    except ValueError as e:
+        _say(f"requiem: {e}", style="red")
+        return EXIT_CODE_FAILED
+
+    twig = TwigClient()
+    projection = asyncio.run(compute_work_state(
+        root_item_id=item_id,
+        twig=twig,
+        repo_client=repo_client,
+        log_dir=log_dir,
+        github_repo=args.github_repo,
+        ado_repo=args.ado_repo,
+    ))
+
+    if args.json:
+        print(json.dumps(projection.to_dict(), indent=2, default=str))
+        return 0
+
+    _render_state_tree(projection, repo_id=repo_id)
+    return 0
+
+
+def _render_state_tree(projection: Any, *, repo_id: str | None) -> None:
+    """Render a :class:`WorkStateProjection` as a rich tree (or plain text).
+
+    Each line is ``<id> [<type>] <title> — <state>`` plus a compact
+    artifact-linkage suffix when the node has an impl branch or a
+    leaf PR. Designed to fit one terminal line per node.
+    """
+    header = (
+        f"requiem state — item {projection.root_item_id} "
+        f"(computed_at={projection.computed_at})"
+    )
+    if repo_id:
+        header += f"  repo={repo_id}"
+    _say(header, style="bold")
+
+    if _HAS_RICH:
+        from rich.tree import Tree
+        root_label = _state_node_label(projection.tree)
+        tree = Tree(root_label)
+        for child in projection.tree.children:
+            _attach_state_children(tree, child)
+        _CONSOLE.print(tree)
+    else:
+        _say(_state_node_label(projection.tree))
+        for child in projection.tree.children:
+            _print_state_node_plain(child, depth=1)
+
+
+def _state_node_label(node: Any) -> str:
+    """One-line label for a :class:`WorkItemNode` (rich + plain share this)."""
+    parts: list[str] = [
+        f"#{node.item_id}",
+        f"[{node.work_item_type}]",
+        node.title or "(no title)",
+        f"— {node.state}",
+    ]
+    dates = []
+    if node.start_date:
+        dates.append(f"start={node.start_date[:10]}")
+    if node.target_date:
+        dates.append(f"target={node.target_date[:10]}")
+    if node.finish_date:
+        dates.append(f"finish={node.finish_date[:10]}")
+    if dates:
+        parts.append("(" + ", ".join(dates) + ")")
+    if node.leaf_pr_number is not None:
+        parts.append(f"PR#{node.leaf_pr_number}:{node.leaf_pr_state or '?'}")
+    elif node.impl_branch:
+        parts.append(f"branch={node.impl_branch}")
+    return " ".join(parts)
+
+
+def _attach_state_children(parent_tree: Any, node: Any) -> None:
+    child_tree = parent_tree.add(_state_node_label(node))
+    for c in node.children:
+        _attach_state_children(child_tree, c)
+
+
+def _print_state_node_plain(node: Any, *, depth: int) -> None:
+    indent = "  " * depth
+    _say(f"{indent}{_state_node_label(node)}")
+    for c in node.children:
+        _print_state_node_plain(c, depth=depth + 1)
+
+
 def cmd_clean(args: argparse.Namespace) -> int:
     """Reset state for one item so the next run starts from scratch.
 
@@ -937,6 +1055,47 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     cl.set_defaults(func=cmd_clean)
+
+    st = sub.add_parser(
+        "state",
+        help="print the read-only work-state projection for one item (ADR-0031 / R4)",
+    )
+    st.add_argument(
+        "--item", type=int, required=True,
+        help="ADO work-item id to anchor the projection at.",
+    )
+    st.add_argument(
+        "--log-dir", default=str(DEFAULT_LOG_DIR),
+        help=(
+            "Directory that may contain leaf-pr-map-<item>.json. Used to "
+            "surface PRs already merged (the open-only repo search can't "
+            "witness them). Default: .runs"
+        ),
+    )
+    st_repo = st.add_mutually_exclusive_group()
+    st_repo.add_argument(
+        "--ado-repo", default=None,
+        help=(
+            "ADO repo identifier (e.g. 'org/project/repo'). Mutually "
+            "exclusive with --github-repo. When neither is given, the "
+            "projection skips repo lookups."
+        ),
+    )
+    st_repo.add_argument(
+        "--github-repo", default=None,
+        help=(
+            "GitHub repo identifier (e.g. 'Owner/Repo'). Mutually "
+            "exclusive with --ado-repo."
+        ),
+    )
+    st.add_argument(
+        "--json", action="store_true",
+        help=(
+            "Emit the projection as JSON (the same shape as the "
+            "/api/state/<item_id> dashboard endpoint). Default: rich tree."
+        ),
+    )
+    st.set_defaults(func=cmd_state)
 
     return p
 

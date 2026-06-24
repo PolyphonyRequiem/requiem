@@ -392,6 +392,63 @@ class AdoClient:
             )
         return self._strip_refs_heads(ref)
 
+    # ---- Work-item reads (ADR-0031 / R4 projection) -----------------
+    #
+    # The projection layer needs a thin, field-selective read of one
+    # work item — state + the three Microsoft.VSTS.Scheduling.* dates
+    # plus title/type/parent. Twig's ``show`` covers most of this
+    # already; this helper is the direct-REST path for callers that
+    # don't want a subprocess hop AND that need to constrain the
+    # fields list (a full work-item fetch carries hundreds of fields
+    # by default — expensive at tree scale).
+
+    async def get_work_item(
+        self,
+        *,
+        organization: str,
+        project: str,
+        item_id: int,
+        fields: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Fetch one ADO work item, optionally restricted to ``fields``.
+
+        Endpoint: ``GET /{org}/{project}/_apis/wit/workitems/{id}``
+        with ``?fields=`` (comma-separated reference names) when
+        ``fields`` is set.
+
+        Returns the raw ADO payload — a dict with ``id``, ``rev``,
+        ``fields`` (dict keyed by reference name), and ``_links``.
+        Callers project as they need; this client deliberately stays
+        below the dataclass layer so consumers (R4 projection,
+        future R3 roll-up) own their own shapes.
+
+        ``fields`` MUST be a list of fully-qualified reference names
+        (e.g. ``"System.Title"``, ``"Microsoft.VSTS.Scheduling.StartDate"``).
+        Passing ``None`` fetches every field — the default ADO
+        behaviour, kept for ad-hoc forensic reads but discouraged at
+        tree scale (per ADR-0031 §scope: \"request only what you
+        need\").
+
+        Raises :class:`AdoNotFoundError` on 404 (work item doesn't
+        exist or isn't in scope), :class:`AdoAuthError` on 401/403,
+        and the usual typed subclasses for transport / shape errors.
+        """
+        url = (
+            f"{self._base}/{organization}/{project}"
+            f"/_apis/wit/workitems/{item_id}"
+        )
+        params: dict[str, str] = {}
+        if fields:
+            params["fields"] = ",".join(fields)
+        payload = await self._request("GET", url, params=params)
+        if not isinstance(payload, dict):
+            raise AdoUnknownError(
+                f"ADO get_work_item {item_id}: expected dict, "
+                f"got {type(payload).__name__}",
+                url=url,
+            )
+        return payload
+
     # ---- payload → RepoPullRequest ----------------------------------
 
     @staticmethod
@@ -487,6 +544,7 @@ class FakeAdoClient:
         raise_on_search: Exception | None = None,
         raise_on_create: Exception | None = None,
         raise_on_sha: Exception | None = None,
+        work_items: dict[int, dict[str, Any]] | None = None,
     ) -> None:
         # repo -> default branch (e.g. {"contoso/proj/repo": "main"})
         self._default_branches = dict(default_branches or {})
@@ -501,6 +559,10 @@ class FakeAdoClient:
         self.raise_on_search = raise_on_search
         self.raise_on_create = raise_on_create
         self.raise_on_sha = raise_on_sha
+        # ADR-0031 / R4: in-memory work-item store for get_work_item.
+        # Keyed by int id; values are ADO-shaped {id, rev, fields}
+        # payloads. Tests seed only the fields they want to assert on.
+        self._work_items = {int(k): dict(v) for k, v in (work_items or {}).items()}
         # Forensic logs for test assertions.
         self.created_refs: list[tuple[str, str, str]] = []  # (repo, branch, sha)
         self.created_prs: list[dict[str, Any]] = []
@@ -603,3 +665,34 @@ class FakeAdoClient:
             # common repo shape and keeps tests terse.
             return "main"
         return self._default_branches[repo]
+
+    async def get_work_item(
+        self,
+        *,
+        organization: str,
+        project: str,
+        item_id: int,
+        fields: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """In-memory ``get_work_item`` for tests.
+
+        Returns the seeded payload (or raises :class:`AdoNotFoundError`
+        if the id was never seeded). ``fields`` is honoured by
+        narrowing the returned ``fields`` dict — useful for tests that
+        want to assert their consumer requested the right subset.
+        ``organization`` / ``project`` are recorded for forensics but
+        do not filter (the fake is single-tenant).
+        """
+        if item_id not in self._work_items:
+            raise AdoNotFoundError(
+                f"work item {item_id} does not exist (organization="
+                f"{organization!r}, project={project!r})",
+                status=404,
+            )
+        payload = dict(self._work_items[item_id])
+        if fields is not None:
+            raw_fields = payload.get("fields") or {}
+            payload["fields"] = {
+                k: v for k, v in raw_fields.items() if k in fields
+            }
+        return payload

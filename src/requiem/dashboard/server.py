@@ -16,16 +16,18 @@ Routes::
     GET  /api/runs                      → list_runs(...)        as JSON
     GET  /api/runs/<run_id>             → run_detail(...)       as JSON  (404 if absent)
     GET  /api/gates                     → pending_gates(...)    as JSON
+    GET  /api/state/<item_id>           → compute_work_state(...) as JSON (ADR-0031 / R4)
     POST /api/gates/<run_id>/resolve    → resolve_gate(...)     {"choice": "..."}
     GET  /healthz                       → {"ok": true}
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from requiem.dashboard import projection
 from requiem.dashboard.page import PAGE_HTML
@@ -38,7 +40,50 @@ def _json_bytes(obj: Any) -> bytes:
     return json.dumps(obj, default=str).encode("utf-8")
 
 
-def make_handler(log_dir: Path, *, auto_resume: bool = False) -> type[BaseHTTPRequestHandler]:
+# ---- ADR-0031 / R4: /api/state/<item_id> wiring -------------------------
+#
+# The dashboard process generally has no twig/azure-identity bootstrap.
+# Rather than crash on import or invocation, we lazy-construct
+# TwigClient + repo_client per request and return 503 on any
+# construction failure. Tests inject a synthetic provider (see
+# ``make_handler(state_provider=...)``) so they don't need a live ADO.
+
+
+def _default_state_provider(
+    *, item_id: int, log_dir: Path, ado_repo: str | None,
+    github_repo: str | None,
+) -> dict[str, Any]:
+    """Compute the work-state projection for ``item_id`` (default impl).
+
+    Constructs a real :class:`TwigClient` + repo client and runs
+    ``compute_work_state`` synchronously. Raises on construction or
+    fetch failure — the handler maps the exception to 503.
+    """
+    from requiem.clients.twig import TwigClient
+    from requiem.end_to_end import _resolve_repo_target
+    from requiem.projections import compute_work_state
+
+    _, repo_client = _resolve_repo_target(
+        github_repo=github_repo, ado_repo=ado_repo, gh=None,
+    )
+    twig = TwigClient()
+    projection_obj = asyncio.run(compute_work_state(
+        root_item_id=item_id,
+        twig=twig,
+        repo_client=repo_client,
+        log_dir=log_dir,
+        github_repo=github_repo,
+        ado_repo=ado_repo,
+    ))
+    return projection_obj.to_dict()
+
+
+def make_handler(
+    log_dir: Path,
+    *,
+    auto_resume: bool = False,
+    state_provider: Any | None = None,
+) -> type[BaseHTTPRequestHandler]:
     """Build a request-handler class bound to ``log_dir``.
 
     A factory (rather than a module global) so multiple dashboards / tests can
@@ -48,7 +93,20 @@ def make_handler(log_dir: Path, *, auto_resume: bool = False) -> type[BaseHTTPRe
     also spawns ``requiem resume`` for the run as a detached subprocess, so the
     operator doesn't have to run it by hand (ADR-0019). Off by default — the
     dashboard's safe contract is append-the-decision-and-stop.
+
+    ``state_provider`` (ADR-0031 / R4): callable used to compute the
+    work-state projection for ``/api/state/<item_id>``. Signature::
+
+        provider(*, item_id: int, log_dir: Path, ado_repo: str | None,
+                 github_repo: str | None) -> dict
+
+    Defaults to :func:`_default_state_provider` (real TwigClient + repo
+    client). Tests inject a synthetic provider so they don't need a
+    live ADO. Any exception raised by the provider is mapped to a 503
+    with the error message — a missing twig binary or expired token
+    must not crash the dashboard process.
     """
+    provider = state_provider or _default_state_provider
 
     class _Handler(BaseHTTPRequestHandler):
         server_version = "requiem-dashboard/1.0"
@@ -100,6 +158,63 @@ def make_handler(log_dir: Path, *, auto_resume: bool = False) -> type[BaseHTTPRe
                     self._not_found(f"no such run {run_id!r}")
                     return
                 self._json(detail.to_dict())
+                return
+            if path.startswith("/api/state/"):
+                # ADR-0031 / R4: read-only work-state projection for one
+                # ADO item. ``?ado_repo=org/proj/repo`` or
+                # ``?github_repo=Owner/Repo`` enables repo-linkage
+                # surfacing; otherwise the tree is pure ADO state.
+                raw_id = path[len("/api/state/"):]
+                if not raw_id or "/" in raw_id or "\\" in raw_id:
+                    self._json(
+                        {"error": "invalid item id"}, status=400,
+                    )
+                    return
+                try:
+                    item_id = int(raw_id)
+                except ValueError:
+                    self._json(
+                        {"error": f"item id {raw_id!r} is not an integer"},
+                        status=400,
+                    )
+                    return
+                query = parse_qs(urlparse(self.path).query)
+                ado_repo = (query.get("ado_repo") or [None])[0]
+                github_repo = (query.get("github_repo") or [None])[0]
+                if ado_repo and github_repo:
+                    self._json(
+                        {"error": "ado_repo and github_repo are mutually "
+                                  "exclusive — pass one or the other"},
+                        status=400,
+                    )
+                    return
+                try:
+                    payload = provider(
+                        item_id=item_id,
+                        log_dir=Path(log_dir),
+                        ado_repo=ado_repo,
+                        github_repo=github_repo,
+                    )
+                except KeyError as e:
+                    # FakeTwig / real twig raises KeyError for "not found"
+                    # (the projection's twig.show_async contract). Surface
+                    # as 404 rather than 503 — the item genuinely doesn't
+                    # exist (or isn't visible to this caller).
+                    self._json(
+                        {"error": f"work item {item_id} not found: {e}"},
+                        status=404,
+                    )
+                    return
+                except Exception as e:  # noqa: BLE001 — defensive
+                    # Construction or fetch failure: 503 with the
+                    # message, NEVER let it crash the dashboard.
+                    self._json(
+                        {"error": f"projection failed: "
+                                  f"{type(e).__name__}: {e}"},
+                        status=503,
+                    )
+                    return
+                self._json(payload)
                 return
             self._not_found()
 
@@ -171,14 +286,22 @@ def make_handler(log_dir: Path, *, auto_resume: bool = False) -> type[BaseHTTPRe
 
 def build_server(
     log_dir: Path, host: str = "127.0.0.1", port: int = 8770,
-    *, auto_resume: bool = False,
+    *, auto_resume: bool = False, state_provider: Any | None = None,
 ) -> ThreadingHTTPServer:
     """Construct (but do not start) the dashboard HTTP server.
 
     ``auto_resume`` (opt-in, default off) spawns ``requiem resume`` after a
     successful dashboard gate resolution — see :func:`make_handler`.
+
+    ``state_provider`` (ADR-0031 / R4) lets tests inject a synthetic
+    work-state computer; production callers use the default (real
+    twig + repo client).
     """
-    handler = make_handler(Path(log_dir), auto_resume=auto_resume)
+    handler = make_handler(
+        Path(log_dir),
+        auto_resume=auto_resume,
+        state_provider=state_provider,
+    )
     return ThreadingHTTPServer((host, port), handler)
 
 
