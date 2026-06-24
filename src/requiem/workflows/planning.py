@@ -2257,6 +2257,14 @@ def build_engine(
         toolbelt=Toolbelt.real(),
         log_dir=log_dir,
         gate_handler=final_gate,
+        # ADR-0030 §2: thread the operator's ProcessConfig into the
+        # planning Engine so role-tagged AgentSpecs (planner/reviewer
+        # — not currently tagged but the wiring should be ready) can
+        # pick up `models.<role>` from process.yaml. Without this the
+        # kernel's `_invoke_with_resolved_model` always sees
+        # `self.process_config is None`. Closing the same gap as the
+        # implementation workflow (run #28).
+        process_config=final_config,
     )
 
 
