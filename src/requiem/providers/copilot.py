@@ -207,12 +207,45 @@ class CopilotProvider:
         )
 
         t0 = time.perf_counter()
+        # Lazy import — like CopilotClient, keep this in the call path so
+        # Anthropic-only / OpenAI-only users aren't forced to install the
+        # Copilot SDK. The constant is part of the SDK's public API
+        # (re-exported from copilot/__init__.py).
+        from copilot import BUILTIN_TOOLS_ISOLATED
         try:
             session = await self.client.create_session(
                 on_permission_request=_allow_all_permissions,
                 working_directory=self.working_directory or os.getcwd(),
                 streaming=True,
                 model=model,
+                # ADR-0030-followup (run-#26): restrict the session's tool
+                # surface to the SDK's BUILTIN_TOOLS_ISOLATED preset
+                # (ask_user, task_complete, exit_plan_mode, task, read_agent,
+                # write_agent, list_agents, send_inbox, context_board, skill).
+                # NONE of these tools can read or write the host filesystem
+                # or open network connections (the SDK's own contract — see
+                # copilot._mode docstring "no access outside the session,
+                # no cross-session state, no host environment access, no
+                # network").
+                #
+                # Without this argument the SDK defaults to its FULL tool
+                # surface (write_file, edit_file, bash, web_fetch, …) and
+                # the model can — and did, in run #26 — write files to
+                # the working_directory mid-session. Those writes survive
+                # the session even when we return `bad_output` or
+                # `network_timeout`, contaminating the worktree for every
+                # subsequent leaf in a sequential fanout (each leaf's
+                # `assert_clean_workspace` then bails with `workspace.dirty`,
+                # turning one stray Copilot tool call into a fanout-wide
+                # cascade).
+                #
+                # Our requiem coder contract is "parse the assistant
+                # message as CoderOutput JSON and apply file_changes via
+                # the implementation workflow's apply_changes verb"; we
+                # never want the SDK to do filesystem IO on our behalf.
+                # The isolated set is exactly the right level of
+                # capability for that contract.
+                available_tools=list(BUILTIN_TOOLS_ISOLATED),
             )
         except Exception as e:  # noqa: BLE001
             return _on_unknown(call, e, model)
@@ -255,7 +288,22 @@ class CopilotProvider:
             # INV-CANCEL-SHORT-CIRCUITS-RETRY: do not swallow.
             raise
         except asyncio.TimeoutError as e:
-            return _on_timeout(spec.name, call, e, model, self.session_timeout_s)
+            # ADR-0030-followup (run-#26): when OUR asyncio.wait_for
+            # ceiling fires (the session was still running), capture the
+            # real wall-time + any partial token counts the SDK already
+            # surfaced before the timeout. Run #26 had every leaf reporting
+            # `latency_ms=0, input_tokens=0, request_id=""` because the
+            # default _on_timeout built an empty receipt — masking the
+            # fact that 600s of real Copilot work had just been abandoned.
+            # Pass the live session/usage state so operators can see what
+            # the call actually did before being interrupted.
+            return _on_timeout(
+                spec.name, call, e, model, self.session_timeout_s,
+                elapsed_s=time.perf_counter() - t0,
+                session_id=str(getattr(session, "session_id", "") or ""),
+                partial_input_tokens=usage_in,
+                partial_output_tokens=usage_out,
+            )
         except Exception as e:  # noqa: BLE001
             return _on_unknown(call, e, model)
         finally:
@@ -536,8 +584,37 @@ def _on_session_error(
 def _on_timeout(
     agent: str, call: AgentCall, e: Exception, model: str,
     timeout_s: float = _SESSION_TIMEOUT_S,
+    *,
+    elapsed_s: float | None = None,
+    session_id: str = "",
+    partial_input_tokens: int = 0,
+    partial_output_tokens: int = 0,
 ) -> Outcome:
-    receipt = make_receipt(model=model, error=f"network_timeout: {e}")
+    """Build a retryable-failure outcome for an asyncio.wait_for timeout.
+
+    ``elapsed_s`` is the wall-time the session ran BEFORE the timeout
+    fired (we know that — we wrapped it). Reported as ``latency_ms`` on
+    the receipt so operators don't see ``latency_ms=0`` as in run #26,
+    which was systematically wrong (the SDK call was running for the
+    full ``timeout_s``, not zero seconds). When unknown, latency_ms
+    defaults to ``timeout_s * 1000`` (a strict upper bound).
+
+    ``session_id`` and ``partial_input_tokens`` / ``partial_output_tokens``
+    are the live session's state at the moment of timeout — useful when
+    Copilot streamed some usage updates before stalling.
+    """
+    latency_ms = (
+        int(elapsed_s * 1000) if elapsed_s is not None
+        else int(timeout_s * 1000)
+    )
+    receipt = make_receipt(
+        model=model,
+        input_tokens=partial_input_tokens,
+        output_tokens=partial_output_tokens,
+        latency_ms=latency_ms,
+        request_id=session_id,
+        error=f"network_timeout: {e}",
+    )
     return retryable_with(
         error_kind="network_timeout",
         message=f"copilot session timeout (>{timeout_s}s): {e}",

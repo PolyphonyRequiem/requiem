@@ -699,3 +699,165 @@ def test_on_timeout_message_uses_supplied_timeout_not_module_constant():
     # outcome.message contains the timeout
     assert "30.0" in outcome.message
     assert "600" not in outcome.message
+
+
+# ---- tool isolation + accurate timeout receipts (run-#26 follow-up) ---
+
+
+def test_on_timeout_receipt_uses_supplied_elapsed_not_zero():
+    """ADR-0030 followup (run-#26): when our asyncio.wait_for ceiling
+    fires, the receipt's latency_ms must reflect the WALL-TIME the
+    session ran before being aborted, NOT zero.
+
+    Run #26 had every leaf's receipt reporting `latency_ms=0,
+    input_tokens=0, request_id=""` because the previous `_on_timeout`
+    built an empty receipt — masking the fact that 600s of real
+    Copilot work had just been abandoned. The fix threads
+    `elapsed_s`/`session_id`/partial token counts from the call site
+    so operators see the real picture."""
+    from requiem.providers.copilot import _on_timeout
+    from pydantic import BaseModel
+
+    class _M(BaseModel):
+        x: int = 0
+
+    from requiem.agent import AgentCall, AgentSpec
+    spec = AgentSpec(name="x", charter="t", response_model=_M, model="m")
+    call = AgentCall(spec=spec, user_message="p")
+    outcome = _on_timeout(
+        "agent", call, TimeoutError("boom"), "m", timeout_s=600.0,
+        elapsed_s=487.2,
+        session_id="sess-abc-123",
+        partial_input_tokens=75_559,
+        partial_output_tokens=3_609,
+    )
+    receipt = outcome.receipts[0]
+    # Latency in ms, not seconds.
+    assert receipt["latency_ms"] == 487_200
+    assert receipt["input_tokens"] == 75_559
+    assert receipt["output_tokens"] == 3_609
+    assert receipt["request_id"] == "sess-abc-123"
+    # And the actual non-empty error tag is preserved.
+    assert "network_timeout" in receipt["error"]
+
+
+def test_on_timeout_receipt_defaults_to_upper_bound_when_elapsed_unknown():
+    """When ``elapsed_s`` is not supplied, the receipt's latency_ms
+    defaults to ``timeout_s * 1000`` — a strict upper bound that's
+    still better than zero. Pins the back-compat call signature so
+    legacy/manual call sites keep working."""
+    from requiem.providers.copilot import _on_timeout
+    from pydantic import BaseModel
+
+    class _M(BaseModel):
+        x: int = 0
+
+    from requiem.agent import AgentCall, AgentSpec
+    spec = AgentSpec(name="x", charter="t", response_model=_M, model="m")
+    call = AgentCall(spec=spec, user_message="p")
+    outcome = _on_timeout(
+        "agent", call, TimeoutError("boom"), "m", timeout_s=30.0,
+        # No elapsed_s / session_id / partial_*.
+    )
+    receipt = outcome.receipts[0]
+    assert receipt["latency_ms"] == 30_000  # 30s upper bound, not 0
+
+
+def test_session_uses_isolated_tool_preset():
+    """ADR-0030-followup (run-#26): every Copilot session MUST be
+    created with ``available_tools=BUILTIN_TOOLS_ISOLATED``. Without
+    this, the SDK exposes its default tool surface (write_file,
+    edit_file, bash, …) and the model can write to the working
+    directory mid-session, contaminating the worktree for every
+    subsequent sequential fanout leaf.
+
+    Pin the call signature: a future regression that drops the tool
+    filter would re-introduce the run-#26 cascade.
+    """
+    import asyncio
+    import inspect
+
+    import copilot
+
+    from requiem.providers.copilot import CopilotProvider, DEFAULT_COPILOT_MODEL
+
+    # Capture create_session's kwargs without actually talking to a
+    # real Copilot SDK. The provider's _start() path calls into the
+    # client; we stub the client with a Mock that records the call.
+    recorded: dict[str, object] = {}
+
+    class _StubSession:
+        session_id = "sess-stub"
+
+        def on(self, _cb):
+            pass
+
+        async def send(self, _prompt):
+            # Fire the done event immediately by closing the session.
+            pass
+
+    class _StubAuthStatus:
+        isAuthenticated = True
+
+    class _StubClient:
+        async def get_auth_status(self):
+            return _StubAuthStatus()
+
+        async def create_session(self, **kwargs):
+            recorded.update(kwargs)
+            # We don't care about end-to-end behavior here — just that
+            # `available_tools` was supplied. Return something the
+            # caller can release.
+            return _StubSession()
+
+        async def delete_session(self, _sid):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+    # Construct the provider directly with the stub client so we don't
+    # need a real github-copilot-sdk install or a token.
+    provider = CopilotProvider(model=DEFAULT_COPILOT_MODEL, client=_StubClient())
+
+    from requiem.agent import AgentCall, AgentSpec
+    from pydantic import BaseModel
+
+    class _Resp(BaseModel):
+        x: int = 0
+
+    spec = AgentSpec(name="t", charter="c", response_model=_Resp, model=DEFAULT_COPILOT_MODEL)
+    call = AgentCall(spec=spec, user_message="hi")
+
+    # Drive the invoke once. We expect a timeout (the stub session
+    # never fires `session.idle`) but the create_session kwargs we
+    # care about will have been captured by then.
+    async def _drive():
+        # Shorten the per-call ceiling so the stub timeout fires fast.
+        provider.session_timeout_s = 0.05
+        await provider.invoke(call)
+
+    asyncio.run(_drive())
+
+    assert "available_tools" in recorded, (
+        "CopilotProvider.create_session must pass available_tools — "
+        "without it the SDK enables write_file/edit_file/bash and "
+        "the model contaminates the worktree (run-#26 regression)."
+    )
+    tools = list(recorded["available_tools"])
+    # The exact list is the SDK's BUILTIN_TOOLS_ISOLATED constant; we
+    # compare with the constant rather than hardcoding so the SDK can
+    # rev the set without breaking our test.
+    assert tools == list(copilot.BUILTIN_TOOLS_ISOLATED), (
+        f"available_tools must equal BUILTIN_TOOLS_ISOLATED "
+        f"({copilot.BUILTIN_TOOLS_ISOLATED!r}); got {tools!r}"
+    )
+    # Belt + suspenders: file-writing tools must NOT be in the set.
+    for forbidden in ("write_file", "edit_file", "bash", "create_file"):
+        assert forbidden not in tools, (
+            f"{forbidden!r} present in available_tools — would let the "
+            f"model write the host worktree mid-session"
+        )
