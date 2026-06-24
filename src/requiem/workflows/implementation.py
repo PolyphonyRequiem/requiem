@@ -201,6 +201,7 @@ CODER_SPEC = AgentSpec(
         "interpretation in `notes` rather than guessing silently."
     ),
     response_model=CoderOutput,
+    role="implementer",
 )
 
 CODER_REVISION_SPEC = AgentSpec(
@@ -213,6 +214,7 @@ CODER_REVISION_SPEC = AgentSpec(
         "fails again the workflow surrenders to a human reviewer."
     ),
     response_model=CoderOutput,
+    role="implementer",
 )
 
 

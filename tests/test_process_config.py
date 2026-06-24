@@ -550,3 +550,99 @@ def test_tier_for_type_works_with_types_schema():
     assert cfg.tier_for_type("Feature") == "decomposable"
     assert cfg.tier_for_type("Task") == "implementable"
     assert cfg.tier_for_type("Unknown") == "unspecified"
+
+
+# ---- models block (ADR-0030 §2 loader; run-#27 follow-up) -------------
+
+
+def test_models_block_loaded_from_yaml(tmp_path):
+    """ADR-0030 §2: ``models:`` in process.yaml round-trips through
+    ``load_process_config`` so ``resolve_model_for_role`` finds it.
+
+    Pre-fix gap: ``ProcessConfig.models`` existed as a dataclass field
+    but ``_build_from_mapping`` never read the YAML key — every
+    operator-supplied ``models:`` block was silently ignored. The unit
+    tests for ``model_routing`` constructed ``ProcessConfig`` directly
+    so the gap escaped notice until run #27 needed to pin the coder
+    agent to a specific model via operator config."""
+    from requiem.process_config import load_process_config
+    from requiem.model_routing import resolve_model_for_role
+
+    p = tmp_path / "process.yaml"
+    p.write_text(
+        "root_parent_types: [Scenario]\n"
+        "models:\n"
+        "  implementer:\n"
+        "    provider: copilot\n"
+        "    model: claude-sonnet-4.6\n"
+        "  planner:\n"
+        "    provider: anthropic\n"
+        "    model: claude-opus-4.7\n"
+        "    max_tokens: 16384\n",
+        encoding="utf-8",
+    )
+    cfg = load_process_config(p)
+
+    # Loaded into the dataclass field.
+    assert "implementer" in cfg.models
+    assert "planner" in cfg.models
+
+    # Round-trips through the resolver — operator-supplied YAML actually
+    # routes calls.
+    impl = resolve_model_for_role("implementer", cfg)
+    assert impl.provider == "copilot"
+    assert impl.model == "claude-sonnet-4.6"
+    assert impl.max_tokens is None
+
+    planner = resolve_model_for_role("planner", cfg)
+    assert planner.provider == "anthropic"
+    assert planner.model == "claude-opus-4.7"
+    assert planner.max_tokens == 16384
+
+
+def test_models_block_absent_is_empty_dict(tmp_path):
+    """When the YAML omits ``models:`` entirely, the dataclass field
+    defaults to an empty dict (no error). Preserves backward-compat
+    for the many process.yaml files in the wild that pre-date
+    ADR-0030 §2."""
+    from requiem.process_config import load_process_config
+
+    p = tmp_path / "process.yaml"
+    p.write_text("root_parent_types: [Scenario]\n", encoding="utf-8")
+    cfg = load_process_config(p)
+    assert cfg.models == {}
+
+
+def test_models_block_rejects_non_mapping(tmp_path):
+    """A malformed ``models:`` (e.g. a list) fails at load time with
+    a path-pointing error — better than a confused KeyError later."""
+    import pytest
+    from requiem.process_config import load_process_config, ProcessConfigError
+
+    p = tmp_path / "process.yaml"
+    p.write_text(
+        "root_parent_types: [Scenario]\n"
+        "models:\n"
+        "  - planner\n"
+        "  - implementer\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ProcessConfigError, match="models.*must be a mapping"):
+        load_process_config(p)
+
+
+def test_models_entry_rejects_non_mapping(tmp_path):
+    """A role binding that's not a mapping (e.g. a string shorthand)
+    fails at load time, not at first resolve."""
+    import pytest
+    from requiem.process_config import load_process_config, ProcessConfigError
+
+    p = tmp_path / "process.yaml"
+    p.write_text(
+        "root_parent_types: [Scenario]\n"
+        "models:\n"
+        "  implementer: claude-sonnet-4.6\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ProcessConfigError, match="implementer.*must be a mapping"):
+        load_process_config(p)

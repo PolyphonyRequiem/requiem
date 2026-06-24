@@ -444,6 +444,55 @@ def _str_map(data: Mapping[str, Any], key: str, path: Path | None) -> dict[str, 
     return out
 
 
+def _models_map(
+    data: Mapping[str, Any], key: str, path: Path | None
+) -> dict[str, dict[str, Any]]:
+    """Parse the ``models`` block (ADR-0030 §2 role→model routing).
+
+    Returns ``dict[role_name, dict[field, value]]``. Shape validation
+    only — the per-entry field validation (provider/model/max_tokens
+    presence + types) lives in
+    :func:`requiem.model_routing._validate_entry` and runs lazily on
+    each ``resolve_model_for_role()`` call. This keeps the loader
+    simple (no schema knowledge of the routing-entry shape, which
+    may grow over time without a process_config schema bump) and
+    matches the precedent set by the ADR-0030 §2 unit tests in
+    ``tests/test_model_routing.py``, which build ``ProcessConfig``
+    instances directly with raw dict values for ``models``.
+
+    Forward-compat: an unrecognised field inside a role entry passes
+    through to ``_validate_entry``, which only rejects shapes that
+    would prevent routing (it doesn't reject extra keys — the routing
+    layer is supposed to ignore what it doesn't understand so new
+    knobs like ``reasoning_effort`` can be added to the YAML without
+    breaking older requiem builds).
+    """
+    raw = data.get(key)
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise ProcessConfigError(
+            f"'{key}' must be a mapping of role name to model binding, "
+            f"got {type(raw).__name__}",
+            path=path,
+        )
+    out: dict[str, dict[str, Any]] = {}
+    for role_name, binding in raw.items():
+        if not isinstance(role_name, str):
+            raise ProcessConfigError(
+                f"'{key}' role names must be strings, got {type(role_name).__name__}",
+                path=path,
+            )
+        if not isinstance(binding, Mapping):
+            raise ProcessConfigError(
+                f"'{key}.{role_name}' must be a mapping (with at least "
+                f"'provider' + 'model'), got {type(binding).__name__}",
+                path=path,
+            )
+        out[role_name] = dict(binding)
+    return out
+
+
 def _roles_map(
     data: Mapping[str, Any], key: str, path: Path | None
 ) -> dict[str, RoleBinding]:
@@ -614,6 +663,7 @@ def _build_from_mapping(
         implementable_types=_str_set(data, "implementable_types", source),
         types=_types_map(data, "types", source),
         roles=_roles_map(data, "roles", source),
+        models=_models_map(data, "models", source),
         source=source,
         sha256=sha256,
     )

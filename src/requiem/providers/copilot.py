@@ -68,7 +68,27 @@ from requiem.providers._common import (
 )
 
 
-DEFAULT_COPILOT_MODEL: Final[str] = "claude-sonnet-4.5"
+DEFAULT_COPILOT_MODEL: Final[str] = "claude-sonnet-4.6"
+"""Default model for the Copilot-backed provider. Was ``claude-sonnet-4.5``
+until 2026-06-24; bumped to ``4.6`` after run #27 showed Claude 4.5
+hitting the 600s session timeout while emitting only ~365 output tokens
+in 10 minutes (~0.6 tok/s) on context-pack-dense prompts.
+
+Key capability deltas (queried via ``CopilotClient.list_models()``):
+
+  * 4.5: ``supported_reasoning_efforts=None`` (no explicit
+    reasoning loop; no knobs to tune; thinks in-band, apparently
+    slowly on dense prompts), ``max_prompt_tokens=168000``,
+    ``max_context_window_tokens=200000``.
+  * 4.6: ``supported_reasoning_efforts=['low', 'medium', 'high',
+    'max']`` (separate reasoning loop with tunable effort;
+    ``default_reasoning_effort='medium'``), ``max_prompt_tokens=
+    936000``, ``max_context_window_tokens=1000000``.
+
+Operator override path is unchanged: pass ``model=<id>`` to
+``CopilotProvider(...)`` or set per-role policy via
+``process.yaml`` (ADR-0030 §2).
+"""
 _SESSION_TIMEOUT_S: Final[float] = 600.0
 """Default ceiling for one ``invoke`` call (overridable via
 ``CopilotProvider(session_timeout_s=N)``). Raised from 180s on 2026-06-23
@@ -94,7 +114,7 @@ class CopilotProvider:
     Constructor knobs:
 
     * ``model``    — default model (per-call override via ``AgentSpec.model``).
-      Copilot exposes its own set of models (``claude-sonnet-4.5``,
+      Copilot exposes its own set of models (``claude-sonnet-4.6``,
       ``gpt-5.x``, etc.); see ``copilot --help model`` on the host CLI.
     * ``client``   — pre-built ``copilot.CopilotClient`` for tests.
     * ``working_directory`` — passed to ``create_session``; defaults to
@@ -109,12 +129,34 @@ class CopilotProvider:
       out at exactly 180.0s while Copilot was still working. Set
       higher on slow links / dense prompts; lower in CI / tests
       where you want a fast-fail.
+    * ``reasoning_effort`` — passed through to ``create_session``
+      verbatim. Honored only by reasoning-capable models (e.g.
+      ``claude-sonnet-4.6`` accepts ``"low"`` / ``"medium"`` / ``"high"``
+      / ``"max"``; query supported values via
+      ``CopilotClient.list_models()`` → ``ModelInfo.supported_reasoning_efforts``).
+      Ignored by older models that don't support a separate reasoning
+      loop. ``None`` (default) → SDK falls back to the model's
+      ``default_reasoning_effort`` (typically ``"medium"``). Set to
+      ``"low"`` to force quicker turnaround at the cost of less
+      thinking — useful for the requiem coder agent on prompts that
+      don't need deep reasoning.
+    * ``reasoning_summary`` — passed through. Controls whether/how
+      Copilot returns the reasoning trace alongside the final answer.
+      Use ``"none"`` to suppress reasoning output for non-reasoning
+      models, or for reasoning-capable models when you don't need
+      the chain-of-thought. Saves output tokens and latency.
+    * ``context_tier`` — passed through. Controls Copilot's context-
+      window tier for supported models. Typically left ``None`` (use
+      model defaults).
     """
 
     model: str = DEFAULT_COPILOT_MODEL
     client: Any = None  # copilot.CopilotClient | None — lazy
     working_directory: str | None = None
     session_timeout_s: float = _SESSION_TIMEOUT_S
+    reasoning_effort: str | None = None
+    reasoning_summary: str | None = None
+    context_tier: str | None = None
     # Internal: the CopilotClient may be entered as a context manager once;
     # we keep a flag so close() is idempotent.
     _started: bool = field(default=False, init=False, repr=False)
@@ -212,41 +254,54 @@ class CopilotProvider:
         # Copilot SDK. The constant is part of the SDK's public API
         # (re-exported from copilot/__init__.py).
         from copilot import BUILTIN_TOOLS_ISOLATED
+        # ADR-0030-followup (run-#26): restrict the session's tool
+        # surface to the SDK's BUILTIN_TOOLS_ISOLATED preset
+        # (ask_user, task_complete, exit_plan_mode, task, read_agent,
+        # write_agent, list_agents, send_inbox, context_board, skill).
+        # NONE of these tools can read or write the host filesystem
+        # or open network connections (the SDK's own contract — see
+        # copilot._mode docstring "no access outside the session,
+        # no cross-session state, no host environment access, no
+        # network").
+        #
+        # Without this argument the SDK defaults to its FULL tool
+        # surface (write_file, edit_file, bash, web_fetch, …) and
+        # the model can — and did, in run #26 — write files to
+        # the working_directory mid-session. Those writes survive
+        # the session even when we return `bad_output` or
+        # `network_timeout`, contaminating the worktree for every
+        # subsequent leaf in a sequential fanout (each leaf's
+        # `assert_clean_workspace` then bails with `workspace.dirty`,
+        # turning one stray Copilot tool call into a fanout-wide
+        # cascade).
+        #
+        # Our requiem coder contract is "parse the assistant
+        # message as CoderOutput JSON and apply file_changes via
+        # the implementation workflow's apply_changes verb"; we
+        # never want the SDK to do filesystem IO on our behalf.
+        # The isolated set is exactly the right level of
+        # capability for that contract.
+        #
+        # Build the create_session kwargs. The reasoning_* knobs are
+        # only included when set so the SDK sees its own ``=None``
+        # defaults — keeps the wire shape clean and makes the test
+        # stub's recorded-kwargs intent unambiguous (only what the
+        # caller actually requested shows up).
+        session_kwargs: dict[str, Any] = {
+            "on_permission_request": _allow_all_permissions,
+            "working_directory": self.working_directory or os.getcwd(),
+            "streaming": True,
+            "model": model,
+            "available_tools": list(BUILTIN_TOOLS_ISOLATED),
+        }
+        if self.reasoning_effort is not None:
+            session_kwargs["reasoning_effort"] = self.reasoning_effort
+        if self.reasoning_summary is not None:
+            session_kwargs["reasoning_summary"] = self.reasoning_summary
+        if self.context_tier is not None:
+            session_kwargs["context_tier"] = self.context_tier
         try:
-            session = await self.client.create_session(
-                on_permission_request=_allow_all_permissions,
-                working_directory=self.working_directory or os.getcwd(),
-                streaming=True,
-                model=model,
-                # ADR-0030-followup (run-#26): restrict the session's tool
-                # surface to the SDK's BUILTIN_TOOLS_ISOLATED preset
-                # (ask_user, task_complete, exit_plan_mode, task, read_agent,
-                # write_agent, list_agents, send_inbox, context_board, skill).
-                # NONE of these tools can read or write the host filesystem
-                # or open network connections (the SDK's own contract — see
-                # copilot._mode docstring "no access outside the session,
-                # no cross-session state, no host environment access, no
-                # network").
-                #
-                # Without this argument the SDK defaults to its FULL tool
-                # surface (write_file, edit_file, bash, web_fetch, …) and
-                # the model can — and did, in run #26 — write files to
-                # the working_directory mid-session. Those writes survive
-                # the session even when we return `bad_output` or
-                # `network_timeout`, contaminating the worktree for every
-                # subsequent leaf in a sequential fanout (each leaf's
-                # `assert_clean_workspace` then bails with `workspace.dirty`,
-                # turning one stray Copilot tool call into a fanout-wide
-                # cascade).
-                #
-                # Our requiem coder contract is "parse the assistant
-                # message as CoderOutput JSON and apply file_changes via
-                # the implementation workflow's apply_changes verb"; we
-                # never want the SDK to do filesystem IO on our behalf.
-                # The isolated set is exactly the right level of
-                # capability for that contract.
-                available_tools=list(BUILTIN_TOOLS_ISOLATED),
-            )
+            session = await self.client.create_session(**session_kwargs)
         except Exception as e:  # noqa: BLE001
             return _on_unknown(call, e, model)
 
