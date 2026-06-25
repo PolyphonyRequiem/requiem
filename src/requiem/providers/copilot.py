@@ -294,12 +294,23 @@ class CopilotProvider:
             "model": model,
             "available_tools": list(BUILTIN_TOOLS_ISOLATED),
         }
-        if self.reasoning_effort is not None:
-            session_kwargs["reasoning_effort"] = self.reasoning_effort
-        if self.reasoning_summary is not None:
-            session_kwargs["reasoning_summary"] = self.reasoning_summary
-        if self.context_tier is not None:
-            session_kwargs["context_tier"] = self.context_tier
+        # Per-call provider-specific knobs from AgentCall.model_options
+        # take precedence over the provider's constructor defaults so
+        # the operator's process.yaml `models.<role>` block (which
+        # populates model_options via ADR-0030 §2 / model_routing) can
+        # tune any specific call without changing the global default.
+        # The constructor defaults still apply when a key is absent
+        # from model_options.
+        call_options = getattr(call, "model_options", None) or {}
+        effort = call_options.get("reasoning_effort", self.reasoning_effort)
+        summary = call_options.get("reasoning_summary", self.reasoning_summary)
+        tier = call_options.get("context_tier", self.context_tier)
+        if effort is not None:
+            session_kwargs["reasoning_effort"] = effort
+        if summary is not None:
+            session_kwargs["reasoning_summary"] = summary
+        if tier is not None:
+            session_kwargs["context_tier"] = tier
         try:
             session = await self.client.create_session(**session_kwargs)
         except Exception as e:  # noqa: BLE001

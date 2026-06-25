@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ValidationError
 
@@ -52,6 +52,18 @@ class AgentCall:
     retry_key: str = ""
     cancel: asyncio.Event | None = None
     event_callback: Callable[[str, dict[str, Any]], None] | None = None
+    model_options: Mapping[str, Any] = field(default_factory=dict)
+    """ADR-0030 §2 (run #28 follow-up): per-call provider-specific knobs
+    resolved from the operator's :class:`ProcessConfig.models.<role>`
+    block. The kernel populates this when a routed role specifies extra
+    fields beyond provider/model/max_tokens (e.g.
+    ``reasoning_effort``, ``reasoning_summary``, ``context_tier`` for
+    the Copilot provider). Each provider decides which keys it
+    understands and silently ignores the rest — this lets operators
+    add new knobs to process.yaml without coordinated provider changes.
+
+    Empty dict (the default) preserves v0 behaviour: the provider
+    uses its own constructor-time defaults for every knob."""
 
 
 @runtime_checkable

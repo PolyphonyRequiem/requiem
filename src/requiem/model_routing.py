@@ -61,15 +61,60 @@ class ModelSpec:
     ``max_tokens`` is independently optional: a policy may pin
     ``provider`` + ``model`` without pinning ``max_tokens``, in which
     case the provider's own default applies.
+
+    ``reasoning_effort``, ``reasoning_summary``, ``context_tier`` are
+    provider-specific knobs surfaced by the GitHub Copilot SDK (run #28
+    follow-up: discovered claude-sonnet-4.6 has a tunable reasoning
+    loop while claude-sonnet-4.5 does not — ``reasoning_effort='low'``
+    forces faster turnaround at the cost of less deliberate reasoning).
+    The kernel threads non-None values through to the provider via
+    ``AgentCall.model_options``; providers that don't understand a key
+    silently ignore it. Operator yaml shape::
+
+        models:
+          implementer:
+            provider: copilot
+            model: claude-sonnet-4.6
+            reasoning_effort: low      # 'low' | 'medium' | 'high' | 'max'
+            reasoning_summary: none    # provider-specific
+            context_tier: standard     # provider-specific
     """
 
     provider: str | None = None
     model: str | None = None
     max_tokens: int | None = None
+    reasoning_effort: str | None = None
+    reasoning_summary: str | None = None
+    context_tier: str | None = None
 
     def is_empty(self) -> bool:
         """True when no override was resolved — caller may skip plumbing."""
-        return self.provider is None and self.model is None and self.max_tokens is None
+        return (
+            self.provider is None
+            and self.model is None
+            and self.max_tokens is None
+            and self.reasoning_effort is None
+            and self.reasoning_summary is None
+            and self.context_tier is None
+        )
+
+    def to_model_options(self) -> dict[str, Any]:
+        """Project the provider-specific knobs into the dict that
+        :class:`requiem.agent.AgentCall.model_options` expects.
+
+        Returns only the keys that are explicitly set — ``None`` values
+        are omitted so the receiving provider sees its own
+        constructor-time defaults rather than a redundant ``None``.
+        Keeps the wire shape clean and the test stub recorded-kwargs
+        comparison straightforward."""
+        opts: dict[str, Any] = {}
+        if self.reasoning_effort is not None:
+            opts["reasoning_effort"] = self.reasoning_effort
+        if self.reasoning_summary is not None:
+            opts["reasoning_summary"] = self.reasoning_summary
+        if self.context_tier is not None:
+            opts["context_tier"] = self.context_tier
+        return opts
 
 
 def _validate_entry(role: str, entry: Any) -> ModelSpec:
@@ -87,6 +132,9 @@ def _validate_entry(role: str, entry: Any) -> ModelSpec:
     provider = entry.get("provider")
     model = entry.get("model")
     max_tokens = entry.get("max_tokens")
+    reasoning_effort = entry.get("reasoning_effort")
+    reasoning_summary = entry.get("reasoning_summary")
+    context_tier = entry.get("context_tier")
 
     if provider is None or not isinstance(provider, str) or not provider.strip():
         raise ValueError(
@@ -107,7 +155,29 @@ def _validate_entry(role: str, entry: Any) -> ModelSpec:
                 f"models.{role}.max_tokens must be a positive integer when set; "
                 f"got {max_tokens}"
             )
-    return ModelSpec(provider=provider, model=model, max_tokens=max_tokens)
+    # The three reasoning knobs are all "non-empty string when set" — the
+    # provider validates the actual values against its own enum
+    # (e.g. Copilot accepts 'low'/'medium'/'high'/'max' for
+    # reasoning_effort; we don't hard-code that vocabulary here so new
+    # providers can extend it without coordinated changes here).
+    for fname, fval in (
+        ("reasoning_effort", reasoning_effort),
+        ("reasoning_summary", reasoning_summary),
+        ("context_tier", context_tier),
+    ):
+        if fval is not None and (not isinstance(fval, str) or not fval.strip()):
+            raise ValueError(
+                f"models.{role}.{fname} must be a non-empty string when set; "
+                f"got {fval!r}"
+            )
+    return ModelSpec(
+        provider=provider,
+        model=model,
+        max_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
+        reasoning_summary=reasoning_summary,
+        context_tier=context_tier,
+    )
 
 
 def resolve_model_for_role(

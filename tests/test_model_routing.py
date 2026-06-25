@@ -165,3 +165,114 @@ def test_modelspec_is_empty_when_all_fields_none() -> None:
     assert not ModelSpec(provider="x").is_empty()
     assert not ModelSpec(model="y").is_empty()
     assert not ModelSpec(max_tokens=1).is_empty()
+
+
+# ---- reasoning_effort / reasoning_summary / context_tier (run-#28 follow-up) ----
+
+
+def test_reasoning_effort_carried_on_model_spec() -> None:
+    """``models.<role>.reasoning_effort`` round-trips through the
+    resolver and lands on :class:`ModelSpec`.
+
+    Run #28 against AB#62759077 showed that even with the routing
+    plumbing fixed (operator yaml `models.implementer` → coder
+    agent actually runs on sonnet-4.6), the 600s session ceiling
+    still dominated failures. claude-sonnet-4.6 supports
+    `reasoning_effort` ('low'/'medium'/'high'/'max') — pinning to
+    'low' should force faster turnaround. The kernel threads this
+    into `AgentCall.model_options`; the CopilotProvider reads it.
+    """
+    from requiem.model_routing import resolve_model_for_role
+    cfg = _config({
+        "implementer": {
+            "provider": "copilot",
+            "model": "claude-sonnet-4.6",
+            "reasoning_effort": "low",
+        },
+    })
+    resolved = resolve_model_for_role("implementer", cfg)
+    assert resolved.provider == "copilot"
+    assert resolved.model == "claude-sonnet-4.6"
+    assert resolved.reasoning_effort == "low"
+    assert resolved.reasoning_summary is None
+    assert resolved.context_tier is None
+
+
+def test_all_three_reasoning_knobs_carried() -> None:
+    """All three knobs round-trip; absent fields stay None."""
+    from requiem.model_routing import resolve_model_for_role
+    cfg = _config({
+        "implementer": {
+            "provider": "copilot",
+            "model": "claude-sonnet-4.6",
+            "reasoning_effort": "max",
+            "reasoning_summary": "concise",
+            "context_tier": "extended",
+        },
+    })
+    resolved = resolve_model_for_role("implementer", cfg)
+    assert resolved.reasoning_effort == "max"
+    assert resolved.reasoning_summary == "concise"
+    assert resolved.context_tier == "extended"
+
+
+def test_to_model_options_returns_only_set_keys() -> None:
+    """``ModelSpec.to_model_options()`` omits None-valued keys so the
+    provider sees its own constructor defaults rather than redundant
+    None entries — keeps the wire shape clean and test stub
+    recorded-kwargs assertions unambiguous."""
+    from requiem.model_routing import ModelSpec
+    # Empty spec → empty dict.
+    assert ModelSpec().to_model_options() == {}
+    # Only reasoning_effort set.
+    only_effort = ModelSpec(
+        provider="copilot", model="x", reasoning_effort="low",
+    )
+    assert only_effort.to_model_options() == {"reasoning_effort": "low"}
+    # All three.
+    full = ModelSpec(
+        provider="copilot", model="x",
+        reasoning_effort="high",
+        reasoning_summary="detailed",
+        context_tier="standard",
+    )
+    assert full.to_model_options() == {
+        "reasoning_effort": "high",
+        "reasoning_summary": "detailed",
+        "context_tier": "standard",
+    }
+
+
+def test_reasoning_effort_invalid_shape_fails_closed() -> None:
+    """A non-string `reasoning_effort` (e.g. integer, list) raises
+    ValueError at resolve time so a typo in process.yaml is
+    one-line debuggable.
+
+    Note: we DO NOT validate the value's vocabulary
+    ('low'/'medium'/'high'/'max') here — that's the provider's job.
+    A new model with a 'turbo' tier should just work without
+    coordinated changes here."""
+    from requiem.model_routing import resolve_model_for_role
+    import pytest
+    cfg = _config({
+        "implementer": {
+            "provider": "copilot",
+            "model": "claude-sonnet-4.6",
+            "reasoning_effort": 42,
+        },
+    })
+    with pytest.raises(ValueError, match="reasoning_effort.*non-empty string"):
+        resolve_model_for_role("implementer", cfg)
+
+
+def test_is_empty_accounts_for_reasoning_knobs() -> None:
+    """A ModelSpec with only a reasoning knob set is NOT empty —
+    `is_empty()` must return False so the kernel knows to thread the
+    knob into model_options (and emit the agent_call_started with
+    the resolved provider)."""
+    from requiem.model_routing import ModelSpec
+    assert ModelSpec().is_empty() is True
+    # Only reasoning_effort set: still a routing override.
+    assert ModelSpec(reasoning_effort="low").is_empty() is False
+    assert ModelSpec(reasoning_summary="x").is_empty() is False
+    assert ModelSpec(context_tier="x").is_empty() is False
