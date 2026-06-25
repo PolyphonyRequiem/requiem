@@ -838,7 +838,11 @@ def test_session_uses_isolated_tool_preset():
     # care about will have been captured by then.
     async def _drive():
         # Shorten the per-call ceiling so the stub timeout fires fast.
+        # Dual-clock: shorten everything so the stub flow exits fast.
         provider.session_timeout_s = 0.05
+        provider.max_session_seconds = 0.05
+        provider.idle_timeout_s = 0.01
+        provider.max_recovery_attempts = 0
         await provider.invoke(call)
 
     asyncio.run(_drive())
@@ -915,7 +919,11 @@ def test_reasoning_effort_omitted_from_create_session_when_unset():
     call = AgentCall(spec=spec, user_message="hi")
 
     async def _drive():
+        # Dual-clock: shorten everything so the stub flow exits fast.
         provider.session_timeout_s = 0.05
+        provider.max_session_seconds = 0.05
+        provider.idle_timeout_s = 0.01
+        provider.max_recovery_attempts = 0
         await provider.invoke(call)
 
     asyncio.run(_drive())
@@ -968,7 +976,11 @@ def test_reasoning_effort_threaded_into_create_session_when_set():
     call = AgentCall(spec=spec, user_message="hi")
 
     async def _drive():
+        # Dual-clock: shorten everything so the stub flow exits fast.
         provider.session_timeout_s = 0.05
+        provider.max_session_seconds = 0.05
+        provider.idle_timeout_s = 0.01
+        provider.max_recovery_attempts = 0
         await provider.invoke(call)
 
     asyncio.run(_drive())
@@ -1035,7 +1047,11 @@ def test_model_options_per_call_overrides_provider_default():
     )
 
     async def _drive():
+        # Dual-clock: shorten everything so the stub flow exits fast.
         provider.session_timeout_s = 0.05
+        provider.max_session_seconds = 0.05
+        provider.idle_timeout_s = 0.01
+        provider.max_recovery_attempts = 0
         await provider.invoke(call)
 
     asyncio.run(_drive())
@@ -1085,7 +1101,11 @@ def test_model_options_default_empty_preserves_v0_behaviour():
     call = AgentCall(spec=spec, user_message="hi")
 
     async def _drive():
+        # Dual-clock: shorten everything so the stub flow exits fast.
         provider.session_timeout_s = 0.05
+        provider.max_session_seconds = 0.05
+        provider.idle_timeout_s = 0.01
+        provider.max_recovery_attempts = 0
         await provider.invoke(call)
 
     asyncio.run(_drive())
