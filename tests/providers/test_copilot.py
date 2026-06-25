@@ -982,3 +982,115 @@ def test_reasoning_effort_threaded_into_create_session_when_set():
 # what the model returns, just what kwargs got passed to create_session.
 class ToyResponse(BaseModel):
     x: int = 0
+
+
+def test_model_options_per_call_overrides_provider_default():
+    """When ``AgentCall.model_options`` carries a reasoning_effort
+    (the kernel populates this from the operator yaml's
+    ``models.<role>`` block via ModelSpec.to_model_options()), the
+    per-call value beats the CopilotProvider's constructor default.
+
+    Run #28 follow-up: the operator can pin
+    `models.implementer.reasoning_effort: low` without changing the
+    global provider default — exactly the kind of per-role tuning
+    that lets us iterate on dogfood reliability without affecting
+    other workflows.
+    """
+    import asyncio
+    from requiem.providers.copilot import CopilotProvider, DEFAULT_COPILOT_MODEL
+
+    recorded: dict[str, object] = {}
+
+    class _StubSession:
+        session_id = "sess-stub"
+        def on(self, _cb): pass
+        async def send(self, _prompt): pass
+
+    class _StubAuthStatus:
+        isAuthenticated = True
+
+    class _StubClient:
+        async def get_auth_status(self): return _StubAuthStatus()
+        async def create_session(self, **kwargs):
+            recorded.update(kwargs)
+            return _StubSession()
+        async def delete_session(self, _sid): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+
+    # Provider constructed WITH a default reasoning_effort='high'.
+    # The per-call value 'low' should win.
+    provider = CopilotProvider(
+        model=DEFAULT_COPILOT_MODEL,
+        client=_StubClient(),
+        reasoning_effort="high",   # constructor default
+        reasoning_summary="detailed",
+    )
+    spec = AgentSpec(name="t", charter="c", response_model=ToyResponse, model=DEFAULT_COPILOT_MODEL)
+    # AgentCall now has model_options — kernel populates this from
+    # ModelSpec.to_model_options() when a role is routed.
+    call = AgentCall(
+        spec=spec, user_message="hi",
+        model_options={"reasoning_effort": "low", "context_tier": "extended"},
+    )
+
+    async def _drive():
+        provider.session_timeout_s = 0.05
+        await provider.invoke(call)
+
+    asyncio.run(_drive())
+
+    # Per-call values win on the keys they specify.
+    assert recorded.get("reasoning_effort") == "low"      # overridden
+    assert recorded.get("context_tier") == "extended"    # supplied via call
+    # Constructor default still applies for keys NOT in model_options.
+    assert recorded.get("reasoning_summary") == "detailed"
+
+
+def test_model_options_default_empty_preserves_v0_behaviour():
+    """An AgentCall with the default empty model_options dict is
+    indistinguishable from the pre-run-#28 shape — the provider sees
+    only its constructor-time defaults. This is the backward-compat
+    invariant: callers that never opt into role routing aren't
+    affected by this plumbing."""
+    import asyncio
+    from requiem.providers.copilot import CopilotProvider, DEFAULT_COPILOT_MODEL
+
+    recorded: dict[str, object] = {}
+
+    class _StubSession:
+        session_id = "sess-stub"
+        def on(self, _cb): pass
+        async def send(self, _prompt): pass
+
+    class _StubAuthStatus:
+        isAuthenticated = True
+
+    class _StubClient:
+        async def get_auth_status(self): return _StubAuthStatus()
+        async def create_session(self, **kwargs):
+            recorded.update(kwargs)
+            return _StubSession()
+        async def delete_session(self, _sid): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+
+    provider = CopilotProvider(
+        model=DEFAULT_COPILOT_MODEL,
+        client=_StubClient(),
+        # No constructor reasoning_* args either.
+    )
+    spec = AgentSpec(name="t", charter="c", response_model=ToyResponse, model=DEFAULT_COPILOT_MODEL)
+    # AgentCall.model_options defaults to {} — no per-call override.
+    call = AgentCall(spec=spec, user_message="hi")
+
+    async def _drive():
+        provider.session_timeout_s = 0.05
+        await provider.invoke(call)
+
+    asyncio.run(_drive())
+
+    # Nothing leaks into the SDK kwargs.
+    assert "reasoning_effort" not in recorded
+    assert "reasoning_summary" not in recorded
+    assert "context_tier" not in recorded

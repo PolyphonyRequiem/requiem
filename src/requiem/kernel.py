@@ -551,7 +551,16 @@ class Engine:
             return await self.provider.invoke(call)
 
         derived_spec = dataclasses.replace(spec, model=resolved.model or spec.model)
-        derived_call = dataclasses.replace(call, spec=derived_spec)
+        # ADR-0030 §2 (run #28 follow-up): thread provider-specific
+        # knobs (reasoning_effort etc) through AgentCall.model_options.
+        # Providers ignore keys they don't understand, so this is safe
+        # to populate unconditionally — the operator yaml decides which
+        # knobs appear here per role.
+        derived_call = dataclasses.replace(
+            call,
+            spec=derived_spec,
+            model_options={**call.model_options, **resolved.to_model_options()},
+        )
         ctx.emitter.emit_agent_call_started(
             ctx.node_id, spec.name, spec.role,
             resolved.provider, resolved.model or spec.model,
@@ -639,7 +648,16 @@ class Engine:
             )
             return await self.provider.invoke(call)
         derived_spec = dataclasses.replace(spec, model=resolved.model or spec.model)
-        derived_call = dataclasses.replace(call, spec=derived_spec)
+        # ADR-0030 §2 (run #28 follow-up): thread provider-specific
+        # knobs (reasoning_effort etc) through AgentCall.model_options.
+        # Providers ignore keys they don't understand, so this is safe
+        # to populate unconditionally — the operator yaml decides which
+        # knobs appear here per role.
+        derived_call = dataclasses.replace(
+            call,
+            spec=derived_spec,
+            model_options={**call.model_options, **resolved.to_model_options()},
+        )
         ctx.emitter.emit_agent_call_started(
             ctx.node_id, spec.name, spec.role,
             resolved.provider, resolved.model or spec.model,
