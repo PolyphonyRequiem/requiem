@@ -90,11 +90,77 @@ Operator override path is unchanged: pass ``model=<id>`` to
 ``process.yaml`` (ADR-0030 §2).
 """
 _SESSION_TIMEOUT_S: Final[float] = 600.0
-"""Default ceiling for one ``invoke`` call (overridable via
-``CopilotProvider(session_timeout_s=N)``). Raised from 180s on 2026-06-23
-after run #24 showed ADR-0030 §1 context-pack prompts pushing real
-successful Copilot calls past the 180s mark; ~70% of run #24's leaves
-hit the old timeout while Copilot was still working productively."""
+"""DEPRECATED alias for the old single-bucket session ceiling.
+
+Run #29 against AB#62759077 (2026-06-24) made it clear that "kill
+the session after N seconds total" is the wrong shape for a coder
+agent: leaves that legitimately took 15 minutes of actively-emitting
+work got cut off the same as leaves that genuinely went silent.
+
+The new shape mirrors conductor's prior art (see
+``~/projects/conductor/src/conductor/providers/copilot.py`` — the
+:class:`IdleRecoveryConfig` pattern): a **wall-clock ceiling** that
+fires only on truly runaway sessions (default 1 hour), plus a
+short **idle ceiling** that detects "no SDK events for N seconds"
+and either nudges the agent with a recovery prompt or fails fast
+(default 120s + 3 recovery attempts).
+
+Kept as a constant so legacy callers that pass
+``session_timeout_s=X`` still work — the value is then plumbed in
+as the wall-clock ceiling (preserving "you said max 600s, you got
+max 600s" semantics for old callers)."""
+
+_DEFAULT_IDLE_TIMEOUT_S: Final[float] = 120.0
+"""Time without ANY meaningful SDK event before we consider the
+Copilot session genuinely stuck and either send a recovery prompt
+or fail.
+
+Lower than conductor's 90s default because requiem's coder workflow
+prompts are bigger (~10-40K input tokens with ADR-0030 §1 context
+packs) and we want some headroom for the first ``assistant.usage``
+event to land before nudging. Bookkeeping/lifecycle events
+(``session.start``, ``pending_messages.modified``) are explicitly
+excluded — they don't indicate real agent progress, so they don't
+reset the idle clock."""
+
+_DEFAULT_MAX_SESSION_S: Final[float] = 3600.0
+"""Hard wall-clock ceiling. Even with a still-flowing event stream,
+no single ``invoke`` may run longer than this — prevents runaway
+sessions from chewing minutes of operator wall-clock while the
+model loops on tool calls or repeatedly emits delta events without
+ever reaching ``session.idle``.
+
+1 hour is generous for the requiem coder workflow (the biggest run
+#29 success was 8.5 minutes); operators can tighten via
+``CopilotProvider(max_session_seconds=N)``."""
+
+_DEFAULT_MAX_RECOVERY_ATTEMPTS: Final[int] = 3
+"""Number of recovery prompts to send before declaring the session
+stuck and returning ``retryable_failure``. Set to 0 to disable
+recovery (fail on first idle)."""
+
+_DEFAULT_RECOVERY_PROMPT: Final[str] = (
+    "It appears your previous response stalled or did not complete. "
+    "Please continue producing the structured response from where you "
+    "left off. Remember: the final output MUST be a single JSON object "
+    "matching the CoderOutput schema, returned as the assistant's final "
+    "message — not as a tool call."
+)
+"""Sent to the SDK session when the idle clock fires but
+``max_recovery_attempts`` hasn't been exhausted. Tuned for the
+requiem coder contract (structured JSON output as final message,
+not tool calls). Operators can override via
+``CopilotProvider(recovery_prompt=…)``."""
+
+# Events that DON'T reset the idle clock — bookkeeping / lifecycle
+# noise that doesn't indicate the agent is actively working.
+# Matches conductor's `_IDLE_IGNORED_EVENTS` list.
+_IDLE_IGNORED_EVENTS: Final[frozenset[str]] = frozenset({
+    "pending_messages.modified",
+    "session.start",
+    "session.info",
+})
+
 _SERVER_ERROR_AFTER_S: Final[int] = 30
 _TIMEOUT_AFTER_S: Final[int] = 15
 
@@ -121,14 +187,30 @@ class CopilotProvider:
       ``os.getcwd()``. Copilot only writes inside this directory when
       tools are enabled (we enable none), so the value is mostly a
       formality — but the SDK rejects ``None``.
-    * ``session_timeout_s`` — overall wait ceiling for one ``invoke``
-      call, in seconds. Defaults to ``_SESSION_TIMEOUT_S`` (600). Bigger
-      prompts (ADR-0030 §1 context pack adds ~2KB of curated context
-      per leaf) push genuine successful runs past the old 180s
-      ceiling; run #24 against AB#62759077 saw ~70% of leaves timing
-      out at exactly 180.0s while Copilot was still working. Set
-      higher on slow links / dense prompts; lower in CI / tests
-      where you want a fast-fail.
+    * ``session_timeout_s`` — DEPRECATED alias kept for back-compat.
+      When set (non-default), reinterpreted as ``max_session_seconds``
+      so callers that pinned a single ceiling continue to honor it.
+      New code should use ``max_session_seconds`` + ``idle_timeout_s``
+      directly.
+    * ``max_session_seconds`` — hard wall-clock ceiling (default 1
+      hour). Only fires if the session is still running after this
+      long, regardless of event activity. Catches genuinely-runaway
+      sessions (stuck MCP, infinite tool loop, etc.) without
+      penalizing slow-but-progressing real work. Mirrors conductor's
+      ``IdleRecoveryConfig.max_session_seconds``.
+    * ``idle_timeout_s`` — time without any meaningful SDK event
+      before we consider the session stuck and send a recovery
+      prompt (default 120s). Bookkeeping/lifecycle events
+      (``session.start``, ``pending_messages.modified``,
+      ``session.info``) are excluded — they don't indicate the agent
+      is actively working. Run #29's failures were almost all
+      "model went silent for the full 600s" — far longer than any
+      genuine progress gap.
+    * ``max_recovery_attempts`` — number of recovery prompts to send
+      before failing (default 3). Set to 0 to fail on first idle.
+    * ``recovery_prompt`` — template sent to the SDK session when
+      the idle clock fires. Default is tuned for the requiem coder
+      contract; override for other workflows.
     * ``reasoning_effort`` — passed through to ``create_session``
       verbatim. Honored only by reasoning-capable models (e.g.
       ``claude-sonnet-4.6`` accepts ``"low"`` / ``"medium"`` / ``"high"``
@@ -154,6 +236,13 @@ class CopilotProvider:
     client: Any = None  # copilot.CopilotClient | None — lazy
     working_directory: str | None = None
     session_timeout_s: float = _SESSION_TIMEOUT_S
+    """DEPRECATED — kept for back-compat. When non-default, used as
+    ``max_session_seconds``. New code should set the two clocks
+    directly."""
+    max_session_seconds: float = _DEFAULT_MAX_SESSION_S
+    idle_timeout_s: float = _DEFAULT_IDLE_TIMEOUT_S
+    max_recovery_attempts: int = _DEFAULT_MAX_RECOVERY_ATTEMPTS
+    recovery_prompt: str = _DEFAULT_RECOVERY_PROMPT
     reasoning_effort: str | None = None
     reasoning_summary: str | None = None
     context_tier: str | None = None
@@ -162,6 +251,15 @@ class CopilotProvider:
     _started: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        # Back-compat: a caller that explicitly passes session_timeout_s
+        # (i.e. a value != the default sentinel) wants to pin the wall-
+        # clock ceiling to that value. Honor it so the deprecation is
+        # silent for existing callers.
+        if self.session_timeout_s != _SESSION_TIMEOUT_S:
+            # Caller intent: "cap the total time at session_timeout_s."
+            # Plumb into max_session_seconds. Idle timeout stays at the
+            # default — none of the legacy callers reasoned about idle.
+            object.__setattr__(self, "max_session_seconds", self.session_timeout_s)
         if self.client is None:
             # Lazy import — only pay the cost if a CopilotProvider is
             # actually constructed. Keeps Anthropic-only / OpenAI-only
@@ -316,18 +414,31 @@ class CopilotProvider:
         except Exception as e:  # noqa: BLE001
             return _on_unknown(call, e, model)
 
-        # Mutable refs (closure-captured by the event callback).
+        # Mutable refs (closure-captured by the event callback). The
+        # idle clock tracks the most-recent NON-bookkeeping event so the
+        # dual-clock loop below knows whether "no done.set() yet" means
+        # the agent is actively working (events flowing) or genuinely
+        # stuck (no events at all).
         response_text = ""
         error_message: str | None = None
         usage_in = 0
         usage_out = 0
         done = asyncio.Event()
+        last_activity_at = time.monotonic()
+        last_activity_event = "<initial>"
 
         def on_event(event: Any) -> None:
             nonlocal response_text, error_message, usage_in, usage_out
+            nonlocal last_activity_at, last_activity_event
             evt = (
                 event.type.value if hasattr(event.type, "value") else str(event.type)
             )
+            # Update idle clock for every event EXCEPT the bookkeeping
+            # / lifecycle noise that doesn't indicate real agent work.
+            # See `_IDLE_IGNORED_EVENTS` for the full list + rationale.
+            if evt not in _IDLE_IGNORED_EVENTS:
+                last_activity_event = evt
+                last_activity_at = time.monotonic()
             if evt == "assistant.message":
                 # The final assembled assistant message — this is what we keep.
                 response_text = getattr(event.data, "content", "") or ""
@@ -349,22 +460,83 @@ class CopilotProvider:
 
         try:
             await session.send(prompt)
-            await asyncio.wait_for(done.wait(), timeout=self.session_timeout_s)
+            # Dual-clock loop (run #29 follow-up; port of conductor's
+            # IdleRecoveryConfig pattern). Two ceilings:
+            #
+            #   1. max_session_seconds — hard wall-clock ceiling on the
+            #      whole `invoke` call. Only fires if STILL running after
+            #      this long (default 1 hour); catches runaway sessions.
+            #
+            #   2. idle_timeout_s — short clock that fires when no
+            #      meaningful SDK event has arrived for this long
+            #      (default 120s). Doesn't immediately fail — first
+            #      sends a recovery prompt, then waits again, up to
+            #      max_recovery_attempts times.
+            #
+            # The key insight from conductor: when `wait_for(done, idle)`
+            # fires but `time_since_last_event < idle`, EVENTS ARE STILL
+            # FLOWING — the agent is actively working, just hasn't
+            # reached `session.idle` yet. Reset and keep waiting. This is
+            # what unblocks "slow but progressing" Copilot sessions that
+            # the run-#28/#29 single-bucket ceiling killed indiscriminately.
+            recovery_attempts = 0
+            session_start = time.monotonic()
+            while not done.is_set():
+                elapsed = time.monotonic() - session_start
+                if elapsed > self.max_session_seconds:
+                    # Hard wall-clock — fail with full context.
+                    raise asyncio.TimeoutError(
+                        f"session exceeded max_session_seconds="
+                        f"{self.max_session_seconds:.0f}s "
+                        f"(last activity: {last_activity_event} "
+                        f"{time.monotonic() - last_activity_at:.0f}s ago)"
+                    )
+                try:
+                    await asyncio.wait_for(
+                        done.wait(),
+                        timeout=self.idle_timeout_s,
+                    )
+                    break  # done.set() — exit the loop
+                except asyncio.TimeoutError:
+                    # The idle clock fired — but check if events ARE
+                    # flowing (agent is working, just not done yet).
+                    time_since_last = time.monotonic() - last_activity_at
+                    if time_since_last < self.idle_timeout_s:
+                        # Events are still arriving — keep waiting.
+                        # Don't increment recovery_attempts; this is
+                        # normal progress, not a stuck session.
+                        continue
+                    # Genuinely idle — no events for the full window.
+                    recovery_attempts += 1
+                    if recovery_attempts > self.max_recovery_attempts:
+                        # Exhausted recovery — declare stuck. Use the
+                        # same asyncio.TimeoutError path that legacy
+                        # callers handled, with a more informative
+                        # message.
+                        raise asyncio.TimeoutError(
+                            f"session idle after "
+                            f"{recovery_attempts - 1} recovery attempts "
+                            f"(idle_timeout_s={self.idle_timeout_s:.0f}s; "
+                            f"last activity: {last_activity_event} "
+                            f"{time_since_last:.0f}s ago)"
+                        )
+                    # Send a recovery nudge and loop back. The SDK
+                    # may emit more events once the model responds.
+                    # If `done` got set between the wait_for and here
+                    # (race), the loop's while-condition will exit.
+                    if not done.is_set():
+                        await session.send(self.recovery_prompt)
         except asyncio.CancelledError:
             # INV-CANCEL-SHORT-CIRCUITS-RETRY: do not swallow.
             raise
         except asyncio.TimeoutError as e:
-            # ADR-0030-followup (run-#26): when OUR asyncio.wait_for
-            # ceiling fires (the session was still running), capture the
-            # real wall-time + any partial token counts the SDK already
-            # surfaced before the timeout. Run #26 had every leaf reporting
-            # `latency_ms=0, input_tokens=0, request_id=""` because the
-            # default _on_timeout built an empty receipt — masking the
-            # fact that 600s of real Copilot work had just been abandoned.
-            # Pass the live session/usage state so operators can see what
-            # the call actually did before being interrupted.
+            # The dual-clock loop above raises this with a detailed
+            # message (which clock fired, last-activity context).
+            # Capture full receipt state so the run analyzer can see
+            # whether time was burned in wall-clock-runaway vs
+            # genuine-stuck patterns.
             return _on_timeout(
-                spec.name, call, e, model, self.session_timeout_s,
+                spec.name, call, e, model, self.max_session_seconds,
                 elapsed_s=time.perf_counter() - t0,
                 session_id=str(getattr(session, "session_id", "") or ""),
                 partial_input_tokens=usage_in,
