@@ -416,6 +416,46 @@ def test_build_prompt_with_schema_appends_schema_instruction():
     assert "answer" in out  # _TinyOut's field name
 
 
+def test_build_prompt_with_schema_warns_model_off_tool_calls():
+    """Run-#31 follow-up. With `excluded_tools=builtin:*` sealing the
+    Copilot SDK tool surface (commit 4e5ccf7), sonnet-4.6 has NO
+    tools to call. But it sometimes still emits Anthropic-native
+    `<function_calls>` XML trying to call non-existent tools — which
+    appears as trailing prose AFTER the valid CoderOutput JSON and
+    breaks `json.loads`. The prompt MUST tell the model explicitly
+    that no tools exist, so it doesn't waste output tokens (and
+    contaminate the response) attempting to call them.
+    """
+    out = _build_prompt(
+        charter="Charter.", user_message="Do the thing.", schema=_TinyOut,
+    )
+    lowered = out.lower()
+    # The prompt must mention BOTH 'no tools' AND that tool-call
+    # syntax should be avoided. Otherwise the model will still try.
+    assert "no tools" in lowered or "no tool" in lowered, (
+        "prompt must explicitly state no tools are available; got:\n"
+        + out
+    )
+    assert "function_call" in lowered or "tool call" in lowered or "tool_call" in lowered, (
+        "prompt must mention tool-call syntax by name so the model "
+        "knows what NOT to emit (function_calls XML, tool_call blocks, etc.); got:\n"
+        + out
+    )
+
+
+def test_build_prompt_no_schema_omits_no_tools_note():
+    """The no-tools warning only matters when we're expecting structured
+    output. Plain text agents (no schema) don't need it."""
+    out = _build_prompt(
+        charter="Be helpful.", user_message="Hello!", schema=None,
+    )
+    lowered = out.lower()
+    assert "no tools" not in lowered, (
+        "no-schema prompts don't need the no-tools warning; keeps the "
+        "prompt minimal for the freeform path"
+    )
+
+
 # ---- code-fence stripping unit tests ------------------------------------
 
 
