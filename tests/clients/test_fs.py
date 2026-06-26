@@ -249,6 +249,99 @@ async def test_git_op_on_non_git_tree_raises(tmp_path: Path):
         await fs.git_current_branch()
 
 
+# ---- worktree cleanup primitives (run-#30 follow-up) ----------------
+#
+# The implementation workflow needs to scrub a poisoned worktree on
+# bad_output / failed coder runs (run-#30 leaf 9 surfaced this). These
+# primitives are thin wrappers around `git reset --hard HEAD` and
+# `git clean -fd` so the cleanup verb can be tested in isolation.
+
+
+async def test_git_reset_hard_drops_tracked_modifications(
+    fs: FilesystemClient, repo: Path
+):
+    """`reset_hard` discards modifications to TRACKED files and
+    returns to HEAD's tree state — the unambiguous half of the
+    cleanup contract.
+    """
+    (repo / "seed.txt").write_text("polluted\n", encoding="utf-8")
+    assert not await fs.git_is_clean()
+    await fs.git_reset_hard()
+    assert (repo / "seed.txt").read_text(encoding="utf-8") == "seed\n"
+
+
+async def test_git_reset_hard_leaves_untracked_files(
+    fs: FilesystemClient, repo: Path
+):
+    """`reset_hard` deliberately does NOT touch untracked files — it
+    only reverts the index + tracked-file working copy. Untracked
+    junk is removed separately by `git_clean_with_excludes`.
+    """
+    (repo / "untracked.txt").write_text("hi\n", encoding="utf-8")
+    await fs.git_reset_hard()
+    assert (repo / "untracked.txt").exists()
+
+
+async def test_git_clean_with_excludes_removes_untracked(
+    fs: FilesystemClient, repo: Path
+):
+    """The default clean call (no excludes) removes ALL untracked
+    files and dirs — the runtime shape used by the cleanup verb
+    when no `.requiem/` exists yet.
+    """
+    (repo / "orphan.cs").write_text("// junk\n", encoding="utf-8")
+    (repo / "specs").mkdir()
+    (repo / "specs" / "junk.md").write_text("# junk\n", encoding="utf-8")
+    await fs.git_clean_with_excludes(excludes=[])
+    assert not (repo / "orphan.cs").exists()
+    assert not (repo / "specs").exists()
+
+
+async def test_git_clean_with_excludes_preserves_excluded_paths(
+    fs: FilesystemClient, repo: Path
+):
+    """The cleanup verb must NOT delete `.requiem/` bookkeeping
+    (context pack, plan.tree.json) — those are framework-owned
+    and surviving cleanup is the whole point of the excludes list.
+    """
+    (repo / ".requiem").mkdir()
+    (repo / ".requiem" / "AGENTS.md").write_text(
+        "context\n", encoding="utf-8"
+    )
+    (repo / "stray.cs").write_text("// rm me\n", encoding="utf-8")
+    await fs.git_clean_with_excludes(excludes=[".requiem"])
+    assert (repo / ".requiem" / "AGENTS.md").exists()
+    assert not (repo / "stray.cs").exists()
+
+
+async def test_git_reset_hard_followed_by_clean_yields_clean_workspace(
+    fs: FilesystemClient, repo: Path
+):
+    """The composite contract `assert_clean_workspace` expects:
+    after `reset_hard + clean(excludes=['.requiem'])`,
+    `git_status_porcelain()` returns no lines outside `.requiem/`.
+    Modelled on the implementation workflow's filter (`.requiem/`
+    is treated as requiem-internal, not implementation content).
+    """
+    # Mix tracked-modification + untracked file + preserved .requiem/.
+    (repo / "seed.txt").write_text("polluted\n", encoding="utf-8")
+    (repo / "leaf.cs").write_text("// untracked\n", encoding="utf-8")
+    (repo / ".requiem").mkdir()
+    (repo / ".requiem" / "AGENTS.md").write_text("k\n", encoding="utf-8")
+    await fs.git_reset_hard()
+    await fs.git_clean_with_excludes(excludes=[".requiem"])
+    # Nothing left to report except the preserved (untracked) .requiem/
+    # bookkeeping — which the implementation workflow already filters.
+    lines = await fs.git_status_porcelain()
+    non_requiem = [
+        line for line in lines
+        if not line[3:].strip().strip('"').startswith(".requiem")
+    ]
+    assert non_requiem == [], (
+        f"expected only .requiem/ untracked after cleanup, got: {lines!r}"
+    )
+
+
 # ---- error hierarchy sanity -----------------------------------------
 
 

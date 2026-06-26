@@ -139,6 +139,35 @@ _DEFAULT_MAX_RECOVERY_ATTEMPTS: Final[int] = 3
 stuck and returning ``retryable_failure``. Set to 0 to disable
 recovery (fail on first idle)."""
 
+_DEFAULT_MAX_CUMULATIVE_INPUT_TOKENS: Final[int] = 80_000
+"""Cap on peak ``assistant.usage.input_tokens`` observed across a
+single ``invoke`` call. When exceeded, the dual-clock loop fails
+fast as ``RetryableFailure`` rather than letting the session run
+to wall-clock or idle-recovery exhaustion.
+
+Run #30 leaf 9 wedged for 44 minutes producing hallucinated
+``CoderOutput`` after accumulating 120K input tokens across three
+recovery prompts; the model blew past Copilot's own context window
+and started fabricating prose. A cap catches this class of runaway
+*before* it produces bad output, turning a 2648s timeout into a
+fail-fast retryable.
+
+The Copilot SDK emits ``assistant.usage`` events with cumulative-per-
+turn input_tokens (a turn's count includes prior history). We track
+the peak observed value, so the cap reflects the largest single-turn
+context the model was asked to process — the right proxy for
+\"how close are we to the context window?\"
+
+Calibration (CVAPI dogfood, June 2026):
+  * successful leaves:        10K-30K input_tokens
+  * run-#30 successful peak:   18K-22K
+  * run-#30 leaf-9 wedge:     120K
+  * 80K = 3-4× headroom over typical success; 50K under the
+    leaf-9 fail point; under sonnet-4.6's 936K context window.
+
+Set to ``None`` to disable the cap entirely (operator opt-out
+for tuning runs that legitimately need large contexts)."""
+
 _DEFAULT_RECOVERY_PROMPT: Final[str] = (
     "It appears your previous response stalled or did not complete. "
     "Please continue producing the structured response from where you "
@@ -211,6 +240,14 @@ class CopilotProvider:
     * ``recovery_prompt`` — template sent to the SDK session when
       the idle clock fires. Default is tuned for the requiem coder
       contract; override for other workflows.
+    * ``max_cumulative_input_tokens`` — cap on peak observed
+      ``assistant.usage.input_tokens`` for a single ``invoke`` call
+      (default 80_000). When exceeded, the dual-clock loop fails
+      fast as ``RetryableFailure`` rather than letting a wedged
+      session run to wall-clock exhaustion while accumulating
+      hallucinated output across recovery prompts (run #30 leaf 9
+      shape — 120K tokens, 44 minutes, ``bad_output``). Set to
+      ``None`` to disable the cap entirely.
     * ``reasoning_effort`` — passed through to ``create_session``
       verbatim. Honored only by reasoning-capable models (e.g.
       ``claude-sonnet-4.6`` accepts ``"low"`` / ``"medium"`` / ``"high"``
@@ -243,6 +280,7 @@ class CopilotProvider:
     idle_timeout_s: float = _DEFAULT_IDLE_TIMEOUT_S
     max_recovery_attempts: int = _DEFAULT_MAX_RECOVERY_ATTEMPTS
     recovery_prompt: str = _DEFAULT_RECOVERY_PROMPT
+    max_cumulative_input_tokens: int | None = _DEFAULT_MAX_CUMULATIVE_INPUT_TOKENS
     reasoning_effort: str | None = None
     reasoning_summary: str | None = None
     context_tier: str | None = None
@@ -474,10 +512,21 @@ class CopilotProvider:
                 # The final assembled assistant message — this is what we keep.
                 response_text = getattr(event.data, "content", "") or ""
             elif evt == "assistant.usage":
-                # Token accounting (floats sometimes; coerce).
+                # Token accounting (floats sometimes; coerce). The
+                # Copilot SDK emits cumulative-per-turn input_tokens
+                # (a turn's count includes prior conversation history),
+                # so each event's value is a snapshot of "how big is
+                # this session's context right now". We keep the PEAK
+                # observed value so the cumulative-input-token cap
+                # (`max_cumulative_input_tokens`) is robust against any
+                # future SDK change to per-turn-only counts: peak ==
+                # cumulative when counts are cumulative, peak <
+                # cumulative when counts are per-turn — both are safe
+                # under-estimates that fail the cap *later*, never
+                # *earlier* than a real runaway.
                 ein = getattr(event.data, "input_tokens", 0) or 0
                 eout = getattr(event.data, "output_tokens", 0) or 0
-                usage_in = int(ein)
+                usage_in = max(usage_in, int(ein))
                 usage_out = int(eout)
             elif evt == "session.idle":
                 done.set()
@@ -520,6 +569,27 @@ class CopilotProvider:
                         f"session exceeded max_session_seconds="
                         f"{self.max_session_seconds:.0f}s "
                         f"(last activity: {last_activity_event} "
+                        f"{time.monotonic() - last_activity_at:.0f}s ago)"
+                    )
+                # Cumulative input-token cap (run-#30 follow-up).
+                # When peak observed input_tokens exceeds the operator-
+                # supplied ceiling, fail fast: the model has accumulated
+                # so much history (e.g. across recovery prompts) that
+                # any further turn risks hallucinated bad_output. We
+                # use the same asyncio.TimeoutError path as the dual-
+                # clock failures so the existing `_on_timeout` receipt
+                # builder picks it up with the partial token counts
+                # intact (the operator needs to SEE how big the
+                # session got, not have it masked as zero).
+                cap = self.max_cumulative_input_tokens
+                if cap is not None and usage_in > cap:
+                    raise asyncio.TimeoutError(
+                        f"session input tokens "
+                        f"({usage_in}) exceeded "
+                        f"max_cumulative_input_tokens={cap} "
+                        f"(elapsed: {elapsed:.0f}s, "
+                        f"recovery_attempts: {recovery_attempts}, "
+                        f"last activity: {last_activity_event} "
                         f"{time.monotonic() - last_activity_at:.0f}s ago)"
                     )
                 try:

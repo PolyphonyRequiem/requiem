@@ -591,6 +591,68 @@ def build_verb_registry(
             inspected_artifacts=(f"git:{inputs.repo_path}:status",),
         )
 
+    # ---- cleanup_worktree (run-#30 leaf 9 follow-up) -----------------
+    #
+    # Defensive scrub run BEFORE the workflow terminates on any post-
+    # coder failure (bad_output, apply_changes permanent_failure,
+    # tests still red after revision, etc.). The shipped fix for the
+    # actual leaf-9 cascade is `excluded_tools=ToolSet().add_builtin("*")`
+    # in CopilotProvider (commit 67d8978 / 4e5ccf7 — see ADR-0030
+    # STATUS 2026-06-26); this verb is belt-and-suspenders against a
+    # future SDK regression that re-opens the tool surface.
+    #
+    # Routing: only failure edges that follow `invoke_coder` route
+    # here (see workflow builder). PRE-coder failures
+    # (`assert_clean_workspace`, `create_branch` probes) bypass
+    # cleanup — that dirt is human-owned and silently nuking it
+    # would destroy diagnostic state. POST-commit failures (push,
+    # create_pr) also bypass — the local branch is the operator's
+    # record of what was attempted.
+    #
+    # Contract: best-effort. Returns Success unconditionally even if
+    # the underlying git ops fail (no toolbelt.fs, detached HEAD,
+    # IO error). The cascading goal is "don't poison the NEXT leaf";
+    # if cleanup fails, the NEXT leaf's `assert_clean_workspace`
+    # will simply re-detect the dirt and route to its own end_failed.
+    # We must never block a terminal yield to wait for cleanup.
+
+    @verbs.register("cleanup_worktree")
+    async def _cleanup_worktree(ctx):
+        if inputs.dry_run:
+            return Success(value={
+                "cleaned": False,
+                "reason": "dry_run",
+                "dry_run": True,
+            })
+        fs = ctx.toolbelt.fs
+        if fs is None:
+            # No fs client — degrade to no-op so termination isn't blocked.
+            return Success(value={
+                "cleaned": False,
+                "reason": "no_fs_client",
+            })
+        excludes = [".requiem"]
+        try:
+            await fs.git_reset_hard()
+            await fs.git_clean_with_excludes(excludes=excludes)
+        except FsClientError as e:
+            # Best-effort: never block termination. The next leaf's
+            # `assert_clean_workspace` will surface the residual dirt
+            # with the right error_kind if needed.
+            return Success(value={
+                "cleaned": False,
+                "reason": "fs_error",
+                "error": str(e),
+                "excludes": excludes,
+            })
+        return Success(
+            value={
+                "cleaned": True,
+                "excludes": excludes,
+            },
+            inspected_artifacts=(f"git:{inputs.repo_path}:cleanup",),
+        )
+
     # ---- create_branch ------------------------------------------------
 
     @verbs.register("create_branch")
@@ -1194,30 +1256,50 @@ def build_workflow() -> Workflow:
                 .edge("commit_context_pack", on="permanent_failure", to="end_failed")
             .agent("invoke_coder", agent="coder", prompt_verb="coder_prompt")
                 .edge("invoke_coder", on="success", to="apply_changes")
-                .edge("invoke_coder", on="bad_output", to="end_needs_human")
-                .edge("invoke_coder", on="permanent_failure", to="end_failed")
+                # Post-coder failures route through cleanup_worktree so a
+                # misbehaving SDK that wrote files to the worktree (run-#30
+                # leaf 9 shape) can't cascade `workspace.dirty` into every
+                # subsequent sequential leaf. The cleanup verb is
+                # best-effort and always returns Success → the disposition
+                # is preserved by which cleanup node we route to.
+                .edge("invoke_coder", on="bad_output", to="cleanup_for_needs_human")
+                .edge("invoke_coder", on="permanent_failure", to="cleanup_for_failed")
             .script("apply_changes", verb="apply_changes")
                 .edge("apply_changes", on="success", to="run_tests")
-                .edge("apply_changes", on="permanent_failure:coder.no_changes", to="end_failed")
-                .edge("apply_changes", on="permanent_failure", to="end_needs_human")
+                .edge("apply_changes", on="permanent_failure:coder.no_changes", to="cleanup_for_failed")
+                .edge("apply_changes", on="permanent_failure", to="cleanup_for_needs_human")
             .script("run_tests", verb="run_tests")
                 .edge("run_tests", on="success", to="commit_changes")
                 .edge("run_tests", on="permanent_failure:tests.failed", to="invoke_coder_revision")
-                .edge("run_tests", on="permanent_failure", to="end_needs_human")
+                .edge("run_tests", on="permanent_failure", to="cleanup_for_needs_human")
             .agent(
                 "invoke_coder_revision",
                 agent="coder_revision",
                 prompt_verb="coder_revision_prompt",
             )
                 .edge("invoke_coder_revision", on="success", to="apply_changes_revision")
-                .edge("invoke_coder_revision", on="bad_output", to="end_needs_human")
-                .edge("invoke_coder_revision", on="permanent_failure", to="end_needs_human")
+                .edge("invoke_coder_revision", on="bad_output", to="cleanup_for_needs_human")
+                .edge("invoke_coder_revision", on="permanent_failure", to="cleanup_for_needs_human")
             .script("apply_changes_revision", verb="apply_changes_revision")
                 .edge("apply_changes_revision", on="success", to="run_tests_final")
-                .edge("apply_changes_revision", on="permanent_failure", to="end_needs_human")
+                .edge("apply_changes_revision", on="permanent_failure", to="cleanup_for_needs_human")
             .script("run_tests_final", verb="run_tests_final")
                 .edge("run_tests_final", on="success", to="commit_changes")
-                .edge("run_tests_final", on="permanent_failure", to="end_needs_human")
+                .edge("run_tests_final", on="permanent_failure", to="cleanup_for_needs_human")
+            # Cleanup intermediate nodes. Both run the same best-effort
+            # `cleanup_worktree` verb (git reset --hard + git clean -fd
+            # -e .requiem). Two nodes so the disposition is preserved
+            # by routing to the right terminal — the verb itself is
+            # disposition-agnostic.
+            .script("cleanup_for_needs_human", verb="cleanup_worktree")
+                .edge("cleanup_for_needs_human", on="success", to="end_needs_human")
+                # cleanup is best-effort and never returns permanent_failure
+                # in practice, but route the edge defensively so a future
+                # change can't break the workflow's topology validator.
+                .edge("cleanup_for_needs_human", on="permanent_failure", to="end_needs_human")
+            .script("cleanup_for_failed", verb="cleanup_worktree")
+                .edge("cleanup_for_failed", on="success", to="end_failed")
+                .edge("cleanup_for_failed", on="permanent_failure", to="end_failed")
             .script("commit_changes", verb="commit_changes")
                 .edge("commit_changes", on="success", to="push_branch")
                 .edge("commit_changes", on="permanent_failure", to="end_needs_human")
@@ -1258,6 +1340,8 @@ def build_workflow() -> Workflow:
                 "push_branch":             "Pushed feature branch",
                 "create_pr":               "Opened pull request",
                 "link_pr_to_item":         "Linked PR to work item",
+                "cleanup_for_needs_human": "Scrubbed worktree (pre-handoff)",
+                "cleanup_for_failed":      "Scrubbed worktree (pre-failure)",
                 "end_handoff":             "implementation",
                 "end_needs_human":         "implementation",
                 "end_failed":              "implementation",

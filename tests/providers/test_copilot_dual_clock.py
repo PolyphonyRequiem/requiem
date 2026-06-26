@@ -252,3 +252,176 @@ def test_bookkeeping_events_do_not_reset_idle_clock():
     assert outcome.__class__.__name__ == "RetryableFailure", (
         "idle clock must not be reset by bookkeeping events; got %r" % (outcome,)
     )
+
+
+# ---- run-#30 follow-up: cumulative input-token cap --------------------
+#
+# Leaf 9 racked up 120K input tokens across multiple recovery prompts
+# before its 44-minute wedge produced hallucinated output. Each
+# `session.send(recovery_prompt)` appends to the session history;
+# without a cap, a wedged leaf can blow past Copilot's own context
+# window and emit bad_output rather than terminate cleanly. The cap
+# is a fail-fast path that turns the runaway into a clean retryable
+# failure before the model hallucinates.
+
+
+def test_cumulative_input_token_cap_default_value_pinned():
+    """80K is calibrated: successful CVAPI dogfood leaves use 10-30K,
+    leaf-9 runaway hit 120K. 80K cleanly separates the cases.
+    Bump only with the operator's explicit say-so."""
+    from requiem.providers.copilot import _DEFAULT_MAX_CUMULATIVE_INPUT_TOKENS
+    assert _DEFAULT_MAX_CUMULATIVE_INPUT_TOKENS == 80_000
+
+
+def test_cumulative_input_token_cap_fires_retryable_failure():
+    """When peak observed input_tokens exceeds
+    max_cumulative_input_tokens, the loop terminates as
+    RetryableFailure (so the kernel routes via the same code path as
+    `network_timeout` / idle-exhausted — the verb's outcome edges
+    handle it cleanly)."""
+    from requiem.providers.copilot import CopilotProvider, DEFAULT_COPILOT_MODEL
+
+    async def _send_handler(session, _prompt):
+        async def _stream():
+            class _UsageEv:
+                type = "assistant.usage"
+
+                class data:
+                    input_tokens = 0  # rewritten per-emit below
+                    output_tokens = 5
+
+            # Three usage emits with monotonically-growing input_tokens —
+            # mirrors the Copilot SDK's cumulative-per-turn shape on a
+            # session that keeps receiving recovery prompts.
+            for value in (30_000, 60_000, 120_000):
+                _UsageEv.data.input_tokens = value
+                await asyncio.sleep(0.01)
+                if session._cb:
+                    session._cb(_UsageEv())
+            # Note: we never emit session.idle — the cap, not the
+            # idle clock or wall-clock, must be the trigger.
+        asyncio.create_task(_stream())
+
+    provider = CopilotProvider(
+        model=DEFAULT_COPILOT_MODEL,
+        client=_make_stub_client(_send_handler),
+        # Wide-open dual-clock so we can isolate the cap as the cause.
+        idle_timeout_s=10.0,
+        max_session_seconds=30.0,
+        max_recovery_attempts=0,
+        max_cumulative_input_tokens=80_000,
+    )
+    spec = AgentSpec(name="t", charter="c", response_model=_ToyResponse, model=DEFAULT_COPILOT_MODEL)
+    call = AgentCall(spec=spec, user_message="hi")
+
+    outcome = asyncio.run(provider.invoke(call))
+    assert outcome.__class__.__name__ == "RetryableFailure", (
+        "expected RetryableFailure when cumulative input tokens exceeded "
+        "the cap, got %r" % (outcome,)
+    )
+    rcpt = (outcome.receipts or [{}])[0]
+    # Receipt must reflect the partial input_tokens we observed — not
+    # zero. The operator needs to see how big the session actually got.
+    assert rcpt.get("input_tokens", 0) >= 120_000, (
+        "receipt should report the peak input_tokens we observed "
+        f"(>=120000), got {rcpt.get('input_tokens')!r}"
+    )
+
+
+def test_cumulative_input_token_cap_silent_when_well_under_limit():
+    """Successful leaves emit usage events with input_tokens far below
+    the cap. They must complete normally — the cap MUST NOT fire on
+    a healthy session."""
+    from requiem.providers.copilot import CopilotProvider, DEFAULT_COPILOT_MODEL
+
+    async def _send_handler(session, _prompt):
+        async def _stream():
+            class _UsageEv:
+                type = "assistant.usage"
+
+                class data:
+                    input_tokens = 25_000  # one successful turn
+                    output_tokens = 500
+
+            class _MsgEv:
+                type = "assistant.message"
+
+                class data:
+                    content = '{"x": 42}'
+
+            class _IdleEv:
+                type = "session.idle"
+                data = None
+
+            await asyncio.sleep(0.01)
+            if session._cb:
+                session._cb(_UsageEv())
+                session._cb(_MsgEv())
+                session._cb(_IdleEv())
+        asyncio.create_task(_stream())
+
+    provider = CopilotProvider(
+        model=DEFAULT_COPILOT_MODEL,
+        client=_make_stub_client(_send_handler),
+        idle_timeout_s=2.0,
+        max_session_seconds=5.0,
+        max_recovery_attempts=0,
+        max_cumulative_input_tokens=80_000,
+    )
+    spec = AgentSpec(name="t", charter="c", response_model=_ToyResponse, model=DEFAULT_COPILOT_MODEL)
+    call = AgentCall(spec=spec, user_message="hi")
+
+    outcome = asyncio.run(provider.invoke(call))
+    # Should NOT be RetryableFailure — under-cap session succeeds normally.
+    assert outcome.__class__.__name__ != "RetryableFailure", (
+        "cap must not fire on under-limit session; got %r" % (outcome,)
+    )
+
+
+def test_cumulative_input_token_cap_none_disables_check():
+    """max_cumulative_input_tokens=None disables the cap entirely.
+    Useful for non-production tuning runs that legitimately need
+    large contexts (e.g. exploring how far a model degrades)."""
+    from requiem.providers.copilot import CopilotProvider, DEFAULT_COPILOT_MODEL
+
+    async def _send_handler(session, _prompt):
+        async def _stream():
+            class _UsageEv:
+                type = "assistant.usage"
+
+                class data:
+                    input_tokens = 500_000  # WAY over any sane cap
+                    output_tokens = 0
+
+            class _MsgEv:
+                type = "assistant.message"
+
+                class data:
+                    content = '{"x": 7}'
+
+            class _IdleEv:
+                type = "session.idle"
+                data = None
+
+            await asyncio.sleep(0.01)
+            if session._cb:
+                session._cb(_UsageEv())
+                session._cb(_MsgEv())
+                session._cb(_IdleEv())
+        asyncio.create_task(_stream())
+
+    provider = CopilotProvider(
+        model=DEFAULT_COPILOT_MODEL,
+        client=_make_stub_client(_send_handler),
+        idle_timeout_s=2.0,
+        max_session_seconds=5.0,
+        max_recovery_attempts=0,
+        max_cumulative_input_tokens=None,
+    )
+    spec = AgentSpec(name="t", charter="c", response_model=_ToyResponse, model=DEFAULT_COPILOT_MODEL)
+    call = AgentCall(spec=spec, user_message="hi")
+
+    outcome = asyncio.run(provider.invoke(call))
+    assert outcome.__class__.__name__ != "RetryableFailure", (
+        "max_cumulative_input_tokens=None must disable the cap; got %r" % (outcome,)
+    )
