@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import time
 from dataclasses import dataclass, field
@@ -721,9 +722,21 @@ def _extract_json_block(text: str) -> str:
     if not s:
         return s
 
-    # (1) Already-JSON whole text.
+    # (1) Already-JSON whole text. We TRY the parse first — if it
+    # succeeds we keep the original behavior of returning the whole
+    # text verbatim. If it fails (most commonly: valid JSON followed
+    # by trailing prose, the run-#31 leaf-12 shape where sonnet-4.6
+    # emitted CoderOutput JSON then `<function_calls>` XML trying to
+    # call now-blocked tools), we fall through to the balanced
+    # extractor in (3) which slices through the first matching close
+    # brace and ignores the trailing prose. (2)'s fenced extraction
+    # has no fence to find here, so it's a no-op cost.
     if s.startswith("{") or s.startswith("["):
-        return s
+        try:
+            json.loads(s)
+            return s
+        except json.JSONDecodeError:
+            pass  # Fall through to balanced extractor below.
 
     # (2) Fenced block anywhere in the response.
     fenced = _extract_fenced_json(s)
@@ -867,6 +880,26 @@ def _build_prompt(
                 "",
                 "Schema:",
                 _stringify_schema(schema_json),
+                # Run-#31 follow-up. With `excluded_tools=builtin:*`
+                # sealing the SDK tool surface (commit 4e5ccf7),
+                # sonnet-4.6 has NO tools to call but sometimes still
+                # tries — emitting Anthropic-native `<function_calls>`
+                # XML AFTER the JSON, which contaminates the response
+                # and breaks `json.loads` with "Extra data". This
+                # directive tells the model the tools don't exist so
+                # it doesn't waste output tokens (or contaminate the
+                # response) attempting calls. Placed at the TAIL so
+                # it's the model's most-recent constraint (same
+                # rationale as the schema instruction tail-placement
+                # from run #25, commit 551b414).
+                "",
+                "IMPORTANT: You have NO tools available in this session — no "
+                "function_calls, no tool_call blocks, no apply_patch, no "
+                "shell, no file I/O. Any work must be encoded as `file_changes` "
+                "in the CoderOutput JSON itself. Do NOT emit `<function_calls>`, "
+                "`<invoke>`, or any other tool-call syntax — there is nothing "
+                "to receive it, and any text after the JSON object will fail "
+                "to parse.",
             ]
         )
     return "\n".join(parts)
