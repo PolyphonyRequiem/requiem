@@ -867,6 +867,32 @@ def test_session_uses_isolated_tool_preset():
             f"model write the host worktree mid-session"
         )
 
+    # Run #30 leaf 9 follow-up: also pin excluded_tools=ToolSet(builtin:*).
+    # available_tools is insufficient alone because the SDK forces
+    # `toolFilterPrecedence: "excluded"` — see SDK client.py around
+    # lines 1802/2369 — which makes available_tools a weak hint rather
+    # than an authoritative whitelist. Without an excluded_tools cap,
+    # the model could call powershell/apply_patch/task/view/create
+    # despite none of them appearing in BUILTIN_TOOLS_ISOLATED.
+    assert "excluded_tools" in recorded, (
+        "CopilotProvider.create_session must ALSO pass excluded_tools — "
+        "without it the SDK's forced 'excluded'-precedence policy lets "
+        "the model call powershell/apply_patch/task even though they "
+        "aren't in available_tools (run-#30 leaf 9: 30 .cs files "
+        "written to the worktree via powershell despite "
+        "available_tools=BUILTIN_TOOLS_ISOLATED)."
+    )
+    excluded = recorded["excluded_tools"]
+    # The shape must be a ToolSet with builtin:* — the most aggressive
+    # cap available. The coder agent never needs an SDK-side tool —
+    # its CoderOutput JSON IS the work product; apply_changes (a
+    # requiem verb, not an SDK tool) does the file writes.
+    excluded_list = excluded.to_list() if hasattr(excluded, "to_list") else list(excluded)
+    assert "builtin:*" in excluded_list, (
+        f"excluded_tools must cap ALL builtin tools via 'builtin:*'; "
+        f"got {excluded_list!r}"
+    )
+
 
 # ---- model bump + reasoning knobs (run-#27 follow-up) -----------------
 
