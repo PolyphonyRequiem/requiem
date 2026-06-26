@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import time
 from dataclasses import dataclass, field
@@ -721,9 +722,21 @@ def _extract_json_block(text: str) -> str:
     if not s:
         return s
 
-    # (1) Already-JSON whole text.
+    # (1) Already-JSON whole text. We TRY the parse first — if it
+    # succeeds we keep the original behavior of returning the whole
+    # text verbatim. If it fails (most commonly: valid JSON followed
+    # by trailing prose, the run-#31 leaf-12 shape where sonnet-4.6
+    # emitted CoderOutput JSON then `<function_calls>` XML trying to
+    # call now-blocked tools), we fall through to the balanced
+    # extractor in (3) which slices through the first matching close
+    # brace and ignores the trailing prose. (2)'s fenced extraction
+    # has no fence to find here, so it's a no-op cost.
     if s.startswith("{") or s.startswith("["):
-        return s
+        try:
+            json.loads(s)
+            return s
+        except json.JSONDecodeError:
+            pass  # Fall through to balanced extractor below.
 
     # (2) Fenced block anywhere in the response.
     fenced = _extract_fenced_json(s)

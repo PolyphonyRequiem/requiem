@@ -581,6 +581,62 @@ def test_extract_json_block_empty_input():
     assert _extract_json_block("   ") == ""
 
 
+# ---- run-#31 follow-up: trailing-prose-after-JSON ---------------------
+#
+# When `excluded_tools=builtin:*` seals the SDK tool surface (run-#30
+# leaf-9 fix, commit 4e5ccf7), sonnet-4.6 sometimes emits a valid
+# CoderOutput followed by Anthropic native function-call XML (`<function_calls>...`)
+# as it tries to call tools that no longer exist. The text starts with
+# `{` so step (1) of _extract_json_block returns it whole; json.loads
+# then chokes with "Extra data". This was 7/7 of run #31's bad_output
+# leaves. Fix: when whole-text passthrough would fail to parse, fall
+# through to step (3) which uses brace-balanced extraction and returns
+# the first complete JSON object, ignoring the trailing prose.
+
+
+def test_extract_json_block_falls_through_when_whole_text_has_trailing_prose():
+    """The actual leaf-62879412 raw_output shape: valid CoderOutput
+    JSON followed by `\\n\\nLet me explore the codebase first.\\n\\n<function_calls>...`"""
+    raw = (
+        '{"intent_summary":"Exploring repo structure before implementing",'
+        '"file_changes":[],"notes":"Exploring first"}\n\n'
+        'Let me explore the codebase first.\n\n'
+        '<function_calls>\n<invoke name="glob">\n<parameter name="pattern">**/*</parameter>\n</invoke>\n</function_calls>'
+    )
+    out = _extract_json_block(raw)
+    # Must return ONLY the first balanced JSON object, not the whole text.
+    assert out == (
+        '{"intent_summary":"Exploring repo structure before implementing",'
+        '"file_changes":[],"notes":"Exploring first"}'
+    ), (
+        f"expected balanced JSON extraction; got prose-contaminated text "
+        f"starting with: {out[:80]!r}"
+    )
+
+
+def test_extract_json_block_falls_through_when_whole_text_has_trailing_garbage():
+    """Smaller version: any non-whitespace trailing after the balanced
+    close-brace breaks json.loads. Pre-fix step (1) returned this
+    whole; post-fix step (3) returns the slice through the first }."""
+    raw = '{"x": 1} trailing garbage that breaks json.loads'
+    assert _extract_json_block(raw) == '{"x": 1}'
+
+
+def test_extract_json_block_passthrough_still_works_when_whole_text_IS_valid():
+    """Don't regress the original step (1) behavior: when the WHOLE
+    trimmed text is valid JSON, we keep returning it verbatim (no
+    need to invoke the balanced extractor). Validates the
+    try-parse-then-fall-through wiring is conditional, not always-on."""
+    s = '{"a": 1, "b": [2, 3], "c": {"nested": true}}'
+    assert _extract_json_block(s) == s
+
+
+def test_extract_json_block_falls_through_for_array_with_trailing_prose():
+    """Symmetric to the object case — arrays as the leading payload."""
+    raw = '[1, 2, 3]\n\nNow let me explore the rest of the codebase.'
+    assert _extract_json_block(raw) == '[1, 2, 3]'
+
+
 def test_extract_fenced_json_finds_mid_response_fence():
     """The killer case: prose preamble, then ```json {...} ```, then
     optional trailing prose."""
