@@ -385,12 +385,43 @@ class CopilotProvider:
         # defaults — keeps the wire shape clean and makes the test
         # stub's recorded-kwargs intent unambiguous (only what the
         # caller actually requested shows up).
+        # Run #30 leaf 9 revealed that BUILTIN_TOOLS_ISOLATED alone is
+        # INSUFFICIENT. Even with available_tools set to the "isolated"
+        # builtin preset, the SDK's `toolFilterPrecedence: "excluded"`
+        # (always set by the SDK — see client.py around lines 1802/2369)
+        # means available_tools acts as a weak hint, not an authoritative
+        # whitelist. The model can still call dangerous builtins like
+        # `powershell`/`bash`/`apply_patch`/`task` if they aren't in the
+        # excluded list.
+        #
+        # Repro (June 26): a thin prompt asking the model to write a file
+        # caused these tool calls under all four tested configurations:
+        #   available_tools=[ask_user,…,skill]            → calls powershell,task,create
+        #   available_tools=ToolSet().add_builtin(…)      → calls powershell,apply_patch,view
+        #   available_tools=[…] + excluded=[bash,…,task]  → blocked (skill only)
+        #   excluded_tools=ToolSet().add_builtin("*")     → blocked all
+        #
+        # Production proof: run #30 leaf 9 wrote 30 .cs files to the
+        # worktree during a 44-min recovery-prompt loop despite our
+        # `available_tools=BUILTIN_TOOLS_ISOLATED` setting — the model
+        # used `powershell` and `task` tools that aren't in that list.
+        #
+        # Fix: pass excluded_tools with a wildcard against ALL builtins
+        # (`ToolSet().add_builtin("*")`). The requiem coder agent doesn't
+        # need any builtin tools — the JSON CoderOutput it returns IS the
+        # work product; apply_changes (a requiem verb, not an SDK tool)
+        # handles the file writes. Keeping available_tools=
+        # BUILTIN_TOOLS_ISOLATED as belt-and-braces in case the SDK ever
+        # changes precedence semantics.
+        from copilot import ToolSet
+        excluded = ToolSet().add_builtin("*")
         session_kwargs: dict[str, Any] = {
             "on_permission_request": _allow_all_permissions,
             "working_directory": self.working_directory or os.getcwd(),
             "streaming": True,
             "model": model,
             "available_tools": list(BUILTIN_TOOLS_ISOLATED),
+            "excluded_tools": excluded,
         }
         # Per-call provider-specific knobs from AgentCall.model_options
         # take precedence over the provider's constructor defaults so
