@@ -302,6 +302,45 @@ class FilesystemClient:
         """Switch HEAD to existing branch ``name``."""
         await self._git("checkout", name)
 
+    async def git_reset_hard(self, ref: str = "HEAD") -> None:
+        """Discard all tracked-file modifications, reverting to ``ref``.
+
+        Equivalent to ``git reset --hard <ref>``. Tracked files are
+        restored to ``ref``'s tree; the index is reset; **untracked
+        files are NOT touched** (use :meth:`git_clean_with_excludes`
+        to remove those).
+
+        Default ``ref="HEAD"`` is the dogfood path: \"throw away
+        everything since the last commit on this branch.\" The pair of
+        ``reset_hard`` + ``clean_with_excludes(['.requiem'])`` is what
+        the implementation workflow uses to scrub a worktree polluted
+        by a misbehaving coder agent (run-#30 leaf 9) before yielding
+        to its terminal state — so subsequent sequential leaves see a
+        clean tree at ``assert_clean_workspace`` instead of cascading
+        ``permanent_failure:workspace.dirty``.
+        """
+        await self._git("reset", "--hard", ref)
+
+    async def git_clean_with_excludes(self, *, excludes: list[str]) -> None:
+        """Delete untracked files and directories, preserving paths in ``excludes``.
+
+        Equivalent to ``git clean -fd -e <ex1> -e <ex2> ...``. Each
+        ``excludes`` entry is a gitignore-style pattern passed via
+        ``-e`` — matching paths survive the clean. The implementation
+        workflow uses ``excludes=['.requiem']`` so framework-owned
+        bookkeeping (the curated context pack, ``.plan.tree.json``)
+        is not destroyed alongside coder slop.
+
+        Pass an empty list to remove every untracked path
+        unconditionally. This method does NOT touch tracked-file
+        modifications — pair with :meth:`git_reset_hard` for the full
+        scrub.
+        """
+        argv: list[str] = ["clean", "-fd"]
+        for pattern in excludes:
+            argv.extend(["-e", pattern])
+        await self._git(*argv)
+
     async def git_worktree_add(
         self, path: Path, *, branch: str, from_ref: str
     ) -> None:

@@ -494,6 +494,179 @@ async def test_bad_output_routes_to_handoff_no_retry(repo_path: Path, tmp_path: 
     assert len(provider.calls) == 1
 
 
+# ---- run-#30 follow-up: defensive worktree cleanup on coder failure --
+#
+# Leaf 9 of run #30 wrote 30 .cs files to the worktree during a
+# 44-minute recovery-prompt loop (the SDK tool-isolation gap was the
+# root cause — the actual fix is on copilot.py — but a future SDK
+# regression could re-open that surface). The implementation workflow
+# defensively scrubs the worktree on any post-coder failure so a
+# single bad leaf can't poison every subsequent sequential leaf via
+# cascading ``permanent_failure:workspace.dirty`` in
+# ``assert_clean_workspace``.
+
+
+async def test_bad_output_scrubs_polluted_worktree_before_terminating(
+    repo_path: Path, tmp_path: Path,
+) -> None:
+    """The classic leaf-9 shape: the coder agent writes junk to the
+    worktree out-of-band, then returns BadOutput. The workflow must
+    leave the worktree clean (no untracked junk, no tracked diffs)
+    on the way to ``end_needs_human`` — otherwise the next sequential
+    leaf bails at ``assert_clean_workspace``.
+    """
+    from requiem.agent import AgentCall
+    from requiem.outcomes import Outcome
+
+    # The original leaf-9 SDK leak: the coder \"agent\" creates files
+    # in the worktree (mimicking the SDK's powershell/apply_patch
+    # invocations) and only then returns BadOutput.
+    junk_paths: list[Path] = []
+
+    class _PollutingProvider:
+        calls: list[dict[str, Any]] = []
+        async def invoke(self, call: AgentCall) -> Outcome:
+            self.calls.append({"agent": call.spec.name})
+            # Plant the same kind of mess leaf 9 produced:
+            #   * tracked-file modification (mutate README.md — a tracked file in this fixture)
+            #   * untracked specs/ dir with a junk file
+            #   * untracked top-level .cs orphan
+            (repo_path / "README.md").write_text(
+                "# polluted by leaf-9-style leak\n", encoding="utf-8",
+            )
+            (repo_path / "specs").mkdir(exist_ok=True)
+            junk1 = repo_path / "specs" / "leaked-spec.md"
+            junk1.write_text("# leaked\n", encoding="utf-8")
+            junk_paths.append(junk1)
+            junk2 = repo_path / "OrphanedClass.cs"
+            junk2.write_text("// orphan\n", encoding="utf-8")
+            junk_paths.append(junk2)
+            return BadOutput(
+                error_kind="schema_mismatch",
+                validation_errors=("simulating leaf-9 hallucinated output",),
+                raw_output="prose, not JSON",
+            )
+
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh()
+    provider = _PollutingProvider()
+    engine = _make_engine(
+        repo_path, tmp_path / "logs",
+        provider=provider, twig=twig, gh=gh,
+        test_runner=_passing_runner,
+    )
+    result = await engine.run("leaf9-repro")
+
+    # Routing pin: surrender to human, as before the fix.
+    assert isinstance(result, Completed)
+    assert result.final_node == "end_needs_human"
+    assert result.disposition == "needs_human"
+
+    # The load-bearing assertion: the worktree must be clean now.
+    # No junk file should survive (cleanup also removed the specs/ dir).
+    assert not (repo_path / "OrphanedClass.cs").exists(), (
+        "untracked .cs orphan from polluting coder must be removed by cleanup"
+    )
+    assert not (repo_path / "specs").exists(), (
+        "untracked specs/ dir from polluting coder must be removed by cleanup"
+    )
+    # And the tracked file must be reverted to HEAD.
+    assert (repo_path / "README.md").read_text(encoding="utf-8") == "# repo\n", (
+        "modified tracked file must be reset to HEAD by cleanup"
+    )
+
+
+async def test_cleanup_preserves_requiem_internal_bookkeeping(
+    repo_path: Path, tmp_path: Path,
+) -> None:
+    """`.requiem/` is framework-owned bookkeeping (context pack,
+    plan.tree.json). Cleanup must preserve it — otherwise resume on
+    the same leaf branch can't find its own state.
+    """
+    from requiem.agent import AgentCall
+    from requiem.outcomes import Outcome
+
+    class _PollutingProvider:
+        calls: list[dict[str, Any]] = []
+        async def invoke(self, call: AgentCall) -> Outcome:
+            self.calls.append({"agent": call.spec.name})
+            # Plant `.requiem/` framework bookkeeping AND coder junk.
+            req_dir = repo_path / ".requiem"
+            req_dir.mkdir(exist_ok=True)
+            (req_dir / "AGENTS.md").write_text(
+                "# curated context\nimportant framework state\n",
+                encoding="utf-8",
+            )
+            (repo_path / "coder_junk.txt").write_text(
+                "to be deleted\n", encoding="utf-8",
+            )
+            return BadOutput(
+                error_kind="schema_mismatch",
+                validation_errors=("test",),
+                raw_output="",
+            )
+
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh()
+    provider = _PollutingProvider()
+    engine = _make_engine(
+        repo_path, tmp_path / "logs",
+        provider=provider, twig=twig, gh=gh,
+        test_runner=_passing_runner,
+    )
+    result = await engine.run("preserve-requiem")
+    assert isinstance(result, Completed)
+    assert result.disposition == "needs_human"
+
+    # Coder junk must be removed.
+    assert not (repo_path / "coder_junk.txt").exists()
+    # `.requiem/` framework bookkeeping MUST survive.
+    assert (repo_path / ".requiem" / "AGENTS.md").exists(), (
+        ".requiem/ is framework-owned — cleanup must NOT delete it"
+    )
+    assert (repo_path / ".requiem" / "AGENTS.md").read_text(
+        encoding="utf-8"
+    ) == "# curated context\nimportant framework state\n"
+
+
+async def test_cleanup_does_not_run_when_pre_coder_workspace_is_dirty(
+    repo_path: Path, tmp_path: Path,
+) -> None:
+    """Pre-coder failure modes (``assert_clean_workspace`` finds the
+    workspace dirty BEFORE the coder runs) must NOT route through the
+    cleanup verb. That dirt is human-owned (or a stash from a prior
+    session) and silently nuking it would destroy diagnostic state.
+    """
+    # Pollute the workspace BEFORE the workflow runs.
+    pre_existing_junk = repo_path / "user_authored_wip.md"
+    pre_existing_junk.write_text(
+        "# precious WIP the human is working on\n", encoding="utf-8",
+    )
+
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh()
+    provider = FakeProvider(scripts={"coder": [], "coder_revision": []})
+    engine = _make_engine(
+        repo_path, tmp_path / "logs",
+        provider=provider, twig=twig, gh=gh,
+        test_runner=_passing_runner,
+    )
+    result = await engine.run("dirty-pre-coder")
+
+    # `assert_clean_workspace` returns permanent_failure:workspace.dirty
+    # which still routes to `end_failed` (NOT through cleanup). The
+    # human's WIP is preserved.
+    assert isinstance(result, Completed)
+    assert result.final_node == "end_failed"
+    assert result.disposition == "failed"
+    assert pre_existing_junk.exists(), (
+        "pre-coder dirt is human-owned; cleanup must NOT remove it"
+    )
+    assert pre_existing_junk.read_text(encoding="utf-8") == (
+        "# precious WIP the human is working on\n"
+    )
+
+
 # ---- tests fail first, revision fixes ----
 
 
