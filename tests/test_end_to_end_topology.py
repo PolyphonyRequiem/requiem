@@ -60,10 +60,12 @@ class _Calls:
         self.executor = 0
         self.trunk = 0
         self.leaf_pr = 0
+        self.leaf_lifecycle = 0
         self.feature_pr = 0
         self.order: list[str] = []
         self.trunk_inputs = None
         self.leaf_pr_inputs = None
+        self.leaf_lifecycle_inputs: list[object] = []
         self.feature_pr_inputs = None
 
 
@@ -77,9 +79,13 @@ def _topology_factories(
     trunk_created: bool = True,
     leaf_pr_final: str = "end_success",
     leaf_pr_numbers: dict[str, int] | None = None,
+    leaf_lifecycle_states: dict[str, str] | None = None,
 ):
     """Stub factories for all five engines, recording call order + inputs."""
     leaf_pr_numbers = leaf_pr_numbers or {lid: 9000 + i for i, lid in enumerate(exec_leaf_ids)}
+    leaf_lifecycle_states = leaf_lifecycle_states or {
+        lid: "merged" for lid in exec_leaf_ids
+    }
 
     def planning_factory(log_dir, *, item_id=item_id, twig=None, provider=None,
                          gate_handler=None, process_config=None):
@@ -178,8 +184,54 @@ def _topology_factories(
                 return Completed(run_id, disp, leaf_pr_final, {})
         return _E()
 
+    def leaf_lifecycle_factory(log_dir, *, inputs=None, toolbelt=None, provider=None,
+                               gate_handler=None):
+        calls.leaf_lifecycle += 1
+        calls.order.append(f"leaf_lifecycle:{inputs.leaf_id}")
+        calls.leaf_lifecycle_inputs.append(inputs)
+        state = leaf_lifecycle_states[inputs.leaf_id]
+
+        class _E:
+            async def run(self, run_id):
+                events = [
+                    ("fetch_pr", {"kind": "success", "value": {
+                        "number": inputs.pr_number,
+                        "head": f"impl/{inputs.root_item_id}-{inputs.leaf_id}",
+                        "base": f"feature/{inputs.root_item_id}",
+                        "state": "open",
+                        "merged": False,
+                    }}),
+                ]
+                if state == "merged":
+                    events.append(("merge_pr", {"kind": "success", "value": {
+                        "merged": True,
+                        "merge_sha": f"merge-{inputs.leaf_id}",
+                        "strategy": "squash",
+                    }}))
+                    final = "end_merged"
+                    disp = "completed"
+                elif state == "already_merged":
+                    events.append(("check_initial_state", {
+                        "kind": "permanent_failure",
+                        "error_kind": "already_merged",
+                        "message": "already merged",
+                    }))
+                    final = "end_already_merged"
+                    disp = "completed"
+                else:
+                    events.append(("check_tests_passed", {
+                        "kind": "permanent_failure",
+                        "error_kind": f"needs_human.{state}",
+                        "message": state,
+                    }))
+                    final = "needs_human_end"
+                    disp = "failed"
+                _write_log(log_dir, run_id, events)
+                return Completed(run_id, disp, final, {})
+        return _E()
+
     return (planning_factory, commit_factory, executor_factory,
-            trunk_factory, leaf_pr_factory)
+            trunk_factory, leaf_pr_factory, leaf_lifecycle_factory)
 
 
 # ---- the github_repo gate: legacy path is untouched ------------------------
@@ -188,11 +240,11 @@ def _topology_factories(
 async def test_no_github_repo_skips_topology_entirely(tmp_path):
     """Without github_repo the driver behaves exactly as the legacy pipeline."""
     calls = _Calls()
-    pf, cf, ef, tf, lf = _topology_factories(calls)
+    pf, cf, ef, tf, lf, llf = _topology_factories(calls)
     result = await run_pipeline(
         700, log_dir=tmp_path, board="requiem-700", assignee="w", live=True,
         planning_factory=pf, commit_factory=cf, executor_factory=ef,
-        trunk_bootstrap_factory=tf, leaf_pr_factory=lf,
+        trunk_bootstrap_factory=tf, leaf_pr_factory=lf, leaf_lifecycle_factory=llf,
     )
     assert result.status == "delivered"
     # No topology engine ran; no github fields populated.
@@ -209,21 +261,25 @@ async def test_no_github_repo_skips_topology_entirely(tmp_path):
 
 async def test_topology_runs_in_correct_order(tmp_path):
     calls = _Calls()
-    pf, cf, ef, tf, lf = _topology_factories(
+    pf, cf, ef, tf, lf, llf = _topology_factories(
         calls, exec_leaf_ids=("700",))
     result = await run_pipeline(
         700, log_dir=tmp_path, board="requiem-700", assignee="w", live=True,
         github_repo="Owner/Repo", base_branch="main",
         planning_factory=pf, commit_factory=cf, executor_factory=ef,
-        trunk_bootstrap_factory=tf, leaf_pr_factory=lf,
+        trunk_bootstrap_factory=tf, leaf_pr_factory=lf, leaf_lifecycle_factory=llf,
     )
     assert result.status == "delivered"
-    # trunk_bootstrap strictly before executor; leaf_pr strictly after.
-    assert calls.order == ["planning", "trunk_bootstrap", "executor", "leaf_pr"]
+    # trunk_bootstrap strictly before executor; leaf_pr strictly after; the
+    # new self-merge phase runs serially after leaf_pr.
+    assert calls.order == [
+        "planning", "trunk_bootstrap", "executor", "leaf_pr", "leaf_lifecycle:700"
+    ]
     assert result.github_repo == "Owner/Repo"
     assert result.trunk_branch == "feature/700"
     assert result.trunk_verdict == "created"
     assert result.leaf_pr_verdict == "opened"
+    assert result.leaf_lifecycle_verdict == "merged"
 
 
 # ---- the persisted leaf-PR map (briefing's explicit requirement) -----------
@@ -231,14 +287,14 @@ async def test_topology_runs_in_correct_order(tmp_path):
 
 async def test_leaf_pr_map_is_persisted_and_rehydratable(tmp_path):
     calls = _Calls()
-    pf, cf, ef, tf, lf = _topology_factories(
+    pf, cf, ef, tf, lf, llf = _topology_factories(
         calls, exec_leaf_ids=("700", "701"),
         leaf_pr_numbers={"700": 11, "701": 12})
     result = await run_pipeline(
         700, log_dir=tmp_path, board="requiem-700", assignee="w", live=True,
         github_repo="Owner/Repo", base_branch="main",
         planning_factory=pf, commit_factory=cf, executor_factory=ef,
-        trunk_bootstrap_factory=tf, leaf_pr_factory=lf,
+        trunk_bootstrap_factory=tf, leaf_pr_factory=lf, leaf_lifecycle_factory=llf,
     )
     assert result.leaf_pr_map == (("700", 11), ("701", 12))
     # The map is persisted to disk...
@@ -255,13 +311,13 @@ async def test_leaf_pr_map_is_persisted_and_rehydratable(tmp_path):
 
 async def test_dry_run_threads_to_every_topology_step(tmp_path):
     calls = _Calls()
-    pf, cf, ef, tf, lf = _topology_factories(
+    pf, cf, ef, tf, lf, llf = _topology_factories(
         calls, exec_leaf_ids=("700",), trunk_created=False)
     result = await run_pipeline(
         700, log_dir=tmp_path, board="requiem-700", assignee="w", live=False,
         github_repo="Owner/Repo", base_branch="main",
         planning_factory=pf, commit_factory=cf, executor_factory=ef,
-        trunk_bootstrap_factory=tf, leaf_pr_factory=lf,
+        trunk_bootstrap_factory=tf, leaf_pr_factory=lf, leaf_lifecycle_factory=llf,
     )
     # live=False ⇒ dry_run=True on every topology engine's inputs.
     assert calls.trunk_inputs.dry_run is True
@@ -271,18 +327,61 @@ async def test_dry_run_threads_to_every_topology_step(tmp_path):
     assert result.leaf_pr_map == (("700", None),)
 
 
+async def test_leaf_lifecycle_runs_after_leaf_pr_and_stops_on_first_blocker(tmp_path):
+    calls = _Calls()
+    pf, cf, ef, tf, lf, llf = _topology_factories(
+        calls,
+        exec_leaf_ids=("700", "701", "702"),
+        leaf_pr_numbers={"700": 11, "701": 12, "702": 13},
+        leaf_lifecycle_states={"700": "merged", "701": "tests_not_passed", "702": "merged"},
+    )
+    result = await run_pipeline(
+        700, log_dir=tmp_path, board="requiem-700", assignee="w", live=True,
+        github_repo="Owner/Repo", base_branch="main",
+        planning_factory=pf, commit_factory=cf, executor_factory=ef,
+        trunk_bootstrap_factory=tf, leaf_pr_factory=lf, leaf_lifecycle_factory=llf,
+    )
+    assert result.stage == "leaf_lifecycle"
+    assert result.status == "paused"
+    assert calls.order == [
+        "planning",
+        "trunk_bootstrap",
+        "executor",
+        "leaf_pr",
+        "leaf_lifecycle:700",
+        "leaf_lifecycle:701",
+    ]
+    assert [inp.leaf_id for inp in calls.leaf_lifecycle_inputs] == ["700", "701"]
+    assert result.leaf_lifecycle_verdict == "needs_human"
+    assert result.leaf_lifecycle_results == (("700", "merged"), ("701", "needs_human"))
+
+
+async def test_leaf_lifecycle_noops_cleanly_when_not_live(tmp_path):
+    calls = _Calls()
+    pf, cf, ef, tf, lf, llf = _topology_factories(calls, exec_leaf_ids=("700", "701"))
+    result = await run_pipeline(
+        700, log_dir=tmp_path, board="requiem-700", assignee="w", live=False,
+        github_repo="Owner/Repo", base_branch="main",
+        planning_factory=pf, commit_factory=cf, executor_factory=ef,
+        trunk_bootstrap_factory=tf, leaf_pr_factory=lf, leaf_lifecycle_factory=llf,
+    )
+    assert result.status == "delivered"
+    assert calls.leaf_lifecycle == 0
+    assert result.leaf_lifecycle_results == ()
+
+
 # ---- fail-closed: a failed bootstrap never dispatches ----------------------
 
 
 async def test_failed_bootstrap_does_not_dispatch(tmp_path):
     calls = _Calls()
-    pf, cf, ef, tf, lf = _topology_factories(
+    pf, cf, ef, tf, lf, llf = _topology_factories(
         calls, trunk_final="end_failed")
     result = await run_pipeline(
         700, log_dir=tmp_path, board="requiem-700", assignee="w", live=True,
         github_repo="Owner/Repo", base_branch="main",
         planning_factory=pf, commit_factory=cf, executor_factory=ef,
-        trunk_bootstrap_factory=tf, leaf_pr_factory=lf,
+        trunk_bootstrap_factory=tf, leaf_pr_factory=lf, leaf_lifecycle_factory=llf,
     )
     assert result.stage == "trunk_bootstrap"
     assert result.status == "paused"
@@ -296,14 +395,14 @@ async def test_failed_bootstrap_does_not_dispatch(tmp_path):
 
 async def test_leaf_pr_needs_human_pauses_with_persisted_map(tmp_path):
     calls = _Calls()
-    pf, cf, ef, tf, lf = _topology_factories(
+    pf, cf, ef, tf, lf, llf = _topology_factories(
         calls, exec_leaf_ids=("700", "701"),
         leaf_pr_final="end_human")
     result = await run_pipeline(
         700, log_dir=tmp_path, board="requiem-700", assignee="w", live=True,
         github_repo="Owner/Repo", base_branch="main",
         planning_factory=pf, commit_factory=cf, executor_factory=ef,
-        trunk_bootstrap_factory=tf, leaf_pr_factory=lf,
+        trunk_bootstrap_factory=tf, leaf_pr_factory=lf, leaf_lifecycle_factory=llf,
     )
     assert result.stage == "leaf_pr"
     assert result.status == "paused"
@@ -317,13 +416,13 @@ async def test_leaf_pr_needs_human_pauses_with_persisted_map(tmp_path):
 
 async def test_executor_pause_skips_leaf_pr(tmp_path):
     calls = _Calls()
-    pf, cf, ef, tf, lf = _topology_factories(
+    pf, cf, ef, tf, lf, llf = _topology_factories(
         calls, exec_final="fail_end")
     result = await run_pipeline(
         700, log_dir=tmp_path, board="requiem-700", assignee="w", live=True,
         github_repo="Owner/Repo", base_branch="main",
         planning_factory=pf, commit_factory=cf, executor_factory=ef,
-        trunk_bootstrap_factory=tf, leaf_pr_factory=lf,
+        trunk_bootstrap_factory=tf, leaf_pr_factory=lf, leaf_lifecycle_factory=llf,
     )
     assert result.stage == "executor"
     assert result.status == "paused"

@@ -201,7 +201,31 @@ def _stub_factories(*, captured: dict):
                 return Completed(run_id, "completed", "end_success", {})
         return _E()
 
-    return planning_factory, executor_factory, trunk_bootstrap_factory, leaf_pr_factory
+    def leaf_lifecycle_factory(log_dir, *, inputs=None, toolbelt=None, provider=None,
+                               gate_handler=None):
+        captured.setdefault("leaf_lifecycle_toolbelts", []).append(toolbelt)
+        captured.setdefault("leaf_lifecycle_inputs", []).append(inputs)
+
+        class _E:
+            async def run(self, run_id):
+                _write_log(log_dir, run_id, [
+                    ("fetch_pr", {"kind": "success", "value": {"number": inputs.pr_number}}),
+                    ("merge_pr", {"kind": "success", "value": {
+                        "merged": True,
+                        "merge_sha": f"merge-{inputs.leaf_id}",
+                        "strategy": "squash",
+                    }}),
+                ])
+                return Completed(run_id, "completed", "end_merged", {})
+        return _E()
+
+    return (
+        planning_factory,
+        executor_factory,
+        trunk_bootstrap_factory,
+        leaf_pr_factory,
+        leaf_lifecycle_factory,
+    )
 
 
 async def test_ado_repo_routes_topology_through_ado_client(tmp_path):
@@ -210,7 +234,7 @@ async def test_ado_repo_routes_topology_through_ado_client(tmp_path):
     toolbelts at toolbelt.repo, and projects ado_repo back in the
     PipelineResult."""
     captured: dict = {}
-    pf, ef, tbf, lpf = _stub_factories(captured=captured)
+    pf, ef, tbf, lpf, llf = _stub_factories(captured=captured)
     ado = FakeAdoClient(refs={("Contoso/P/widgets", "main"): "abc"})
     result = await run_pipeline(
         500,
@@ -225,6 +249,7 @@ async def test_ado_repo_routes_topology_through_ado_client(tmp_path):
         executor_factory=ef,
         trunk_bootstrap_factory=tbf,
         leaf_pr_factory=lpf,
+        leaf_lifecycle_factory=llf,
     )
     # Result projects the ADO choice back out.
     assert result.ado_repo == "Contoso/P/widgets"
@@ -254,7 +279,7 @@ async def test_ado_repo_threads_repo_client_to_executor_toolbelt(tmp_path):
     propagate through.
     """
     captured: dict = {}
-    pf, ef, tbf, lpf = _stub_factories(captured=captured)
+    pf, ef, tbf, lpf, llf = _stub_factories(captured=captured)
     ado = FakeAdoClient(refs={("Contoso/P/widgets", "main"): "abc"})
     await run_pipeline(
         500,
@@ -269,6 +294,7 @@ async def test_ado_repo_threads_repo_client_to_executor_toolbelt(tmp_path):
         executor_factory=ef,
         trunk_bootstrap_factory=tbf,
         leaf_pr_factory=lpf,
+        leaf_lifecycle_factory=llf,
     )
     # The executor's toolbelt carries the same FakeAdoClient at .repo —
     # the same identity the trunk_bootstrap + leaf_pr stages received.
@@ -285,7 +311,7 @@ async def test_github_repo_path_still_projects_github_field(tmp_path):
     """Back-compat: the original github_repo path still populates
     PipelineResult.github_repo and leaves ado_repo None."""
     captured: dict = {}
-    pf, ef, tbf, lpf = _stub_factories(captured=captured)
+    pf, ef, tbf, lpf, llf = _stub_factories(captured=captured)
     # Inject a stub gh client so we don't need the real `gh` binary.
     from requiem.clients.repo import RepoPullRequest
 
@@ -325,6 +351,7 @@ async def test_github_repo_path_still_projects_github_field(tmp_path):
         executor_factory=ef,
         trunk_bootstrap_factory=tbf,
         leaf_pr_factory=lpf,
+        leaf_lifecycle_factory=llf,
     )
     assert result.github_repo == "Acme/Widget"
     assert result.ado_repo is None
@@ -333,7 +360,7 @@ async def test_github_repo_path_still_projects_github_field(tmp_path):
 async def test_passing_both_github_and_ado_raises(tmp_path):
     """Driver-level fail-closed for the mutually-exclusive contract."""
     captured: dict = {}
-    pf, ef, tbf, lpf = _stub_factories(captured=captured)
+    pf, ef, tbf, lpf, llf = _stub_factories(captured=captured)
     with pytest.raises(ValueError) as exc:
         await run_pipeline(
             500, log_dir=tmp_path, board="requiem-500", assignee="w",
@@ -342,6 +369,7 @@ async def test_passing_both_github_and_ado_raises(tmp_path):
             ado_repo="Contoso/P/widgets",
             planning_factory=pf, executor_factory=ef,
             trunk_bootstrap_factory=tbf, leaf_pr_factory=lpf,
+            leaf_lifecycle_factory=llf,
         )
     assert "mutually exclusive" in str(exc.value)
 
@@ -350,12 +378,13 @@ async def test_executor_only_path_unaffected(tmp_path):
     """Neither github_repo nor ado_repo set → executor-only, no topology.
     PipelineResult has both repo fields as None."""
     captured: dict = {}
-    pf, ef, tbf, lpf = _stub_factories(captured=captured)
+    pf, ef, tbf, lpf, llf = _stub_factories(captured=captured)
     result = await run_pipeline(
         500, log_dir=tmp_path, board="requiem-500", assignee="w",
         live=True,
         planning_factory=pf, executor_factory=ef,
         trunk_bootstrap_factory=tbf, leaf_pr_factory=lpf,
+        leaf_lifecycle_factory=llf,
     )
     assert result.status == "delivered"
     assert result.github_repo is None

@@ -28,6 +28,7 @@ from requiem.outcomes import (
     RetryableFailure,
     Success,
 )
+from requiem.review_schemas import LeafReviewReport
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,21 @@ class AgentCall:
 
     Empty dict (the default) preserves v0 behaviour: the provider
     uses its own constructor-time defaults for every knob."""
+
+
+LEAF_REVIEWER = AgentSpec(
+    name="leaf_reviewer",
+    charter=(
+        "You are Requiem's implementation-leaf reviewer. Review the leaf PR "
+        "diff against its feature/<root> base, then return exactly one verdict: "
+        "`approve`, `request_changes`, or `needs_human`. Use `request_changes` "
+        "only when you can name concrete, code-level fixes; use `needs_human` "
+        "for ambiguous risk, missing context, or anything unsafe to auto-merge. "
+        "Every comment must include file, optional line, body, and severity."
+    ),
+    response_model=LeafReviewReport,
+    role="reviewer",
+)
 
 
 @runtime_checkable

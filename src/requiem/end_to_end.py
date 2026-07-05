@@ -39,6 +39,7 @@ from requiem.workflows import commit_plan as commit_plan_mod
 from requiem.workflows import fanout as fanout_mod
 from requiem.workflows import feature_pr as feature_pr_mod
 from requiem.workflows import kanban_executor as executor_mod
+from requiem.workflows import leaf_lifecycle as leaf_lifecycle_mod
 from requiem.workflows import leaf_pr as leaf_pr_mod
 from requiem.workflows import planning as planning_mod
 from requiem.workflows import trunk_bootstrap as trunk_bootstrap_mod
@@ -54,6 +55,7 @@ ExecutorFactory = Callable[..., Engine]
 # the same way (real build_engine by default) so the wiring is stub-testable.
 TrunkBootstrapFactory = Callable[..., Engine]
 LeafPrFactory = Callable[..., Engine]
+LeafLifecycleFactory = Callable[..., Engine]
 FeaturePrFactory = Callable[..., Engine]
 
 
@@ -88,6 +90,8 @@ class PipelineResult:
     leaf_pr_verdict: str | None = None        # opened | previewed | needs_human | failed
     leaf_pr_map: tuple[tuple[str, int | None], ...] = ()  # (leaf_id, pr_number)
     leaf_pr_map_path: str | None = None       # persisted {leaf_id: pr_number} artifact
+    leaf_lifecycle_verdict: str | None = None
+    leaf_lifecycle_results: tuple[tuple[str, str], ...] = ()  # (leaf_id, final_state)
     feature_pr_verdict: str | None = None     # opened | previewed | needs_human | failed
     feature_pr_number: int | None = None
     feature_pr_url: str | None = None
@@ -287,6 +291,9 @@ def _persist_leaf_pr_map(
     return path
 
 
+
+
+
 async def _dispatch_in_process(
     *,
     item_id: int,
@@ -311,6 +318,7 @@ async def _dispatch_in_process(
     trunk_verdict: str | None,
     fanout_factory: Any,
     process_config: Any | None = None,  # ADR-0030 §1: optional context-pack input
+    leaf_lifecycle_factory: Any = leaf_lifecycle_mod.build_engine,
 ) -> "PipelineResult":
     """Phase 3 (in-process backend): dispatch leaves via requiem.workflows.fanout.
 
@@ -344,7 +352,13 @@ async def _dispatch_in_process(
         repo=github_repo or str(item_id),
         repo_path=repo_path,
         log_dir=log_dir,
-        base_branch=base_branch or "main",
+        # ADR-0018 step 4: when a trunk exists (github_repo threaded), each
+        # leaf's own PR must land on feature/<root>, not the repo default
+        # branch — otherwise leaf PRs bypass the trunk entirely (the run #34
+        # gap: all 16 leaf PRs opened directly against `main`). The
+        # creds-light path (no github_repo, no trunk) keeps the legacy
+        # base_branch/"main" fallback.
+        base_branch=trunk_branch or base_branch or "main",
         dry_run=not live,
         parallel=fanout_parallel,
         leaves=inline_leaves,
@@ -409,13 +423,100 @@ async def _dispatch_in_process(
             fanout_leaves_landed=fo_result.leaves_landed,
         )
 
-    # All leaves landed. The in-process implementation children already opened
-    # their own leaf PRs (impl/<root>-<leaf> → base), so unlike the kanban path
-    # there is no separate leaf-PR leg here. Report delivery.
+    # All leaves landed. Each in-process implementation child opened its own
+    # leaf PR (impl/<root>-<leaf> → trunk_branch, per the base_branch fix
+    # above) — unlike the kanban path there is no separate leaf-PR leg here.
+    # When a trunk exists and this is a live run, drive leaf_lifecycle per
+    # landed leaf exactly as the kanban path does after its leaf_pr leg,
+    # so fanout-backend runs get the same self-merge behaviour (ADR-0018).
+    leaf_lifecycle_verdict: str | None = None
+    leaf_lifecycle_results: list[tuple[str, str]] = []
+    if live and github_repo is not None and trunk_branch is not None:
+        for outcome in fo_result.outcomes:
+            if outcome.disposition != "completed":
+                continue
+            leaf_id = str(outcome.real_id)
+            if outcome.pr_number is None:
+                leaf_lifecycle_results.append((leaf_id, "needs_human"))
+                leaf_lifecycle_verdict = "needs_human"
+                return PipelineResult(
+                    item_id=item_id, stage="leaf_lifecycle", status="paused",
+                    detail=(
+                        f"leaf lifecycle cannot start for {leaf_id}: no PR "
+                        "number was recovered from its implementation child's "
+                        "log after landing."
+                    ),
+                    decomposable=decomposable, leaf_ids=leaf_ids,
+                    plan_artifact=plan_artifact,
+                    committed_path=str(committed_path) if committed_path else None,
+                    executor_final_node=fo_final,
+                    github_repo=github_repo_arg, ado_repo=ado_repo_arg,
+                    base_branch=base_branch,
+                    trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
+                    fanout_verdict=fo_result.verdict,
+                    fanout_leaves_total=fo_result.leaves_total,
+                    fanout_leaves_landed=fo_result.leaves_landed,
+                    leaf_lifecycle_verdict=leaf_lifecycle_verdict,
+                    leaf_lifecycle_results=tuple(leaf_lifecycle_results),
+                )
+            ll_inputs = leaf_lifecycle_mod.LeafLifecycleInputs(
+                repo=github_repo,
+                repo_path=repo_path,
+                leaf_id=leaf_id,
+                root_item_id=item_id,
+                pr_number=outcome.pr_number,
+                default_branch=base_branch or "main",
+                merge_strategy="squash",
+                dry_run=not live,
+            )
+            ll_run = f"leaflife-{item_id}-{leaf_id}"
+            ll_engine = leaf_lifecycle_factory(
+                log_dir,
+                inputs=ll_inputs,
+                toolbelt=_topology_toolbelt(twig, repo_client),
+                provider=provider,
+                **({"gate_handler": gate_handler} if gate_handler is not None else {}),
+            )
+            await ll_engine.run(ll_run)
+            ll_result = leaf_lifecycle_mod.build_result(_completed_map(log_dir, ll_run))
+            leaf_lifecycle_results.append((leaf_id, ll_result.final_state))
+            if ll_result.final_state in {"needs_human", "failed"}:
+                leaf_lifecycle_verdict = ll_result.final_state
+                return PipelineResult(
+                    item_id=item_id, stage="leaf_lifecycle", status="paused",
+                    detail=(
+                        f"leaf lifecycle stopped at {leaf_id} "
+                        f"({ll_result.final_state}); remaining leaves were not "
+                        "dispatched to the self-merge loop."
+                    ),
+                    decomposable=decomposable, leaf_ids=leaf_ids,
+                    plan_artifact=plan_artifact,
+                    committed_path=str(committed_path) if committed_path else None,
+                    executor_final_node=fo_final,
+                    github_repo=github_repo_arg, ado_repo=ado_repo_arg,
+                    base_branch=base_branch,
+                    trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
+                    fanout_verdict=fo_result.verdict,
+                    fanout_leaves_total=fo_result.leaves_total,
+                    fanout_leaves_landed=fo_result.leaves_landed,
+                    leaf_lifecycle_verdict=leaf_lifecycle_verdict,
+                    leaf_lifecycle_results=tuple(leaf_lifecycle_results),
+                )
+        if leaf_lifecycle_results:
+            leaf_lifecycle_verdict = "merged"
+
+    detail = (f"in-process fan-out delivered {fo_result.leaves_landed} "
+              f"leaf/leaves" + (" (previewed; dry-run)" if not live else ""))
+    stage = "fanout"
+    if leaf_lifecycle_results:
+        detail = (
+            f"leaves dispatched + leaf PRs opened and self-merged onto "
+            f"{trunk_branch}; run integrate_pipeline for the trunk→base PR."
+        )
+        stage = "leaf_lifecycle"
     return PipelineResult(
-        item_id=item_id, stage="fanout", status="delivered",
-        detail=(f"in-process fan-out delivered {fo_result.leaves_landed} "
-                f"leaf/leaves" + (" (previewed; dry-run)" if not live else "")),
+        item_id=item_id, stage=stage, status="delivered",
+        detail=detail,
         decomposable=decomposable, leaf_ids=leaf_ids,
         plan_artifact=plan_artifact,
         committed_path=str(committed_path) if committed_path else None,
@@ -426,6 +527,8 @@ async def _dispatch_in_process(
         fanout_verdict=fo_result.verdict,
         fanout_leaves_total=fo_result.leaves_total,
         fanout_leaves_landed=fo_result.leaves_landed,
+        leaf_lifecycle_verdict=leaf_lifecycle_verdict,
+        leaf_lifecycle_results=tuple(leaf_lifecycle_results),
     )
 
 
@@ -465,6 +568,7 @@ async def run_pipeline(
     max_polls: int = 120,
     dispatch_backend: str = "kanban",
     repo_path: Path | None = None,
+    repo: Path | None = None,
     fanout_parallel: bool = False,
     escalation_policy: str = "escalate",
     planning_factory: PlanningFactory = planning_mod.build_engine,
@@ -472,6 +576,7 @@ async def run_pipeline(
     executor_factory: ExecutorFactory = executor_mod.build_engine,
     trunk_bootstrap_factory: TrunkBootstrapFactory = trunk_bootstrap_mod.build_engine,
     leaf_pr_factory: LeafPrFactory = leaf_pr_mod.build_engine,
+    leaf_lifecycle_factory: LeafLifecycleFactory = leaf_lifecycle_mod.build_engine,
     fanout_factory: Any = fanout_mod.build_engine,
 ) -> PipelineResult:
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -508,10 +613,17 @@ async def run_pipeline(
     # for use in PipelineResult construction.
     github_repo = repo_id
 
+    resolved_twig = twig
+    if resolved_twig is None:
+        resolved_twig = _make_twig_client(
+            repo_path=None,
+            repo=repo or repo_path or Path.cwd(),
+        )
+
     # -- Phase 1: plan -------------------------------------------------
     plan_run = f"plan-{item_id}"
     plan_engine = planning_factory(
-        log_dir, item_id=item_id, twig=twig, provider=provider,
+        log_dir, item_id=item_id, twig=resolved_twig, provider=provider,
         gate_handler=gate_handler, process_config=process_config,
     )
     plan_outcome = await plan_engine.run(plan_run)
@@ -580,7 +692,7 @@ async def run_pipeline(
         commit_run = f"commit-{item_id}"
         commit_engine = commit_factory(
             log_dir, plan_tree_path=Path(plan_artifact), dry_run=False,
-            twig=twig, manifest_path=committed_path, gate_handler=gate_handler,
+            twig=resolved_twig, manifest_path=committed_path, gate_handler=gate_handler,
         )
         commit_outcome = await commit_engine.run(commit_run)
         if not (isinstance(commit_outcome, Completed)
@@ -665,6 +777,7 @@ async def run_pipeline(
             trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
             fanout_factory=fanout_factory,
             process_config=process_config,
+            leaf_lifecycle_factory=leaf_lifecycle_factory,
         )
 
     real = Toolbelt.real()
@@ -723,6 +836,8 @@ async def run_pipeline(
     leaf_pr_verdict: str | None = None
     leaf_pr_leaves: tuple[LeafPr, ...] = ()
     leaf_pr_map_path: Path | None = None
+    leaf_lifecycle_verdict: str | None = None
+    leaf_lifecycle_results: list[tuple[str, str]] = []
     if github_repo is not None:
         lp_inputs = leaf_pr_mod.LeafPrInputs(
             root_item_id=item_id, repo=github_repo,
@@ -760,15 +875,93 @@ async def run_pipeline(
                 leaf_pr_map_path=str(leaf_pr_map_path),
             )
 
+    if github_repo is not None and live:
+        local_repo = (repo or repo_path or Path.cwd()).expanduser().resolve()
+        for leaf in leaf_pr_leaves:
+            if leaf.pr_number is None:
+                leaf_lifecycle_results.append((leaf.leaf_id, "needs_human"))
+                leaf_lifecycle_verdict = "needs_human"
+                return PipelineResult(
+                    item_id=item_id, stage="leaf_lifecycle", status="paused",
+                    detail=(
+                        f"leaf lifecycle cannot start for {leaf.leaf_id}: no PR number "
+                        "was available after leaf_pr."
+                    ),
+                    decomposable=decomposable, leaf_ids=leaf_ids,
+                    plan_artifact=plan_artifact,
+                    committed_path=str(committed_path) if committed_path else None,
+                    executor_final_node=final_node,
+                    github_repo=_github_repo_arg, ado_repo=_ado_repo_arg,
+                    base_branch=resolved_base,
+                    trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
+                    leaf_pr_verdict=leaf_pr_verdict,
+                    leaf_pr_map=tuple((lp.leaf_id, lp.pr_number) for lp in leaf_pr_leaves),
+                    leaf_pr_map_path=str(leaf_pr_map_path) if leaf_pr_map_path else None,
+                    leaf_lifecycle_verdict=leaf_lifecycle_verdict,
+                    leaf_lifecycle_results=tuple(leaf_lifecycle_results),
+                )
+            ll_inputs = leaf_lifecycle_mod.LeafLifecycleInputs(
+                repo=github_repo,
+                repo_path=local_repo,
+                leaf_id=leaf.leaf_id,
+                root_item_id=item_id,
+                pr_number=leaf.pr_number,
+                default_branch=resolved_base or "main",
+                merge_strategy="squash",
+                dry_run=not live,
+            )
+            ll_run = f"leaflife-{item_id}-{leaf.leaf_id}"
+            ll_engine = leaf_lifecycle_factory(
+                log_dir,
+                inputs=ll_inputs,
+                toolbelt=_topology_toolbelt(twig, repo_client),
+                provider=provider,
+                **({"gate_handler": gate_handler} if gate_handler is not None else {}),
+            )
+            await ll_engine.run(ll_run)
+            ll_result = leaf_lifecycle_mod.build_result(_completed_map(log_dir, ll_run))
+            leaf_lifecycle_results.append((leaf.leaf_id, ll_result.final_state))
+            if ll_result.final_state in {"needs_human", "failed"}:
+                leaf_lifecycle_verdict = ll_result.final_state
+                return PipelineResult(
+                    item_id=item_id, stage="leaf_lifecycle", status="paused",
+                    detail=(
+                        f"leaf lifecycle stopped at {leaf.leaf_id} "
+                        f"({ll_result.final_state}); remaining leaves were not dispatched "
+                        "to the self-merge loop."
+                    ),
+                    decomposable=decomposable, leaf_ids=leaf_ids,
+                    plan_artifact=plan_artifact,
+                    committed_path=str(committed_path) if committed_path else None,
+                    executor_final_node=final_node,
+                    github_repo=_github_repo_arg, ado_repo=_ado_repo_arg,
+                    base_branch=resolved_base,
+                    trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
+                    leaf_pr_verdict=leaf_pr_verdict,
+                    leaf_pr_map=tuple((lp.leaf_id, lp.pr_number) for lp in leaf_pr_leaves),
+                    leaf_pr_map_path=str(leaf_pr_map_path) if leaf_pr_map_path else None,
+                    leaf_lifecycle_verdict=leaf_lifecycle_verdict,
+                    leaf_lifecycle_results=tuple(leaf_lifecycle_results),
+                )
+        if leaf_lifecycle_results:
+            leaf_lifecycle_verdict = "merged"
+
     detail = "all implementable leaves dispatched"
-    if github_repo is not None:
+    stage = "executor"
+    if github_repo is not None and live and leaf_lifecycle_results:
+        detail = (
+            f"leaves dispatched + leaf PRs opened and self-merged onto {trunk_branch}; "
+            "run integrate_pipeline for the trunk→base PR."
+        )
+        stage = "leaf_lifecycle"
+    elif github_repo is not None:
         detail = (
             f"leaves dispatched + leaf PRs {leaf_pr_verdict} onto "
             f"{trunk_branch}; merge them, then run integrate_pipeline for the "
             "trunk→base PR."
         )
     return PipelineResult(
-        item_id=item_id, stage="executor",
+        item_id=item_id, stage=stage,
         status="delivered",
         detail=detail,
         decomposable=decomposable, leaf_ids=leaf_ids,
@@ -781,6 +974,8 @@ async def run_pipeline(
         leaf_pr_verdict=leaf_pr_verdict,
         leaf_pr_map=tuple((lp.leaf_id, lp.pr_number) for lp in leaf_pr_leaves),
         leaf_pr_map_path=str(leaf_pr_map_path) if leaf_pr_map_path else None,
+        leaf_lifecycle_verdict=leaf_lifecycle_verdict,
+        leaf_lifecycle_results=tuple(leaf_lifecycle_results),
     )
 
 
@@ -1002,6 +1197,25 @@ def _resolve_doctrine_for_repo(repo_path: Path) -> Any | None:
         return None
 
 
+def _resolve_twig_cwd(*, repo_path: Path | None, repo: Path | None) -> Path | None:
+    """Pick the workspace root that should own Twig CLI state.
+
+    Twig item lookups should run from the actual repo root so the CLI can see
+    the shared ADO workspace cache. The fanout backend still uses ``repo_path``
+    for code mutations, but the Twig client should prefer the repo root when it
+    is supplied.
+    """
+    base = repo or repo_path
+    if base is None:
+        return None
+    return base.expanduser().resolve()
+
+
+def _make_twig_client(*, repo_path: Path | None, repo: Path | None) -> Any:
+    from requiem.clients.twig import TwigClient
+    return TwigClient(cwd=_resolve_twig_cwd(repo_path=repo_path, repo=repo))
+
+
 def _build_arg_parser():
     import argparse
 
@@ -1159,7 +1373,6 @@ def main(argv: list[str] | None = None) -> int:
     import asyncio
 
     from requiem.clients.kanban import KanbanClient
-    from requiem.clients.twig import TwigClient
     from requiem.providers import default_provider
 
     args = _build_arg_parser().parse_args(argv)
@@ -1194,10 +1407,11 @@ def main(argv: list[str] | None = None) -> int:
         github_repo=args.github_repo,
         ado_repo=args.ado_repo,
         base_branch=args.base_branch,
-        twig=TwigClient(),
+        twig=_make_twig_client(repo_path=args.repo_path, repo=args.repo),
         provider=default_provider(),
         kanban=KanbanClient(),
         process_config=process_config,
+        repo=args.repo,
         poll_interval_s=args.poll_interval,
         max_polls=args.max_polls,
         gate_handler=gate_handler,
@@ -1225,14 +1439,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  leafPR: {result.leaf_pr_verdict} — {rendered}")
     if result.leaf_pr_map_path:
         print(f"  map:    {result.leaf_pr_map_path}")
+    if result.leaf_lifecycle_results:
+        rendered = ", ".join(f"{lid}:{state}" for lid, state in result.leaf_lifecycle_results)
+        print(f"  merge:  {result.leaf_lifecycle_verdict} — {rendered}")
     return 0 if result.status in ("delivered", "planned") else 1
 
 
 def integrate_main(argv: list[str] | None = None) -> int:
     """Entrypoint for the trunk→base integration leg (phase 5)."""
     import asyncio
-
-    from requiem.clients.twig import TwigClient
 
     args = _build_integrate_arg_parser().parse_args(argv)
     if args.github_repo is None and args.ado_repo is None:
@@ -1256,7 +1471,7 @@ def integrate_main(argv: list[str] | None = None) -> int:
         leaf_pr_map_path=Path(map_path),
         base_branch=args.base_branch,
         live=args.live,
-        twig=TwigClient(),
+        twig=_make_twig_client(repo_path=None, repo=args.repo),
     ))
 
     print(f"[integrate] {result.status}: {result.detail}")

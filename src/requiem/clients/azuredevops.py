@@ -40,7 +40,12 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-from requiem.clients.repo import RepoPullRequest
+from requiem.clients.repo import (
+    RepoCompleteResult,
+    RepoMergeStrategy,
+    RepoMergeabilityReport,
+    RepoPullRequest,
+)
 
 # Re-use the existing constants + helpers from ado_pr to avoid two sources
 # of truth for the ADO REST audience id and the lazy-default credential
@@ -97,15 +102,42 @@ class AdoUnknownError(AdoClientError):
     """Anything else — per Ravel L-1, NeedsHuman not silent retry."""
 
 
+def _ado_commit_status_signal(payload: dict[str, Any]) -> str:
+    """Collapse ADO commit statuses into success|failure|pending|unknown."""
+    rows = payload.get("value")
+    if not isinstance(rows, list) or not rows:
+        return "unknown"
+    saw_success = False
+    saw_pending = False
+    for row in rows:
+        state = str((row or {}).get("state", "")).lower()
+        if state == "succeeded":
+            saw_success = True
+            continue
+        if state in {"pending", "notset"}:
+            saw_pending = True
+            continue
+        if state in {"failed", "error"}:
+            return "failure"
+        return "unknown"
+    if saw_pending:
+        return "pending"
+    if saw_success:
+        return "success"
+    return "unknown"
+
+
 # ---- AdoClient (RepoPlatform impl) --------------------------------------
 
 
 class AdoClient:
     """Async :class:`RepoPlatform` impl for Azure DevOps Repos.
 
-    Implements the six-method ADR-0024 contract:
+    Implements the six-method ADR-0024 contract plus the merge-capable
+    sibling surface for workflows that must complete a PR:
     ``branch_sha``, ``ensure_branch_ref``, ``find_open_pr_for_branch``,
-    ``pr_view``, ``pr_create``, ``default_branch``.
+    ``pr_view``, ``pr_create``, ``default_branch``, ``pr_mergeability``,
+    ``pr_complete``.
 
     ``repo`` is ``"<organization>/<project>/<repository>"`` everywhere.
     """
@@ -392,6 +424,103 @@ class AdoClient:
             )
         return self._strip_refs_heads(ref)
 
+    async def pr_mergeability(
+        self, repo: str, number: int
+    ) -> RepoMergeabilityReport:
+        """Return ADO mergeability/policy state in neutral vocabulary."""
+        url = f"{self._repo_base(repo)}/pullrequests/{number}"
+        payload = await self._request("GET", url)
+        merge_status = str(payload.get("mergeStatus", "notSet"))
+        if merge_status == "succeeded":
+            mergeable: bool | None = True
+        elif merge_status in {"queued", "notSet"}:
+            mergeable = None
+        else:
+            mergeable = False
+        head = self._strip_refs_heads(str(payload.get("sourceRefName", "")))
+        checks_state = "unknown"
+        if head:
+            head_sha = await self.branch_sha(repo, head)
+            statuses = await self._request(
+                "GET",
+                f"{self._repo_base(repo)}/commits/{head_sha}/statuses",
+                params={"api-version": "7.1-preview.1"},
+            )
+            checks_state = _ado_commit_status_signal(statuses)
+        return RepoMergeabilityReport(
+            mergeable=mergeable,
+            mergeable_state=merge_status,
+            checks_state=checks_state,
+            conflicts=(merge_status == "conflicts"),
+            policies_satisfied=(merge_status == "succeeded"),
+        )
+
+    async def pr_complete(
+        self,
+        repo: str,
+        number: int,
+        *,
+        strategy: RepoMergeStrategy,
+        expected_head: str | None = None,
+        expected_base: str | None = None,
+    ) -> RepoCompleteResult:
+        """Complete an ADO PR after re-validating live source/target refs."""
+        strategy_map = {
+            "merge": "noFastForward",
+            "squash": "squash",
+            "rebase": "rebase",
+        }
+        merge_strategy = strategy_map[strategy]
+        url = f"{self._repo_base(repo)}/pullrequests/{number}"
+        live = await self._request("GET", url)
+        live_head = self._strip_refs_heads(str(live.get("sourceRefName", "")))
+        live_base = self._strip_refs_heads(str(live.get("targetRefName", "")))
+        if expected_head is not None and live_head != expected_head:
+            raise AdoUnknownError(
+                f"refusing to complete PR {number}: live head {live_head!r} "
+                f"!= expected {expected_head!r}",
+                url=url,
+            )
+        if expected_base is not None and live_base != expected_base:
+            raise AdoUnknownError(
+                f"refusing to complete PR {number}: live base {live_base!r} "
+                f"!= expected {expected_base!r}",
+                url=url,
+            )
+        if str(live.get("status", "")).lower() == "completed":
+            merge_commit = live.get("lastMergeCommit") or {}
+            merge_sha = (
+                str(merge_commit.get("commitId"))
+                if isinstance(merge_commit, dict) and merge_commit.get("commitId")
+                else None
+            )
+            return RepoCompleteResult(
+                number=number,
+                merged=True,
+                merge_sha=merge_sha,
+                strategy=strategy,
+            )
+        payload = await self._request(
+            "PATCH",
+            url,
+            body={
+                "status": "completed",
+                "completionOptions": {"mergeStrategy": merge_strategy},
+            },
+        )
+        merge_commit = payload.get("lastMergeCommit") or {}
+        merge_sha = (
+            str(merge_commit.get("commitId"))
+            if isinstance(merge_commit, dict) and merge_commit.get("commitId")
+            else None
+        )
+        return RepoCompleteResult(
+            number=number,
+            merged=(str(payload.get("status", "")).lower() == "completed"),
+            merge_sha=merge_sha,
+            strategy=strategy,
+        )
+
     # ---- Work-item reads (ADR-0031 / R4 projection) -----------------
     #
     # The projection layer needs a thin, field-selective read of one
@@ -566,6 +695,7 @@ class FakeAdoClient:
         # Forensic logs for test assertions.
         self.created_refs: list[tuple[str, str, str]] = []  # (repo, branch, sha)
         self.created_prs: list[dict[str, Any]] = []
+        self.completed_prs: list[dict[str, Any]] = []
 
     @staticmethod
     def _infer_repo(pr: RepoPullRequest) -> str:
@@ -665,6 +795,77 @@ class FakeAdoClient:
             # common repo shape and keeps tests terse.
             return "main"
         return self._default_branches[repo]
+
+    async def pr_mergeability(
+        self, repo: str, number: int
+    ) -> RepoMergeabilityReport:
+        pr = await self.pr_view(repo, number)
+        status = str(pr.raw.get("mergeStatus", "succeeded"))
+        if status == "succeeded":
+            mergeable: bool | None = True
+        elif status in {"queued", "notSet"}:
+            mergeable = None
+        else:
+            mergeable = False
+        checks_state = _ado_commit_status_signal(
+            {"value": pr.raw.get("statuses") or []}
+        )
+        return RepoMergeabilityReport(
+            mergeable=mergeable,
+            mergeable_state=status,
+            checks_state=checks_state,
+            conflicts=(status == "conflicts"),
+            policies_satisfied=(status == "succeeded"),
+        )
+
+    async def pr_complete(
+        self,
+        repo: str,
+        number: int,
+        *,
+        strategy: RepoMergeStrategy,
+        expected_head: str | None = None,
+        expected_base: str | None = None,
+    ) -> RepoCompleteResult:
+        pr = await self.pr_view(repo, number)
+        if expected_head is not None and pr.head != expected_head:
+            raise AdoUnknownError(
+                f"refusing to complete PR {number}: live head {pr.head!r} "
+                f"!= expected {expected_head!r}",
+            )
+        if expected_base is not None and pr.base != expected_base:
+            raise AdoUnknownError(
+                f"refusing to complete PR {number}: live base {pr.base!r} "
+                f"!= expected {expected_base!r}",
+            )
+        self.completed_prs.append({
+            "repo": repo,
+            "number": number,
+            "strategy": strategy,
+            "expected_head": expected_head,
+            "expected_base": expected_base,
+        })
+        merged = RepoPullRequest(
+            number=pr.number,
+            title=pr.title,
+            state="merged",
+            merged_at=pr.merged_at,
+            head=pr.head,
+            base=pr.base,
+            url=pr.url,
+            raw={**pr.raw, "status": "completed"},
+        )
+        self._pr_by_number[(repo, number)] = merged
+        self._prs = [merged if candidate.number == number else candidate for candidate in self._prs]
+        return RepoCompleteResult(
+            number=number,
+            merged=True,
+            merge_sha=str(pr.raw.get("lastMergeCommit", {}).get("commitId"))
+            if isinstance(pr.raw.get("lastMergeCommit"), dict)
+            and pr.raw.get("lastMergeCommit", {}).get("commitId")
+            else None,
+            strategy=strategy,
+        )
 
     async def get_work_item(
         self,

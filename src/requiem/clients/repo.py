@@ -37,6 +37,7 @@ from typing import Any, Literal, Protocol, runtime_checkable
 #   GitHub: OPEN → "open", CLOSED → "closed", MERGED → "merged"
 #   ADO:    active → "open", abandoned → "closed", completed → "merged"
 RepoPrState = Literal["open", "closed", "merged"]
+RepoMergeStrategy = Literal["merge", "squash", "rebase"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +105,33 @@ def _repo_pr_init(self, *args, **kwargs):  # type: ignore[no-untyped-def]
 
 
 RepoPullRequest.__init__ = _repo_pr_init  # type: ignore[method-assign]
+
+
+@dataclass(frozen=True, slots=True)
+class RepoMergeabilityReport:
+    """Platform-neutral mergeability projection.
+
+    Unifies the load-bearing fields the GitHub and Azure DevOps merge paths
+    expose. ``mergeable`` is ``None`` when the backend has not finished
+    computing a definitive answer yet. ``checks_state`` is backend-normalised
+    to ``"success"``, ``"failure"``, ``"pending"``, or ``"unknown"``.
+    """
+
+    mergeable: bool | None
+    mergeable_state: str
+    checks_state: str
+    conflicts: bool
+    policies_satisfied: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RepoCompleteResult:
+    """Platform-neutral result of completing/merging a PR."""
+
+    number: int
+    merged: bool
+    merge_sha: str | None
+    strategy: RepoMergeStrategy
 
 
 # ---- Protocol -----------------------------------------------------------
@@ -208,5 +236,38 @@ class RepoPlatform(Protocol):
         ``"develop"``, …). Used by the driver to resolve the trunk's
         base when the operator hasn't passed ``--base-branch`` and the
         repo is on a non-main default.
+        """
+        ...
+
+
+@runtime_checkable
+class MergeCapableRepoPlatform(RepoPlatform, Protocol):
+    """Sibling Protocol for workflows that must both inspect and complete PRs.
+
+    Deliberately separate from :class:`RepoPlatform`: most trunk-topology code
+    needs only the narrow six-method surface above. Workflows that actually
+    merge a PR must opt into this broader seam explicitly, and every impl must
+    honour the head/base precondition guard on ``pr_complete``.
+    """
+
+    async def pr_mergeability(
+        self, repo: str, number: int
+    ) -> RepoMergeabilityReport:
+        ...
+
+    async def pr_complete(
+        self,
+        repo: str,
+        number: int,
+        *,
+        strategy: RepoMergeStrategy,
+        expected_head: str | None = None,
+        expected_base: str | None = None,
+    ) -> RepoCompleteResult:
+        """Complete/merge a PR after re-fetching the live head/base.
+
+        When ``expected_head`` and/or ``expected_base`` are supplied, the impl
+        MUST re-read the live PR immediately before mutating it and refuse to
+        merge if the live source/target branches no longer match.
         """
         ...

@@ -30,13 +30,14 @@ print it on `gh api` rate-limit surfaces). Value is a unix epoch second;
 ----------------------------------------------------------------------
 Scope (v0)
 ----------------------------------------------------------------------
-Read-only paths only: `pr_view`, `pr_search`, and a low-level `api`
+Read-mostly paths only: `pr_view`, `pr_search`, and a low-level `api`
 escape hatch. Mutations are deliberately narrow and enumerated:
-`pr_create` (PR open) and — per ADR-0018, ratified 2026-06-07 — the
+`pr_create` (PR open), `pr_complete` (PR merge with live head/base
+precondition guard), and — per ADR-0018, ratified 2026-06-07 — the
 branch-ref pair `branch_sha` / `ensure_branch_ref` (remote
 `feature/<root>` trunk bootstrap, because the local git client is
-read-only). No other mutating argv exists; broader mutations (merge,
-comments, labels) remain out of scope.
+read-only). No broader mutation hatch exists; comments, labels, and
+other repo writes remain out of scope.
 
 `gh` JSON output requires explicit `--json` field listing. Each method
 ships a per-method `_FIELDS` tuple; we never request `*`. This shields
@@ -64,7 +65,14 @@ from typing import Any, Final
 # ---- typed value object ------------------------------------------------
 
 
-from requiem.clients.repo import RepoPlatform, RepoPullRequest  # noqa: F401  (RepoPlatform re-exported for callers that want to type-annotate GhClient at the Protocol)
+from requiem.clients.repo import (  # noqa: F401  (re-exported for callers that want to type-annotate GhClient at the Protocol)
+    MergeCapableRepoPlatform,
+    RepoCompleteResult,
+    RepoMergeStrategy,
+    RepoMergeabilityReport,
+    RepoPlatform,
+    RepoPullRequest,
+)
 
 
 # Back-compat alias — older code expected ``GhClient.pr_view`` to return a
@@ -181,6 +189,43 @@ _AUTH_HINTS = (
     "401",
     "gh auth login",
 )
+
+
+def _github_check_signal(status_payload: dict[str, Any], check_runs_payload: dict[str, Any]) -> str:
+    """Collapse GitHub combined-status + check-runs into success|failure|pending|unknown."""
+    statuses = status_payload.get("statuses")
+    status_signal = "unknown"
+    if isinstance(statuses, list) and statuses:
+        state = str(status_payload.get("state", "")).lower()
+        if state == "success":
+            status_signal = "success"
+        elif state == "pending":
+            status_signal = "pending"
+        elif state in {"failure", "error"}:
+            status_signal = "failure"
+
+    runs = check_runs_payload.get("check_runs")
+    runs_signal = "unknown"
+    if isinstance(runs, list) and runs:
+        runs_signal = "success"
+        for run in runs:
+            status = str((run or {}).get("status", "")).lower()
+            conclusion = str((run or {}).get("conclusion", "")).lower()
+            if status != "completed":
+                runs_signal = "pending"
+                break
+            if conclusion != "success":
+                runs_signal = "failure"
+                break
+
+    signals = (status_signal, runs_signal)
+    if "failure" in signals:
+        return "failure"
+    if "pending" in signals:
+        return "pending"
+    if "success" in signals:
+        return "success"
+    return "unknown"
 
 
 def _extract_http_status(blob: str) -> int | None:
@@ -419,6 +464,85 @@ class GhClient:
                 argv=(self._binary, "api", f"repos/{repo}"),
             )
         return branch
+
+    async def pr_mergeability(
+        self, repo: str, number: int
+    ) -> RepoMergeabilityReport:
+        """Return GitHub's mergeability projection in neutral vocabulary."""
+        payload = await self.api(f"repos/{repo}/pulls/{number}", method="GET")
+        mergeable = payload.get("mergeable")
+        mergeable_state = str(payload.get("mergeable_state", "unknown"))
+        checks_state = "unknown"
+        head = payload.get("head")
+        head_sha = head.get("sha") if isinstance(head, dict) else None
+        if isinstance(head_sha, str) and head_sha:
+            status_payload = await self.api(
+                f"repos/{repo}/commits/{head_sha}/status",
+                method="GET",
+            )
+            check_runs_payload = await self.api(
+                f"repos/{repo}/commits/{head_sha}/check-runs",
+                method="GET",
+            )
+            checks_state = _github_check_signal(status_payload, check_runs_payload)
+        return RepoMergeabilityReport(
+            mergeable=mergeable if isinstance(mergeable, bool) or mergeable is None else None,
+            mergeable_state=mergeable_state,
+            checks_state=checks_state,
+            conflicts=(mergeable is False or mergeable_state == "dirty"),
+            policies_satisfied=(mergeable_state == "clean"),
+        )
+
+    async def pr_complete(
+        self,
+        repo: str,
+        number: int,
+        *,
+        strategy: RepoMergeStrategy,
+        expected_head: str | None = None,
+        expected_base: str | None = None,
+    ) -> RepoCompleteResult:
+        """Merge a PR after re-validating its live head/base branches."""
+        live = await self.pr_view(repo, number)
+        if expected_head is not None and live.head != expected_head:
+            raise GhUnknownError(
+                f"refusing to merge PR #{number}: live head {live.head!r} "
+                f"!= expected {expected_head!r}",
+                exit_code=0,
+                stderr="head precondition failed",
+                argv=(self._binary, "pr", "view", str(number)),
+            )
+        if expected_base is not None and live.base != expected_base:
+            raise GhUnknownError(
+                f"refusing to merge PR #{number}: live base {live.base!r} "
+                f"!= expected {expected_base!r}",
+                exit_code=0,
+                stderr="base precondition failed",
+                argv=(self._binary, "pr", "view", str(number)),
+            )
+        if live.merged:
+            raw_merge = live.raw.get("mergeCommit") if isinstance(live.raw, dict) else None
+            merge_sha = None
+            if isinstance(raw_merge, dict):
+                oid = raw_merge.get("oid")
+                merge_sha = str(oid) if oid else None
+            return RepoCompleteResult(
+                number=number,
+                merged=True,
+                merge_sha=merge_sha,
+                strategy=strategy,
+            )
+        payload = await self.api(
+            f"repos/{repo}/pulls/{number}/merge",
+            method="PUT",
+            body={"merge_method": strategy},
+        )
+        return RepoCompleteResult(
+            number=number,
+            merged=bool(payload.get("merged", False)),
+            merge_sha=str(payload.get("sha")) if payload.get("sha") else None,
+            strategy=strategy,
+        )
 
     async def api(
         self,

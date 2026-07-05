@@ -112,6 +112,13 @@ class LeafOutcome:
     final_node: str
     child_run_id: str
     skipped: bool = False       # already terminal on a prior run (idempotent)
+    # Populated when the leaf's own `implementation` child opened a PR (its
+    # `create_pr` verb). None when the leaf never reached create_pr (needs_human
+    # / failed) or when running in dry_run. Lets the caller (end_to_end's
+    # in-process dispatch) drive leaf_lifecycle per landed leaf, mirroring the
+    # kanban backend's separate leaf_pr leg.
+    pr_number: int | None = None
+    branch_name: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +206,38 @@ def _terminal_disposition(log_path: Path) -> str | None:
     except CorruptLogError:
         return None
     return disp
+
+
+def _leaf_pr_info(log_path: Path) -> tuple[int | None, str]:
+    """Read a landed leaf's PR number + branch name from its own durable log.
+
+    The in-process ``implementation`` child opens its own PR (``create_pr``
+    verb) rather than deferring to a separate leaf_pr leg (unlike the kanban
+    backend). This is how the caller (``end_to_end._dispatch_in_process``)
+    recovers the PR number needed to drive ``leaf_lifecycle`` per leaf —
+    mirroring the kanban path's ``leaf_pr`` → ``leaf_lifecycle`` handoff.
+    Returns ``(None, "")`` for a leaf that never reached ``create_pr`` (a
+    needs_human/failed leaf, or a dry_run preview) or whose log is missing.
+    """
+    if not log_path.exists():
+        return None, ""
+    from requiem.persistence import CorruptLogError, replay
+    pr_number: int | None = None
+    branch_name = ""
+    try:
+        for ev in replay(log_path):
+            if ev.get("kind") != "verb_completed":
+                continue
+            node_id = ev.get("node_id")
+            outcome = (ev.get("payload") or {}).get("outcome") or {}
+            value = outcome.get("value") or {}
+            if node_id == "create_branch":
+                branch_name = str(value.get("branch_name") or branch_name)
+            elif node_id == "create_pr":
+                pr_number = value.get("pr_number")
+    except CorruptLogError:
+        return None, ""
+    return pr_number, branch_name
 
 
 @dataclass
@@ -292,9 +331,11 @@ def build_verb_registry(inputs: FanoutInputs) -> VerbRegistry:
         # terminal disposition on a prior orchestrator run.
         prior = _terminal_disposition(log_path)
         if prior is not None:
+            prior_pr, prior_branch = _leaf_pr_info(log_path)
             return LeafOutcome(
                 real_id=leaf.real_id, disposition=prior,
                 final_node="(prior run)", child_run_id=run_id, skipped=True,
+                pr_number=prior_pr, branch_name=prior_branch,
             )
 
         repo_path = inputs.repo_path
@@ -374,9 +415,11 @@ def build_verb_registry(inputs: FanoutInputs) -> VerbRegistry:
             except FsGitError:
                 pass
 
+        pr_number, branch_name = _leaf_pr_info(log_path)
         return LeafOutcome(
             real_id=leaf.real_id, disposition=disp,
             final_node=final, child_run_id=run_id,
+            pr_number=pr_number, branch_name=branch_name,
         )
 
     @verbs.register("dispatch_leaves")
@@ -425,6 +468,7 @@ def build_verb_registry(inputs: FanoutInputs) -> VerbRegistry:
                     "real_id": o.real_id, "disposition": o.disposition,
                     "final_node": o.final_node, "child_run_id": o.child_run_id,
                     "skipped": o.skipped,
+                    "pr_number": o.pr_number, "branch_name": o.branch_name,
                 }
                 for o in outcomes
             ],
@@ -531,6 +575,7 @@ def fanout_result(completed: dict, final_node: str) -> FanoutResult:
             real_id=int(o["real_id"]), disposition=str(o["disposition"]),
             final_node=str(o["final_node"]), child_run_id=str(o["child_run_id"]),
             skipped=bool(o.get("skipped", False)),
+            pr_number=o.get("pr_number"), branch_name=str(o.get("branch_name") or ""),
         )
         for o in disp.get("outcomes", [])
     )

@@ -1,0 +1,365 @@
+"""Workflow tests for `requiem.workflows.leaf_lifecycle`.
+
+These cover the guarded self-merge loop for implementation-leaf PRs only:
+`impl/<root>-<item>` → `feature/<root>`. The final `feature/<root>` PR remains
+out of scope and human-gated elsewhere.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from requiem.agent import FakeProvider
+from requiem.clients.repo import (
+    RepoCompleteResult,
+    RepoMergeabilityReport,
+    RepoPullRequest,
+)
+from requiem.kernel import Completed
+from requiem.persistence import replay
+from requiem.workflows.leaf_lifecycle import (
+    FakeLeafLifecycleToolkit,
+    LeafLifecycleInputs,
+    build_engine,
+    build_result,
+)
+
+ROOT = 700
+REPO = "Owner/Repo"
+
+
+@pytest.fixture
+def log_dir(tmp_path: Path) -> Path:
+    d = tmp_path / "runs"
+    d.mkdir()
+    return d
+
+
+def _pr(*, state: str = "open", merged: bool = False,
+        head: str = f"impl/{ROOT}-1", base: str = f"feature/{ROOT}") -> RepoPullRequest:
+    return RepoPullRequest(
+        number=41,
+        title="leaf 1",
+        state=state,
+        merged=merged,
+        merged_at=None,
+        head=head,
+        base=base,
+        url="https://example.test/pr/41",
+        raw={},
+    )
+
+
+def _mergeable(*, mergeable=True, state="clean", checks="success",
+               conflicts=False, policies=True) -> RepoMergeabilityReport:
+    return RepoMergeabilityReport(
+        mergeable=mergeable,
+        mergeable_state=state,
+        checks_state=checks,
+        conflicts=conflicts,
+        policies_satisfied=policies,
+    )
+
+
+def _toolkit(
+    *,
+    prs: list[RepoPullRequest] | None = None,
+    mergeability: list[RepoMergeabilityReport] | None = None,
+    push_shas: list[str] | None = None,
+) -> FakeLeafLifecycleToolkit:
+    return FakeLeafLifecycleToolkit(
+        pr_snapshots=prs or [_pr()],
+        branch_sha_snapshots=["head-sha-1", "head-sha-2", "head-sha-3"],
+        mergeability_snapshots=mergeability or [_mergeable()],
+        complete_result=RepoCompleteResult(
+            number=41,
+            merged=True,
+            merge_sha="merge-sha-41",
+            strategy="squash",
+        ),
+        push_shas=push_shas or ["push-sha-1", "push-sha-2", "push-sha-3"],
+    )
+
+
+def _provider(*, reviewer=None, synth=None, addresser=None) -> FakeProvider:
+    return FakeProvider(scripts={
+        "leaf_reviewer": reviewer or [
+            {"verdict": "approve", "comments": [], "summary": "ok"}
+        ],
+        "comment_synthesizer": synth or [],
+        "comment_addresser": addresser or [],
+    })
+
+
+def _engine(log_dir: Path, *, toolkit: FakeLeafLifecycleToolkit,
+            provider: FakeProvider | None = None,
+            dry_run=False, max_iterations=3, default_branch="main"):
+    inputs = LeafLifecycleInputs(
+        repo=REPO,
+        repo_path=log_dir,
+        leaf_id="1",
+        root_item_id=ROOT,
+        pr_number=41,
+        default_branch=default_branch,
+        dry_run=dry_run,
+        max_iterations=max_iterations,
+    )
+    return build_engine(
+        log_dir,
+        inputs=inputs,
+        toolkit=toolkit,
+        provider=provider or _provider(),
+    )
+
+
+def _completed_map(log_path: Path) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for ev in replay(log_path):
+        if ev["kind"] == "verb_completed":
+            out[ev["node_id"]] = ev["payload"]["outcome"]
+    return out
+
+
+async def test_happy_path_approves_and_merges(log_dir: Path):
+    tk = _toolkit()
+    engine = _engine(log_dir, toolkit=tk)
+    result = await engine.run("happy")
+    assert isinstance(result, Completed)
+    assert result.final_node == "end_merged"
+    res = build_result(_completed_map(log_dir / "happy.events.jsonl"))
+    assert res.final_state == "merged"
+    assert res.merge_sha == "merge-sha-41"
+    assert tk.complete_calls[0]["strategy"] == "squash"
+
+
+async def test_request_changes_loops_once_then_merges(log_dir: Path):
+    tk = _toolkit(push_shas=["push-sha-1"])
+    provider = _provider(
+        reviewer=[
+            {
+                "verdict": "request_changes",
+                "summary": "fix the bug",
+                "comments": [
+                    {"file": "app.py", "line": 10, "body": "fix bug", "severity": "major"}
+                ],
+            },
+            {"verdict": "approve", "comments": [], "summary": "now good"},
+        ],
+        synth=[
+            {
+                "actionable_items": [
+                    {
+                        "file": "app.py",
+                        "line_range": [10, 10],
+                        "change_summary": "fix bug",
+                        "original_comment_ids": [1],
+                    }
+                ],
+                "non_actionable": [],
+            }
+        ],
+        addresser=[
+            {"commits": ["push-sha-1"], "summary": "fixed", "items_addressed": [1]}
+        ],
+    )
+    engine = _engine(log_dir, toolkit=tk, provider=provider)
+    result = await engine.run("loop")
+    assert result.final_node == "end_merged"
+    res = build_result(_completed_map(log_dir / "loop.events.jsonl"))
+    assert res.final_state == "merged"
+    assert res.iterations == 1
+    assert res.comments_addressed == 1
+    assert len(tk.complete_calls) == 1
+
+
+async def test_tests_not_passed_precondition_blocks_before_review(log_dir: Path):
+    tk = _toolkit(mergeability=[_mergeable(checks="failure")])
+    engine = _engine(log_dir, toolkit=tk)
+    result = await engine.run("tests_gate")
+    assert result.final_node == "needs_human_end"
+    completed = _completed_map(log_dir / "tests_gate.events.jsonl")
+    assert completed["check_tests_passed"]["error_kind"] == "needs_human.tests_not_passed"
+    assert "review_leaf" not in completed
+    assert tk.complete_calls == []
+
+
+async def test_tests_status_unknown_precondition_blocks_before_review(log_dir: Path):
+    tk = _toolkit(mergeability=[_mergeable(checks="pending")])
+    engine = _engine(log_dir, toolkit=tk)
+    result = await engine.run("tests_unknown")
+    assert result.final_node == "needs_human_end"
+    completed = _completed_map(log_dir / "tests_unknown.events.jsonl")
+    assert completed["check_tests_passed"]["error_kind"] == "needs_human.tests_status_unknown"
+    assert "review_leaf" not in completed
+
+
+async def test_reviewer_needs_human_routes_to_needs_human(log_dir: Path):
+    tk = _toolkit()
+    engine = _engine(log_dir, toolkit=tk, provider=_provider(reviewer=[
+        {"verdict": "needs_human", "comments": [], "summary": "ambiguous"}
+    ]))
+    result = await engine.run("reviewer_human")
+    assert result.final_node == "needs_human_end"
+    res = build_result(_completed_map(log_dir / "reviewer_human.events.jsonl"))
+    assert res.final_state == "needs_human"
+
+
+async def test_max_iterations_escalates(log_dir: Path):
+    tk = _toolkit(push_shas=["sha-1", "sha-2"])
+    review1 = {
+        "verdict": "request_changes",
+        "summary": "same fix",
+        "comments": [{"file": "a.py", "line": 1, "body": "fix", "severity": "major"}],
+    }
+    review2 = {
+        "verdict": "request_changes",
+        "summary": "second fix",
+        "comments": [{"file": "a.py", "line": 2, "body": "add test", "severity": "major"}],
+    }
+    synth1 = {
+        "actionable_items": [{
+            "file": "a.py", "line_range": [1, 1], "change_summary": "fix", "original_comment_ids": [1]
+        }],
+        "non_actionable": [],
+    }
+    synth2 = {
+        "actionable_items": [{
+            "file": "a.py", "line_range": [2, 2], "change_summary": "add test", "original_comment_ids": [1]
+        }],
+        "non_actionable": [],
+    }
+    addr = {"commits": ["sha-x"], "summary": "fixed", "items_addressed": [1]}
+    engine = _engine(
+        log_dir,
+        toolkit=tk,
+        provider=_provider(
+            reviewer=[review1, review2],
+            synth=[synth1, synth2],
+            addresser=[addr, addr],
+        ),
+        max_iterations=1,
+    )
+    result = await engine.run("max_iter")
+    assert result.final_node == "needs_human_end"
+    completed = _completed_map(log_dir / "max_iter.events.jsonl")
+    assert completed["check_progress"]["error_kind"] == "needs_human.max_iterations"
+
+
+async def test_same_sha_twice_trips_no_progress(log_dir: Path):
+    tk = _toolkit(push_shas=["same-sha", "same-sha"])
+    review = {
+        "verdict": "request_changes",
+        "summary": "same fix",
+        "comments": [{"file": "a.py", "line": 1, "body": "fix", "severity": "major"}],
+    }
+    synth = {
+        "actionable_items": [{
+            "file": "a.py", "line_range": [1, 1], "change_summary": "fix", "original_comment_ids": [1]
+        }],
+        "non_actionable": [],
+    }
+    addr = {"commits": ["same-sha"], "summary": "fixed", "items_addressed": [1]}
+    engine = _engine(
+        log_dir,
+        toolkit=tk,
+        provider=_provider(reviewer=[review, review], synth=[synth, synth], addresser=[addr, addr]),
+    )
+    result = await engine.run("no_progress")
+    assert result.final_node == "needs_human_end"
+    completed = _completed_map(log_dir / "no_progress.events.jsonl")
+    assert completed["check_progress"]["error_kind"] == "needs_human.no_progress"
+
+
+async def test_same_findings_twice_on_new_sha_escalates(log_dir: Path):
+    tk = _toolkit(push_shas=["sha-1", "sha-2"])
+    review = {
+        "verdict": "request_changes",
+        "summary": "same fix",
+        "comments": [{"file": "a.py", "line": 1, "body": "fix", "severity": "major"}],
+    }
+    synth = {
+        "actionable_items": [{
+            "file": "a.py", "line_range": [1, 1], "change_summary": "fix", "original_comment_ids": [1]
+        }],
+        "non_actionable": [],
+    }
+    addr = {"commits": ["sha-x"], "summary": "fixed", "items_addressed": [1]}
+    engine = _engine(
+        log_dir,
+        toolkit=tk,
+        provider=_provider(reviewer=[review, review], synth=[synth, synth], addresser=[addr, addr]),
+    )
+    result = await engine.run("same_findings")
+    assert result.final_node == "needs_human_end"
+    completed = _completed_map(log_dir / "same_findings.events.jsonl")
+    assert completed["check_progress"]["error_kind"] == "needs_human.same_findings"
+
+
+@pytest.mark.parametrize(
+    ("report", "error_kind"),
+    [
+        (_mergeable(mergeable=False, state="dirty", checks="failure", conflicts=True), "needs_human.conflicts"),
+        (_mergeable(mergeable=True, state="blocked", checks="failure"), "needs_human.tests_not_passed"),
+        (_mergeable(mergeable=True, state="blocked", checks="pending"), "needs_human.tests_status_unknown"),
+        (_mergeable(mergeable=None, state="unknown", checks="success", policies=False), "needs_human.mergeability_unknown"),
+    ],
+)
+async def test_mergeability_fail_closed_paths(log_dir: Path, report, error_kind):
+    precheck = _mergeable()
+    tk = _toolkit(mergeability=[precheck, report])
+    engine = _engine(log_dir, toolkit=tk)
+    result = await engine.run(f"mergeability_{error_kind.split('.')[-1]}")
+    assert result.final_node == "needs_human_end"
+    completed = _completed_map(log_dir / f"mergeability_{error_kind.split('.')[-1]}.events.jsonl")
+    assert completed["check_can_merge"]["error_kind"] == error_kind
+
+
+async def test_scope_violation_rejected_on_initial_fetch(log_dir: Path):
+    tk = _toolkit(prs=[_pr(base="main")])
+    engine = _engine(log_dir, toolkit=tk)
+    result = await engine.run("scope_initial")
+    assert result.final_node == "needs_human_end"
+    completed = _completed_map(log_dir / "scope_initial.events.jsonl")
+    assert completed["assert_leaf_scope"]["error_kind"] == "needs_human.scope_violation"
+
+
+async def test_scope_violation_rejected_on_runtime_recheck(log_dir: Path):
+    tk = _toolkit(prs=[_pr(), _pr(base="main")])
+    engine = _engine(log_dir, toolkit=tk)
+    result = await engine.run("scope_runtime")
+    assert result.final_node == "needs_human_end"
+    completed = _completed_map(log_dir / "scope_runtime.events.jsonl")
+    assert completed["prepare_review"]["error_kind"] == "needs_human.scope_violation"
+
+
+async def test_already_merged_short_circuits(log_dir: Path):
+    tk = _toolkit(prs=[_pr(state="merged", merged=True)])
+    engine = _engine(log_dir, toolkit=tk)
+    result = await engine.run("already")
+    assert result.final_node == "end_already_merged"
+    res = build_result(_completed_map(log_dir / "already.events.jsonl"))
+    assert res.final_state == "already_merged"
+    assert tk.complete_calls == []
+
+
+async def test_dry_run_does_not_call_pr_complete(log_dir: Path):
+    tk = _toolkit()
+    engine = _engine(log_dir, toolkit=tk, dry_run=True)
+    result = await engine.run("dry_merge")
+    assert result.final_node == "end_merged"
+    assert tk.complete_calls == []
+    res = build_result(_completed_map(log_dir / "dry_merge.events.jsonl"))
+    assert res.final_state == "merged"
+
+
+def test_inputs_reject_default_branch_equal_to_expected_base():
+    with pytest.raises(ValueError):
+        LeafLifecycleInputs(
+            repo=REPO,
+            repo_path=Path("."),
+            leaf_id="1",
+            root_item_id=ROOT,
+            pr_number=41,
+            default_branch=f"feature/{ROOT}",
+        )

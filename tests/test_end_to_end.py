@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from requiem.end_to_end import run_pipeline
+from requiem.end_to_end import _resolve_twig_cwd, run_pipeline
 from requiem.kernel import Completed
 
 
@@ -36,6 +36,22 @@ def _record_plan(*, decomposable: bool, verdict: str = "approved",
             "plan_artifact": f"/logs/plan-{item_id}.plan.tree.json",
         },
     }
+
+
+def test_resolve_twig_cwd_prefers_repo_root(tmp_path):
+    repo_path = tmp_path / "fanout-worktree"
+    repo_path.mkdir()
+    fallback_repo = tmp_path / "repo-root"
+    fallback_repo.mkdir()
+
+    assert _resolve_twig_cwd(repo_path=repo_path, repo=fallback_repo) == fallback_repo.resolve()
+
+
+def test_resolve_twig_cwd_falls_back_to_repo_path(tmp_path):
+    fallback_repo = tmp_path / "repo-root"
+    fallback_repo.mkdir()
+
+    assert _resolve_twig_cwd(repo_path=fallback_repo, repo=None) == fallback_repo.resolve()
 
 
 class _Calls:
@@ -92,6 +108,42 @@ def _factories(calls: _Calls, *, decomposable: bool, plan_verdict: str = "approv
         return _E()
 
     return planning_factory, commit_factory, executor_factory
+
+
+async def test_run_pipeline_prefers_repo_root_for_twig_client(tmp_path, monkeypatch):
+    repo_path = tmp_path / "worktree"
+    repo_path.mkdir()
+    repo_root = tmp_path / "repo-root"
+    repo_root.mkdir()
+    sentinel = object()
+    observed: dict[str, Path | None] = {}
+
+    def fake_make_twig_client(*, repo_path: Path | None, repo: Path | None) -> object:
+        observed["repo_path"] = repo_path
+        observed["repo"] = repo
+        return sentinel
+
+    monkeypatch.setattr("requiem.end_to_end._make_twig_client", fake_make_twig_client)
+
+    calls = _Calls()
+    pf, cf, ef = _factories(calls, decomposable=False, item_id=500)
+
+    def planning_factory(log_dir, *, item_id=500, twig=None, provider=None,
+                         gate_handler=None, process_config=None):
+        assert twig is sentinel
+        return pf(log_dir, item_id=item_id, twig=twig, provider=provider,
+                  gate_handler=gate_handler, process_config=process_config)
+
+    result = await run_pipeline(
+        500, log_dir=tmp_path, board="requiem-500", assignee="w",
+        live=True, repo_path=repo_path, repo=repo_root,
+        planning_factory=planning_factory, commit_factory=cf, executor_factory=ef,
+    )
+
+    assert result.stage == "executor"
+    assert result.status == "delivered"
+    assert observed["repo_path"] is None
+    assert observed["repo"] == repo_root
 
 
 async def test_leaf_root_dispatches_root_as_single_leaf(tmp_path):

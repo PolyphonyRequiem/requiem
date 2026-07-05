@@ -31,6 +31,7 @@ from requiem.clients.gh import (
     GhUnknownError,
     _PR_FIELDS,
 )
+from requiem.clients.repo import MergeCapableRepoPlatform
 
 
 # ---- subprocess mock harness ------------------------------------------
@@ -94,6 +95,10 @@ def _pr_payload(**overrides: Any) -> dict[str, Any]:
 
 
 # ---- happy paths ------------------------------------------------------
+
+
+def test_gh_client_satisfies_merge_capable_platform_at_runtime() -> None:
+    assert isinstance(GhClient(), MergeCapableRepoPlatform)
 
 
 def test_pr_view_happy_path_parses_all_fields() -> None:
@@ -206,6 +211,134 @@ def test_default_branch_raises_on_missing_field() -> None:
     with p:
         with pytest.raises(GhUnknownError):
             asyncio.run(GhClient().default_branch("acme/widgets"))
+
+
+def test_pr_mergeability_maps_clean_state() -> None:
+    client = GhClient()
+    seen: list[str] = []
+
+    async def fake_api(endpoint: str, method: str = "GET", body=None):
+        seen.append(endpoint)
+        assert method == "GET"
+        if endpoint == "repos/acme/widgets/pulls/42":
+            return {
+                "mergeable": True,
+                "mergeable_state": "clean",
+                "head": {"sha": "headsha42"},
+            }
+        if endpoint == "repos/acme/widgets/commits/headsha42/status":
+            return {"state": "success", "statuses": [{"context": "ci", "state": "success"}]}
+        if endpoint == "repos/acme/widgets/commits/headsha42/check-runs":
+            return {"check_runs": [{"status": "completed", "conclusion": "success"}]}
+        raise AssertionError(endpoint)
+
+    client.api = fake_api  # type: ignore[method-assign]
+    report = asyncio.run(client.pr_mergeability("acme/widgets", 42))
+    assert seen == [
+        "repos/acme/widgets/pulls/42",
+        "repos/acme/widgets/commits/headsha42/status",
+        "repos/acme/widgets/commits/headsha42/check-runs",
+    ]
+    assert report.mergeable is True
+    assert report.mergeable_state == "clean"
+    assert report.checks_state == "success"
+    assert report.conflicts is False
+    assert report.policies_satisfied is True
+
+
+def test_pr_mergeability_without_any_checks_reports_unknown() -> None:
+    client = GhClient()
+
+    async def fake_api(endpoint: str, method: str = "GET", body=None):
+        if endpoint == "repos/acme/widgets/pulls/42":
+            return {
+                "mergeable": True,
+                "mergeable_state": "clean",
+                "head": {"sha": "headsha42"},
+            }
+        if endpoint == "repos/acme/widgets/commits/headsha42/status":
+            return {"state": "pending", "statuses": []}
+        if endpoint == "repos/acme/widgets/commits/headsha42/check-runs":
+            return {"check_runs": []}
+        raise AssertionError(endpoint)
+
+    client.api = fake_api  # type: ignore[method-assign]
+    report = asyncio.run(client.pr_mergeability("acme/widgets", 42))
+    assert report.checks_state == "unknown"
+
+
+def test_pr_complete_refuses_to_mutate_on_expected_head_mismatch() -> None:
+    client = GhClient()
+    touched = {"api": False}
+
+    async def fake_view(repo: str, number: int):
+        return GhPullRequest(
+            number=number,
+            title="leaf",
+            state="OPEN",
+            merged=False,
+            merged_at=None,
+            head="impl/700-2",
+            base="feature/700",
+            url="https://example.test/pr/42",
+        )
+
+    async def fake_api(endpoint: str, method: str = "GET", body=None):
+        touched["api"] = True
+        return {"merged": True, "sha": "deadbeef"}
+
+    client.pr_view = fake_view  # type: ignore[method-assign]
+    client.api = fake_api  # type: ignore[method-assign]
+
+    with pytest.raises(GhUnknownError):
+        asyncio.run(client.pr_complete(
+            "acme/widgets",
+            42,
+            strategy="squash",
+            expected_head="impl/700-1",
+            expected_base="feature/700",
+        ))
+    assert touched["api"] is False
+
+
+def test_pr_complete_puts_merge_method_and_returns_result() -> None:
+    client = GhClient()
+    seen: dict[str, Any] = {}
+
+    async def fake_view(repo: str, number: int):
+        return GhPullRequest(
+            number=number,
+            title="leaf",
+            state="OPEN",
+            merged=False,
+            merged_at=None,
+            head="impl/700-1",
+            base="feature/700",
+            url="https://example.test/pr/42",
+        )
+
+    async def fake_api(endpoint: str, method: str = "GET", body=None):
+        seen.update({"endpoint": endpoint, "method": method, "body": body})
+        return {"merged": True, "sha": "merge-sha-42"}
+
+    client.pr_view = fake_view  # type: ignore[method-assign]
+    client.api = fake_api  # type: ignore[method-assign]
+    result = asyncio.run(client.pr_complete(
+        "acme/widgets",
+        42,
+        strategy="squash",
+        expected_head="impl/700-1",
+        expected_base="feature/700",
+    ))
+    assert seen == {
+        "endpoint": "repos/acme/widgets/pulls/42/merge",
+        "method": "PUT",
+        "body": {"merge_method": "squash"},
+    }
+    assert result.number == 42
+    assert result.merged is True
+    assert result.merge_sha == "merge-sha-42"
+    assert result.strategy == "squash"
 
 
 def test_api_get_returns_parsed_dict() -> None:

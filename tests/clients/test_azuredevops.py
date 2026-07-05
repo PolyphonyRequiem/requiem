@@ -29,7 +29,7 @@ from requiem.clients.azuredevops import (
     AdoUnknownError,
     FakeAdoClient,
 )
-from requiem.clients.repo import RepoPlatform, RepoPullRequest
+from requiem.clients.repo import MergeCapableRepoPlatform, RepoPlatform, RepoPullRequest
 
 
 # ---- protocol shape -----------------------------------------------------
@@ -48,6 +48,14 @@ def test_fake_ado_client_satisfies_repoplatform_at_runtime():
     assert isinstance(FakeAdoClient(), RepoPlatform)
 
 
+def test_ado_client_satisfies_merge_capable_platform_at_runtime():
+    assert isinstance(AdoClient(), MergeCapableRepoPlatform)
+
+
+def test_fake_ado_client_satisfies_merge_capable_platform_at_runtime():
+    assert isinstance(FakeAdoClient(), MergeCapableRepoPlatform)
+
+
 def test_ado_client_implements_every_repoplatform_method_async():
     required = (
         "branch_sha", "ensure_branch_ref",
@@ -60,6 +68,17 @@ def test_ado_client_implements_every_repoplatform_method_async():
             assert method is not None, (
                 f"{cls.__name__} missing required method {name!r}"
             )
+            assert inspect.iscoroutinefunction(method), (
+                f"{cls.__name__}.{name} must be async (Protocol contract)"
+            )
+
+
+def test_ado_clients_implement_every_merge_capable_method_async():
+    required = ("pr_mergeability", "pr_complete")
+    for name in required:
+        for cls in (AdoClient, FakeAdoClient):
+            method = getattr(cls, name, None)
+            assert method is not None, f"{cls.__name__} missing required method {name!r}"
             assert inspect.iscoroutinefunction(method), (
                 f"{cls.__name__}.{name} must be async (Protocol contract)"
             )
@@ -284,6 +303,89 @@ def test_default_branch_raises_on_missing_field():
     client, _ = _stub_client([{"id": "abc", "name": "repo"}])
     with pytest.raises(AdoUnknownError):
         asyncio.run(client.default_branch("Contoso/P/repo"))
+
+
+def test_pr_mergeability_maps_succeeded_to_green() -> None:
+    client, calls = _stub_client([
+        {
+            "mergeStatus": "succeeded",
+            "sourceRefName": "refs/heads/impl/700-1",
+        },
+        {"value": [{"name": "refs/heads/impl/700-1", "objectId": "headsha42"}]},
+        {"value": [{"state": "succeeded"}]},
+    ])
+    report = asyncio.run(client.pr_mergeability("Contoso/P/repo", 42))
+    assert calls[0]["url"].endswith("/pullrequests/42")
+    assert calls[1]["url"].endswith("/refs")
+    assert calls[2]["url"].endswith("/commits/headsha42/statuses")
+    assert report.mergeable is True
+    assert report.mergeable_state == "succeeded"
+    assert report.checks_state == "success"
+    assert report.conflicts is False
+    assert report.policies_satisfied is True
+
+
+def test_pr_mergeability_with_no_commit_statuses_reports_unknown() -> None:
+    client, _ = _stub_client([
+        {
+            "mergeStatus": "succeeded",
+            "sourceRefName": "refs/heads/impl/700-1",
+        },
+        {"value": [{"name": "refs/heads/impl/700-1", "objectId": "headsha42"}]},
+        {"value": []},
+    ])
+    report = asyncio.run(client.pr_mergeability("Contoso/P/repo", 42))
+    assert report.checks_state == "unknown"
+
+
+def test_pr_complete_refuses_to_patch_on_expected_base_mismatch() -> None:
+    client, calls = _stub_client([{
+        "status": "active",
+        "sourceRefName": "refs/heads/impl/700-1",
+        "targetRefName": "refs/heads/feature/other",
+    }])
+    with pytest.raises(AdoUnknownError):
+        asyncio.run(client.pr_complete(
+            "Contoso/P/repo",
+            42,
+            strategy="squash",
+            expected_head="impl/700-1",
+            expected_base="feature/700",
+        ))
+    assert len(calls) == 1
+    assert calls[0]["method"] == "GET"
+
+
+def test_pr_complete_patches_completion_options_with_strategy() -> None:
+    client, calls = _stub_client([
+        {
+            "status": "active",
+            "sourceRefName": "refs/heads/impl/700-1",
+            "targetRefName": "refs/heads/feature/700",
+        },
+        {
+            "pullRequestId": 42,
+            "status": "completed",
+            "lastMergeCommit": {"commitId": "merge-ado-42"},
+        },
+    ])
+    result = asyncio.run(client.pr_complete(
+        "Contoso/P/repo",
+        42,
+        strategy="squash",
+        expected_head="impl/700-1",
+        expected_base="feature/700",
+    ))
+    assert calls[1]["method"] == "PATCH"
+    assert calls[1]["url"].endswith("/pullrequests/42")
+    assert calls[1]["body"] == {
+        "status": "completed",
+        "completionOptions": {"mergeStrategy": "squash"},
+    }
+    assert result.number == 42
+    assert result.merged is True
+    assert result.merge_sha == "merge-ado-42"
+    assert result.strategy == "squash"
 
 
 # ---- FakeAdoClient in-memory behaviour ----------------------------------

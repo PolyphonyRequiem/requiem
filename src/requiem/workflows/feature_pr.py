@@ -32,8 +32,11 @@ Design invariants (ADR-0018):
 * **Trunk-before-fan-out.** This workflow does *not* create ``feature/<root>``
   — it is bootstrapped earlier (driver, pre-dispatch). Here we only verify the
   leaf PRs landed on it and open the trunk→main PR.
-* **No self-merge.** ``GhClient`` has no ``pr_merge``; review→merge of the
-  trunk PR is owned by ``pr_lifecycle`` / the human, exactly like ``plan_pr``.
+* **No self-merge on the final feature PR.** This workflow never merges the
+  ``feature/<root>`` → base PR; review→merge of that final trunk PR is owned by
+  ``pr_lifecycle`` / the human, exactly like ``plan_pr``. This invariant is
+  deliberately scoped to the final feature PR — leaf PR self-merge is owned by
+  ``leaf_lifecycle.py``.
 * **Fail closed on a partial set.** If any expected leaf PR is missing,
   wrong-head, wrong-base, or unmerged, we escalate to a human rather than
   opening an integration PR over an incomplete trunk.

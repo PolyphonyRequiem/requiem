@@ -81,10 +81,12 @@ part of what an Option below must pin down.
    trunk-integrated only when a PR exists with `head==impl/<root>-<item>`,
    `base==feature/<root>`, `merged==true`. "Hermes task delivered" ≠ "merged
    into trunk."
-3. **No self-merge.** Whatever opens the trunk→main PR must **not** merge leaf
-   branches or the trunk itself — merge stays owned by `pr_lifecycle` / the
-   human, consistent with "GhClient has no `pr_merge`" (plan_pr.py:21-23) and
-   INV-NO-DIRECT-TRUNK-COMMITS (ADR-0006).
+3. **No self-merge on the final feature PR.** Whatever opens the
+   `feature/<root>`→default-branch PR must **not** merge that final PR — merge
+   stays owned by `pr_lifecycle` / the human, consistent with "GhClient has no
+   `pr_merge`" (plan_pr.py:21-23) and INV-NO-DIRECT-TRUNK-COMMITS (ADR-0006).
+   This invariant is intentionally scoped to the final feature PR; leaf PRs are
+   allowed to self-merge under Requiem's own guarded reviewer loop.
 4. **Expected-leaf set is authoritative.** The integration gate must read the
    committed plan / executor leaf set, not discover leaves by GitHub search
    alone (avoids adopting a partial/stale set).
@@ -119,12 +121,22 @@ producer* on `impl/<root>-<item>`; requiem owns everything around it:
    head+base match — exactly plan_pr.py's pattern). This sidesteps the
    missing Hermes `--base` flag entirely: requiem never needed Hermes to
    target the PR, because requiem opens it. The worker just supplies commits.
-3. **feature_pr readiness + final PR:** once every expected leaf PR is
+3. **Leaf self-merge lifecycle:** once a leaf PR exists, `leaf_lifecycle.py`
+   may self-merge `impl/<root>-<item>` → `feature/<root>` **only** when all
+   three safety gates hold: (a) the leaf PR's own verified CI/build status is
+   green before any reviewer runs (`RepoMergeabilityReport.checks_state ==
+   "success"` — never a self-reported worker handoff claim), (b) Requiem's
+   internal reviewer loop ends in approval, and (c) the merge path passes a
+   three-layer base-branch guard (constructor-time leaf/base validation,
+   runtime re-fetch scope validation, and platform-native `expected_head` /
+   `expected_base` refusal-to-mutate checks in `pr_complete`). Any ambiguity
+   fails closed to `needs_human`.
+4. **feature_pr readiness + final PR:** once every expected leaf PR is
    `merged==true` into the trunk (invariant 2) and requirement dispositions
    are satisfied (ADR-0006), a small `feature_pr` workflow/step opens (reuses)
    `feature/<root>` → `main` and hands off to `pr_lifecycle` / the human. No
    self-merge.
-4. **Drift policy:** for v0, `feature_pr` only *opens* the trunk→main PR and
+5. **Drift policy:** for v0, `feature_pr` only *opens* the trunk→main PR and
    lets `pr_lifecycle` surface an unmergeable (drifted) PR to the human. A
    `rebase_onto_target` verb is deferred (ADR-0007 §5.1 foresaw it) and, if
    added, must be the *only* writer to the trunk to respect
@@ -177,7 +189,13 @@ Adopt **Option C** (ratified 2026-06-05). Specifically:
    post-merge re-derivation of the map is the driver's job (a default
    `gh pr list` is open-only), consistent with requiem persisting every
    decision in the event log.
-3. **`feature_pr.py`** — load expected leaves from the committed plan; verify
+3. **`leaf_lifecycle.py`** — reviewer-and-rework self-merge for leaf PRs only.
+   **STATUS: landed 2026-07-05.** Runs serially per leaf after `leaf_pr`,
+   requires green PR CI/build status before review, reuses the
+   `pr_lifecycle.py` comment synthesizer/addresser loop for rework, and merges
+   with squash only after an approve verdict plus mergeability checks. A blocker
+   leaf stops the batch; the final `feature/<root>` PR remains human-gated.
+4. **`feature_pr.py`** — load expected leaves from the committed plan; verify
    trunk exists; verify every expected leaf PR is head/base-correct and
    merged; (optionally) verify requirement dispositions or gate if omitted;
    open/reuse `feature/<root>` → `main`; backlink; end. No self-merge.

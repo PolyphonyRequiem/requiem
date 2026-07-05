@@ -40,6 +40,7 @@ from requiem.clients.gh import (
     GhNotFoundError,
     GhPullRequest,
 )
+from requiem.clients.repo import RepoCompleteResult, RepoMergeabilityReport
 from requiem.clients.twig import (
     TwigItem,
     TwigItemNotFoundError,
@@ -187,6 +188,10 @@ class FakeGhClient:
         default_factory=dict
     )
     search_queries: list[dict[str, Any]] = field(default_factory=list)
+    mergeability_by_number: dict[tuple[str, int], RepoMergeabilityReport | BaseException] = field(
+        default_factory=dict
+    )
+    complete_calls: list[dict[str, Any]] = field(default_factory=list)
 
     async def pr_search(
         self, repo: str, query: str, limit: int = 30
@@ -201,6 +206,48 @@ class FakeGhClient:
         if isinstance(entry, BaseException):
             raise entry
         return entry
+
+    async def pr_mergeability(self, repo: str, number: int) -> RepoMergeabilityReport:
+        entry = self.mergeability_by_number.get((repo, number))
+        if entry is None:
+            return RepoMergeabilityReport(
+                mergeable=True,
+                mergeable_state="clean",
+                checks_state="success",
+                conflicts=False,
+                policies_satisfied=True,
+            )
+        if isinstance(entry, BaseException):
+            raise entry
+        return entry
+
+    async def pr_complete(
+        self,
+        repo: str,
+        number: int,
+        *,
+        strategy: str,
+        expected_head: str | None = None,
+        expected_base: str | None = None,
+    ) -> RepoCompleteResult:
+        pr = await self.pr_view(repo, number)
+        if expected_head is not None and pr.head != expected_head:
+            raise GhNotFoundError(f"fake: head mismatch for PR {number}")
+        if expected_base is not None and pr.base != expected_base:
+            raise GhNotFoundError(f"fake: base mismatch for PR {number}")
+        self.complete_calls.append({
+            "repo": repo,
+            "number": number,
+            "strategy": strategy,
+            "expected_head": expected_head,
+            "expected_base": expected_base,
+        })
+        return RepoCompleteResult(
+            number=number,
+            merged=True,
+            merge_sha="fake-merge-sha",
+            strategy=strategy,
+        )
 
 
 def make_pr(
