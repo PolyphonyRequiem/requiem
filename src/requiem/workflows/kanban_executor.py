@@ -82,6 +82,11 @@ from requiem.handoff import (
 )
 from requiem.kernel import Engine
 from requiem.plan_tree import PlanArtifactError, load_committed_leaves
+from requiem.workflows.leaf_deps import (
+    compute_blocked,
+    releasable_leaves,
+    validate_dep_graph,
+)
 from requiem.outcomes import (
     NeedsHuman,
     PermanentFailure,
@@ -223,6 +228,7 @@ def build_verb_registry(inputs: ExecInputs) -> VerbRegistry:
                     body=r.body,
                     branch=branch_model.impl_branch(inputs.root_item, r.real_id),
                     skills=inputs.skills,
+                    deps=tuple(str(d) for d in r.deps),
                 )
                 for r in resolved
             ]
@@ -447,27 +453,21 @@ def build_verb_registry(inputs: ExecInputs) -> VerbRegistry:
         settled_self = {lid for lid, p in by_leaf.items()
                         if p["requiem_outcome"] != _OUT_IN_FLIGHT}
         nondelivered = settled_self - delivered
-        blocked: set[str] = set()
-        changed = True
-        while changed:
-            changed = False
-            for lid, deps in deps_of.items():
-                if lid in settled_self or lid in blocked:
-                    continue
-                if any(d in nondelivered or d in blocked for d in deps):
-                    blocked.add(lid)
-                    changed = True
+        blocked = compute_blocked(
+            deps_of, nondelivered=nondelivered, settled=settled_self,
+        )
 
         # A child is releasable once every parent is delivered AND its task has
         # not yet started (status ready/todo). This covers both the fresh
         # (unassigned) child and the crash-resumed one (assigned but never
         # dispatched), so release is idempotent across a crash between
         # assign and dispatch — we (re)assign if needed, then (re)dispatch.
+        candidates = releasable_leaves(
+            deps_of, delivered=delivered, settled=settled_self, blocked=blocked,
+        )
         to_release = [
-            lid for lid, deps in deps_of.items()
-            if deps
-            and lid not in settled_self and lid not in blocked
-            and all(d in delivered for d in deps)
+            lid for lid in candidates
+            if deps_of[lid]
             and leaf_to_task[lid] in tasks
             and tasks[leaf_to_task[lid]].status in ("ready", "todo")
         ]
@@ -582,42 +582,12 @@ def _validate_dep_graph(
     dependencies, the only leaves requiem may release immediately; the rest are
     held until requiem records acceptance of their parents (ADR-0017 §3).
 
-    The committed plan tree is a pure decomposition hierarchy whose leaves are
-    independent, so in the real path every leaf is ready. Explicit deps (the
-    demo path, or future callers) are where this guard earns its keep.
+    Thin wrapper over ``leaf_deps.validate_dep_graph`` (shared with the
+    in-process ``fanout`` backend, ADR-00xx) — the committed plan tree can now
+    carry real sibling deps (planner ``depends_on``), so this guard is no
+    longer demo-only.
     """
-    ids = {leaf.leaf_id for leaf in leaves}
-    deps_of: dict[str, tuple[str, ...]] = {}
-    for leaf in leaves:
-        for dep in leaf.deps:
-            if dep == leaf.leaf_id:
-                return f"leaf {leaf.leaf_id!r} depends on itself", ()
-            if dep not in ids:
-                return (
-                    f"leaf {leaf.leaf_id!r} depends on unknown leaf {dep!r}",
-                    (),
-                )
-        deps_of[leaf.leaf_id] = leaf.deps
-
-    # Kahn's algorithm: if we cannot topologically order the graph there is a
-    # cycle, which would leave dependent leaves permanently held (deadlock).
-    pending = {lid: set(deps) for lid, deps in deps_of.items()}
-    ordered: list[str] = []
-    frontier = [lid for lid, d in pending.items() if not d]
-    while frontier:
-        lid = frontier.pop()
-        ordered.append(lid)
-        for other, d in pending.items():
-            if lid in d:
-                d.discard(lid)
-                if not d and other not in ordered and other not in frontier:
-                    frontier.append(other)
-    if len(ordered) != len(pending):
-        cyclic = sorted(lid for lid, d in pending.items() if d)
-        return f"dependency cycle among leaves {cyclic}", ()
-
-    ready = tuple(leaf.leaf_id for leaf in leaves if not leaf.deps)
-    return None, ready
+    return validate_dep_graph({leaf.leaf_id: leaf.deps for leaf in leaves})
 
 
 def _plan_hash(leaves: list[LeafSpec]) -> str:

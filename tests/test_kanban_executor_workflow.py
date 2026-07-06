@@ -282,6 +282,35 @@ async def test_resolves_committed_plan_to_real_leaf_ids(tmp_path: Path):
     assert len(per_leaf) == 3 and all(_is_delivered(p) for p in per_leaf)
 
 
+async def test_committed_plan_depends_on_threads_into_leaf_deps_and_gates_release(
+    tmp_path: Path,
+):
+    """A `depends_on` declared on grandchild A2 (naming sibling A1) must
+    surface as `LeafSpec.deps` on the real leaf id, and the pre-existing
+    wave-release machinery (poll_kanban) must hold A2's task un-dispatched
+    until A1 is delivered — even though both still land by end of run."""
+    tree, committed = _committed_artifacts(tmp_path)
+    tree_data = json.loads(tree.read_text(encoding="utf-8"))
+    # Leaf A2 (children[0].proposals[1]) depends on sibling A1 (slot 0).
+    tree_data["children"][0]["proposals"][1]["depends_on"] = [0]
+    tree.write_text(json.dumps(tree_data), encoding="utf-8")
+
+    kanban = SimKanbanClient()
+    engine = _artifact_engine(tmp_path, kanban=kanban, tree=tree, committed=committed)
+    result = await engine.run("commit")
+    assert isinstance(result, Completed)
+    assert result.disposition == "completed"
+
+    completed = _completed(tmp_path / "commit.events.jsonl")
+    resolved = completed["resolve_leaves"]["value"]
+    by_id = {l["leaf_id"]: l for l in resolved["leaves"]}
+    # A1 = 8101, A2 = 8102 (see _committed_artifacts id_map).
+    assert by_id["8101"]["deps"] == []
+    assert by_id["8102"]["deps"] == ["8101"]
+    per_leaf = completed["poll_kanban"]["value"]["per_leaf"]
+    assert len(per_leaf) == 3 and all(_is_delivered(p) for p in per_leaf)
+
+
 async def test_dry_run_committed_manifest_fails_closed(tmp_path: Path):
     tree, committed = _committed_artifacts(tmp_path)
     # Flip the manifest to a dry-run preview (no real ids to dispatch).
