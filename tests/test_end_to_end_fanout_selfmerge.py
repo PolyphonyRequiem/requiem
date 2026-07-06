@@ -192,9 +192,12 @@ async def test_fanout_leaves_target_trunk_not_base_branch(tmp_path: Path):
     assert result.stage == "leaf_lifecycle"
 
 
-async def test_fanout_leaf_lifecycle_stops_on_first_blocker(tmp_path: Path):
-    """Two landed leaves; the first blocks in leaf_lifecycle — the second must
-    never be dispatched to the self-merge loop (stop_on_first_blocker)."""
+async def test_fanout_leaf_lifecycle_continues_past_a_blocked_leaf(tmp_path: Path):
+    """Two landed leaves; the first blocks in leaf_lifecycle. Run #36
+    postmortem: the old behaviour abandoned every remaining leaf the moment
+    ONE bad merge was hit — 19 good PRs sat unmerged over 4 stragglers in
+    that run. The second (mergeable) leaf must still get its own self-merge
+    attempt."""
     fanout_calls = _FanoutCalls()
     lifecycle_calls = _LifecycleCalls()
     outcomes = [
@@ -219,9 +222,11 @@ async def test_fanout_leaf_lifecycle_stops_on_first_blocker(tmp_path: Path):
     )
     assert result.status == "paused"
     assert result.stage == "leaf_lifecycle"
-    assert len(lifecycle_calls.inputs) == 1  # leaf 2 never dispatched
-    assert lifecycle_calls.inputs[0].leaf_id == "1"
-    assert result.leaf_lifecycle_results == (("1", "needs_human"),)
+    assert len(lifecycle_calls.inputs) == 2  # leaf 2 IS dispatched
+    assert {c.leaf_id for c in lifecycle_calls.inputs} == {"1", "2"}
+    assert result.leaf_lifecycle_results == (("1", "needs_human"), ("2", "merged"))
+    assert "1/2" in result.detail  # 1 of 2 landed leaves merged
+
 
 
 async def test_fanout_needs_human_when_pr_number_missing(tmp_path: Path):
@@ -248,6 +253,51 @@ async def test_fanout_needs_human_when_pr_number_missing(tmp_path: Path):
     assert result.stage == "leaf_lifecycle"
     assert "no PR number" in result.detail
     assert len(lifecycle_calls.inputs) == 0  # never dispatched
+
+
+async def test_fanout_stragglers_do_not_block_self_merge_of_landed_leaves(
+    tmp_path: Path,
+):
+    """Run #36: 19/23 leaves landed cleanly, 4 needed a human at the FAN-OUT
+    stage — but self-merge never ran for ANY of the 19 good leaves because
+    the loop was gated on zero needs_human/failed leaves across the whole
+    fan-out. A leaf that needed a human at fan-out never reaches this loop
+    at all (its disposition isn't "completed"); the leaves that DID land
+    must still get their self-merge attempt."""
+    fanout_calls = _FanoutCalls()
+    lifecycle_calls = _LifecycleCalls()
+    outcomes = [
+        {"real_id": 1, "disposition": "completed", "final_node": "end",
+         "child_run_id": "fanout-700__leaf-1", "skipped": False,
+         "pr_number": 9001, "branch_name": "impl/700-1"},
+        {"real_id": 2, "disposition": "completed", "final_node": "end",
+         "child_run_id": "fanout-700__leaf-2", "skipped": False,
+         "pr_number": 9002, "branch_name": "impl/700-2"},
+        {"real_id": 3, "disposition": "needs_human", "final_node": "invoke_coder",
+         "child_run_id": "fanout-700__leaf-3", "skipped": False,
+         "pr_number": None, "branch_name": ""},
+    ]
+    result = await run_pipeline(
+        ROOT, log_dir=tmp_path, board="requiem-test",
+        dispatch_backend="fanout", repo_path=tmp_path, github_repo=REPO,
+        base_branch="main", live=True,
+        planning_factory=_stub_planning(ROOT),
+        trunk_bootstrap_factory=_stub_trunk(),
+        fanout_factory=_stub_fanout(fanout_calls, outcomes),
+        leaf_lifecycle_factory=_stub_leaf_lifecycle(
+            lifecycle_calls, {"1": "merged", "2": "merged"},
+        ),
+        trunk_sync=_noop_trunk_sync,
+    )
+    # Both landed leaves got their own self-merge attempt, both merged.
+    assert len(lifecycle_calls.inputs) == 2
+    assert {c.leaf_id for c in lifecycle_calls.inputs} == {"1", "2"}
+    assert result.leaf_lifecycle_results == (("1", "merged"), ("2", "merged"))
+    assert result.leaf_lifecycle_verdict == "merged"
+    # Still paused overall (leaf 3 needs a human), but the detail reflects
+    # that the landed leaves' merges succeeded, not an abandoned self-merge.
+    assert result.status == "paused"
+    assert "2/2" in result.detail
 
 
 async def test_fanout_not_live_skips_self_merge(tmp_path: Path):

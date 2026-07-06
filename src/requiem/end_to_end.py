@@ -440,26 +440,14 @@ async def _dispatch_in_process(
             fanout_leaves_landed=fo_result.leaves_landed,
         )
 
-    # A surrendered/failed leaf means the fan-out is not cleanly delivered even
-    # though the orchestrator itself reached end_success — surface to a human.
-    if fo_result.leaves_needs_human > 0 or fo_result.leaves_failed > 0:
-        return PipelineResult(
-            item_id=item_id, stage="fanout", status="paused",
-            detail=(f"in-process fan-out: {fo_result.leaves_landed}/"
-                    f"{fo_result.leaves_total} leaves landed; "
-                    f"{fo_result.leaves_needs_human} need a human, "
-                    f"{fo_result.leaves_failed} failed."),
-            decomposable=decomposable, leaf_ids=leaf_ids,
-            plan_artifact=plan_artifact,
-            committed_path=str(committed_path) if committed_path else None,
-            executor_final_node=fo_final,
-            github_repo=github_repo_arg, ado_repo=ado_repo_arg,
-            base_branch=base_branch,
-            trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
-            fanout_verdict=fo_result.verdict,
-            fanout_leaves_total=fo_result.leaves_total,
-            fanout_leaves_landed=fo_result.leaves_landed,
-        )
+    # A surrendered/failed leaf at the FAN-OUT stage does NOT block self-merge
+    # of the leaves that DID land — run #36 postmortem: gating the entire
+    # self-merge loop on "zero needs_human/failed leaves across the whole
+    # fan-out" left 19 good, mergeable PRs sitting unmerged over 4 unrelated
+    # stragglers. Each landed (disposition == "completed") leaf still gets
+    # its own leaf_lifecycle attempt below; the aggregate verdict reflects
+    # the worst outcome across both the fan-out dispatch and the merges.
+    any_fanout_trouble = fo_result.leaves_needs_human > 0 or fo_result.leaves_failed > 0
 
     # All leaves landed. Each in-process implementation child opened its own
     # leaf PR (impl/<root>-<leaf> → trunk_branch, per the base_branch fix
@@ -469,6 +457,11 @@ async def _dispatch_in_process(
     # so fanout-backend runs get the same self-merge behaviour (ADR-0018).
     leaf_lifecycle_verdict: str | None = None
     leaf_lifecycle_results: list[tuple[str, str]] = []
+    # Per-leaf notes for landed leaves whose merge attempt didn't succeed —
+    # surfaced in the final detail so an operator can see exactly which
+    # leaves need attention without abandoning the other leaves' attempts
+    # (run #36: one bad merge previously abandoned every remaining one).
+    leaf_notes: list[str] = []
     if live and github_repo is not None and trunk_branch is not None:
         for outcome in fo_result.outcomes:
             if outcome.disposition != "completed":
@@ -476,27 +469,12 @@ async def _dispatch_in_process(
             leaf_id = str(outcome.real_id)
             if outcome.pr_number is None:
                 leaf_lifecycle_results.append((leaf_id, "needs_human"))
-                leaf_lifecycle_verdict = "needs_human"
-                return PipelineResult(
-                    item_id=item_id, stage="leaf_lifecycle", status="paused",
-                    detail=(
-                        f"leaf lifecycle cannot start for {leaf_id}: no PR "
-                        "number was recovered from its implementation child's "
-                        "log after landing."
-                    ),
-                    decomposable=decomposable, leaf_ids=leaf_ids,
-                    plan_artifact=plan_artifact,
-                    committed_path=str(committed_path) if committed_path else None,
-                    executor_final_node=fo_final,
-                    github_repo=github_repo_arg, ado_repo=ado_repo_arg,
-                    base_branch=base_branch,
-                    trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
-                    fanout_verdict=fo_result.verdict,
-                    fanout_leaves_total=fo_result.leaves_total,
-                    fanout_leaves_landed=fo_result.leaves_landed,
-                    leaf_lifecycle_verdict=leaf_lifecycle_verdict,
-                    leaf_lifecycle_results=tuple(leaf_lifecycle_results),
+                leaf_notes.append(
+                    f"leaf lifecycle cannot start for {leaf_id}: no PR "
+                    "number was recovered from its implementation child's "
+                    "log after landing."
                 )
+                continue
             ll_inputs = leaf_lifecycle_mod.LeafLifecycleInputs(
                 repo=github_repo,
                 repo_path=repo_path,
@@ -519,29 +497,56 @@ async def _dispatch_in_process(
             ll_result = leaf_lifecycle_mod.build_result(_completed_map(log_dir, ll_run))
             leaf_lifecycle_results.append((leaf_id, ll_result.final_state))
             if ll_result.final_state in {"needs_human", "failed"}:
-                leaf_lifecycle_verdict = ll_result.final_state
-                return PipelineResult(
-                    item_id=item_id, stage="leaf_lifecycle", status="paused",
-                    detail=(
-                        f"leaf lifecycle stopped at {leaf_id} "
-                        f"({ll_result.final_state}); remaining leaves were not "
-                        "dispatched to the self-merge loop."
-                    ),
-                    decomposable=decomposable, leaf_ids=leaf_ids,
-                    plan_artifact=plan_artifact,
-                    committed_path=str(committed_path) if committed_path else None,
-                    executor_final_node=fo_final,
-                    github_repo=github_repo_arg, ado_repo=ado_repo_arg,
-                    base_branch=base_branch,
-                    trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
-                    fanout_verdict=fo_result.verdict,
-                    fanout_leaves_total=fo_result.leaves_total,
-                    fanout_leaves_landed=fo_result.leaves_landed,
-                    leaf_lifecycle_verdict=leaf_lifecycle_verdict,
-                    leaf_lifecycle_results=tuple(leaf_lifecycle_results),
+                leaf_notes.append(
+                    f"leaf lifecycle stopped at {leaf_id} "
+                    f"({ll_result.final_state})."
                 )
-        if leaf_lifecycle_results:
+        states = [s for _, s in leaf_lifecycle_results]
+        if any(s == "failed" for s in states):
+            leaf_lifecycle_verdict = "failed"
+        elif any(s == "needs_human" for s in states):
+            leaf_lifecycle_verdict = "needs_human"
+        elif states:
             leaf_lifecycle_verdict = "merged"
+
+    merged_count = sum(
+        1 for _, s in leaf_lifecycle_results if s in ("merged", "already_merged")
+    )
+    trouble = any_fanout_trouble or leaf_lifecycle_verdict in ("needs_human", "failed")
+
+    if trouble:
+        parts = []
+        if any_fanout_trouble:
+            parts.append(
+                f"in-process fan-out: {fo_result.leaves_landed}/"
+                f"{fo_result.leaves_total} leaves landed; "
+                f"{fo_result.leaves_needs_human} need a human, "
+                f"{fo_result.leaves_failed} failed."
+            )
+        if leaf_lifecycle_results:
+            parts.append(
+                f"self-merge: {merged_count}/{len(leaf_lifecycle_results)} "
+                "landed leaves merged."
+            )
+        parts.extend(leaf_notes)
+        detail = " ".join(parts) if parts else "in-process fan-out paused."
+        stage = "leaf_lifecycle" if leaf_lifecycle_results else "fanout"
+        return PipelineResult(
+            item_id=item_id, stage=stage, status="paused",
+            detail=detail,
+            decomposable=decomposable, leaf_ids=leaf_ids,
+            plan_artifact=plan_artifact,
+            committed_path=str(committed_path) if committed_path else None,
+            executor_final_node=fo_final,
+            github_repo=github_repo_arg, ado_repo=ado_repo_arg,
+            base_branch=base_branch,
+            trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
+            fanout_verdict=fo_result.verdict,
+            fanout_leaves_total=fo_result.leaves_total,
+            fanout_leaves_landed=fo_result.leaves_landed,
+            leaf_lifecycle_verdict=leaf_lifecycle_verdict,
+            leaf_lifecycle_results=tuple(leaf_lifecycle_results),
+        )
 
     detail = (f"in-process fan-out delivered {fo_result.leaves_landed} "
               f"leaf/leaves" + (" (previewed; dry-run)" if not live else ""))
