@@ -441,6 +441,7 @@ def build_verb_registry(
                     "state": proposal.get("state") or "Proposed",
                     "work_item_type": proposal.get("work_item_type") or "",
                     "area_path": proposal.get("area_path") or "",
+                    "description": proposal.get("description") or "",
                 },
                 inspected_artifacts=(
                     f"planner:proposal/{parent_plan_id or 'recursive'}@{item_id}",
@@ -469,6 +470,15 @@ def build_verb_registry(
                 error_kind="twig_unknown",
                 message=f"twig error fetching {item_id}: {e}",
             )
+        # ADR (gap fix, 2026-07-05 dogfood run #34 postmortem): the planner
+        # and reviewer previously only ever saw title/type/state — never
+        # the work item's actual description. On AB#62759077 the title
+        # ("Capacity-aware VMSS SKU fallback for regional cluster
+        # deployments") was terse enough that the planner filled the gap
+        # by inventing a whole "provision brand-new regions" subtree, even
+        # though the real description explicitly scoped this to EXISTING
+        # regions/existing bicep integration points. Threading the real
+        # description through closes the grounding gap at its source.
         return Success(
             value={
                 "item_id": item.id,
@@ -476,6 +486,10 @@ def build_verb_registry(
                 "state": item.state,
                 "work_item_type": item.work_item_type,
                 "area_path": item.area_path,
+                "description": (item.raw.get("fields") or {}).get(
+                    "System.Description"
+                )
+                or "",
             },
             inspected_artifacts=(f"twig:item/{item.id}",),
         )
@@ -622,10 +636,25 @@ def build_verb_registry(
                     f"'{item['work_item_type']}':\n  {guidance.strip()}\n"
                 )
 
+            # Description grounding fix (2026-07-05): without this the
+            # planner only ever sees the bare title and hallucinates scope
+            # to fill the gap. No truncation — see ADR-0025's "trust the
+            # input, show it complete" precedent; a truncated description
+            # invites the same false-signal problem truncated children
+            # descriptions caused for the reviewer.
+            desc = (item.get("description") or "").strip()
+            description_line = (
+                f"Work item description (ground every proposed child in "
+                f"this, not just the title):\n{desc}\n"
+                if desc
+                else ""
+            )
+
             base = (
                 f"Plan work item AB#{item['item_id']} — \"{item['title']}\" "
                 f"(type={item['work_item_type']}, state={item['state']}).\n"
                 f"Current planning depth: {current_depth} of {max_depth}.\n"
+                + description_line
                 + policy_line
                 + guidance_line
             )
@@ -676,14 +705,30 @@ def build_verb_registry(
             else:
                 child_block = "\n  proposed children: none (leaf plan)\n"
 
+            # Description grounding fix (2026-07-05): give the reviewer the
+            # same source text the planner had, so it can catch scope
+            # drift (children that don't match the actual ask) — not just
+            # internal inconsistency within the planner's own output.
+            desc = (item.get("description") or "").strip()
+            desc_block = (
+                f"\n  original work item description:\n    {desc}\n"
+                if desc
+                else ""
+            )
+
             return (
                 f"Review the following plan for AB#{item['item_id']} "
-                f"(\"{item['title']}\"):\n\n"
+                f"(\"{item['title']}\"):\n"
+                f"{desc_block}\n"
                 f"  summary: {planner['summary']}\n"
                 f"  decomposable: {planner['decomposable']}\n"
                 f"  estimated_complexity: {planner['estimated_complexity']}\n"
                 f"  rationale: {planner['rationale']}"
                 f"{child_block}\n"
+                "Check that the children are grounded in the original "
+                "description above (not just the title) before approving — "
+                "escalate or request revision if a child invents scope "
+                "(e.g. work that already exists) not supported by it.\n"
                 f"Iteration: {iteration} of {ITER_CAP}. "
                 "Approve, request revision, or escalate."
             )
@@ -712,6 +757,26 @@ def build_verb_registry(
                     details={"iteration": iteration},
                 )
             # revise
+            current_planner = ctx.completed[f"planner_{iteration}"]["value"]["parsed"]
+            if iteration > 1:
+                prev_planner = (
+                    ctx.completed.get(f"planner_{iteration - 1}", {})
+                    .get("value", {})
+                    .get("parsed")
+                )
+                if prev_planner is not None and current_planner == prev_planner:
+                    return PermanentFailure(
+                        error_kind="escalate",
+                        message=(
+                            f"planner output did not change after revision request "
+                            f"on iteration {iteration}; escalating to human review"
+                        ),
+                        details={
+                            "iteration": iteration,
+                            "stalled": True,
+                            "previous_iteration": iteration - 1,
+                        },
+                    )
             if last:
                 return PermanentFailure(
                     error_kind="escalate",

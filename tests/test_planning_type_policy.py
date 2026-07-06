@@ -488,6 +488,69 @@ async def test_no_tier_policy_still_calls_planner_no_regression(
 # reviewer prompt so it can evaluate properly.
 
 
+async def test_planner_and_reviewer_prompts_include_root_description(
+    log_dir: Path,
+):
+    """Pin the 2026-07-05 run #34 postmortem fix: previously the planner
+    (and reviewer) only ever saw item_id/title/type/state — never the
+    ADO work item's actual description. On AB#62759077 the terse title
+    left the planner to invent scope (a whole "provision new regions"
+    subtree) that contradicted the real, detailed description ("fallback
+    within EXISTING regions"). Both prompts must now include the
+    description so proposed children can be grounded in it."""
+    cfg = ProcessConfig(
+        decomposable_types=frozenset({"Scenario"}),
+        implementable_types=frozenset({"Task"}),
+    )
+    description = (
+        "Fallback within EXISTING regions only — do not provision new "
+        "regions. Integration point is the existing Cluster/Main.bicep."
+    )
+    twig = FakeTwigClient(
+        items={
+            ROOT_ID: TwigItem(
+                id=ROOT_ID,
+                title="Capacity-aware VMSS SKU fallback",
+                state="New",
+                area_path="Polyphony\\Engine",
+                work_item_type="Scenario",
+                parent_id=None,
+                raw={"fields": {"System.Description": description}},
+            )
+        }
+    )
+    provider = FakeProvider(
+        scripts={
+            "planner": [_leaf()],
+            "plan_reviewer": [_approve()],
+        }
+    )
+    engine = build_engine(
+        log_dir,
+        item_id=ROOT_ID,
+        twig=twig,
+        provider=provider,
+        process_config=cfg,
+    )
+    result = await engine.run("description-grounding")
+    assert isinstance(result, Completed), result
+
+    planner_prompt = next(
+        c["user_message"] for c in provider.calls if c["agent"] == "planner"
+    )
+    reviewer_prompt = next(
+        c["user_message"] for c in provider.calls if c["agent"] == "plan_reviewer"
+    )
+    assert description in planner_prompt, (
+        f"planner prompt must include the root item's description; got:\n"
+        f"{planner_prompt}"
+    )
+    assert description in reviewer_prompt, (
+        f"reviewer prompt must include the root item's description; got:\n"
+        f"{reviewer_prompt}"
+    )
+
+
 async def test_reviewer_prompt_includes_child_titles_not_just_count(
     log_dir: Path,
 ):
