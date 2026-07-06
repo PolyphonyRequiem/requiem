@@ -21,6 +21,26 @@ from requiem.workflows import fanout
 from requiem.workflows import implementation as impl
 from requiem.workflows.planning import completed_from_log
 
+def _make_pushable(repo_path: Path) -> None:
+    """Make `repo_path` push-able by wiring `origin` to a local bare clone.
+
+    Needed for the leaf_merge/wave-gating tests below, which require a real
+    PR number (only recovered from a leaf that actually reached `create_pr`,
+    which only runs after a successful push — see `_leaf_pr_info`)."""
+    bare = repo_path.parent / (repo_path.name + ".git")
+    if not bare.exists():
+        subprocess.run(
+            ["git", "clone", "--bare", "-q", str(repo_path), str(bare)],
+            check=True,
+        )
+    has_origin = "origin" in subprocess.run(
+        ["git", "remote"], cwd=str(repo_path), capture_output=True, text=True,
+    ).stdout.split()
+    if has_origin:
+        subprocess.run(["git", "remote", "remove", "origin"], cwd=str(repo_path), check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=str(repo_path), check=True)
+
+
 ROOT = 9300
 REPO = "Owner/Repo"
 
@@ -87,10 +107,11 @@ def _passing_runner(_cmd, _cwd):
     return TestRunResult(passed=True, summary="green", full_output="OK")
 
 
-def _engine(repo: Path, log_dir: Path, *, leaves, provider, gh=None, dry_run=True):
+def _engine(repo: Path, log_dir: Path, *, leaves, provider, gh=None, dry_run=True,
+            leaf_merge=None):
     inputs = fanout.FanoutInputs(
         root_item_id=ROOT, repo=REPO, repo_path=repo, log_dir=log_dir,
-        dry_run=dry_run, leaves=tuple(leaves),
+        dry_run=dry_run, leaves=tuple(leaves), leaf_merge=leaf_merge,
     )
     return fanout.build_engine(
         log_dir, inputs=inputs, toolbelt=_toolbelt(repo, gh=gh), provider=provider,
@@ -421,3 +442,184 @@ async def test_fanout_build_leaf_context_pack_returns_none_on_failure(
     # Empty leaf still synthesises (the synthesiser tolerates empty fields).
     assert pack is not None
     assert pack.leaf_id == "99"
+
+
+# ---- wave-gated dispatch + interleaved merge (run #36 postmortem) -------
+#
+# These exercise the dependency-aware path added to `_dispatch_leaves`:
+# wave-gating only activates when BOTH a `leaf_merge` hook is wired AND at
+# least one leaf declares a real `deps` edge — otherwise the flat dispatch
+# above runs completely unchanged (see `test_..._is_a_noop_without_hook`
+# and `test_..._is_a_noop_without_declared_deps` below).
+#
+# These need `dry_run=False` (a landed leaf only carries a `pr_number` once
+# it actually reaches `create_pr` — see `_leaf_pr_info`), which in turn
+# reaches `run_tests` for real. The throwaway repo has no detectable test
+# suite, so stub test-detection/execution the same way the auto-detected
+# command would resolve in a real dogfood repo — hermetic, no subprocess.
+
+
+def _stub_test_detection(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        impl, "detect_test_command",
+        lambda repo_path: impl.DetectedTestCommand(command="true", cwd=repo_path),
+    )
+    monkeypatch.setattr(
+        impl, "_default_test_runner",
+        lambda command, cwd: impl.TestRunResult(
+            passed=True, summary="stubbed", full_output="stubbed",
+        ),
+    )
+
+
+def _two_leaf_provider() -> FakeProvider:
+    # One coder response per dispatched leaf (in dispatch order).
+    return FakeProvider(scripts={
+        "coder": [
+            {
+                "intent_summary": "producer change",
+                "file_changes": [
+                    {"path": "PRODUCER.md", "operation": "create", "content": "p\n"},
+                ],
+                "notes": "",
+            },
+            {
+                "intent_summary": "dependent change",
+                "file_changes": [
+                    {"path": "DEPENDENT.md", "operation": "create", "content": "d\n"},
+                ],
+                "notes": "",
+            },
+        ],
+    })
+
+
+async def test_dependent_leaf_is_released_only_after_producer_merges(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Leaf 2 depends on leaf 1. The fake `leaf_merge` hook reports leaf 1 as
+    merged; leaf 2 must then be dispatched (its own child log exists) and
+    land, carrying merge_state == "merged" from the SAME hook."""
+    _make_pushable(repo)
+    _stub_test_detection(monkeypatch)
+    calls: list[tuple[int, int]] = []
+
+    async def fake_merge(real_id: int, pr_number: int) -> str:
+        calls.append((real_id, pr_number))
+        return "merged"
+
+    leaves = [
+        fanout.FanoutLeaf(real_id=1, title="producer", body="m"),
+        fanout.FanoutLeaf(real_id=2, title="dependent", body="m", deps=(1,)),
+    ]
+    engine = _engine(
+        repo, tmp_path, leaves=leaves, provider=_two_leaf_provider(),
+        dry_run=False, leaf_merge=fake_merge,
+    )
+    result = await engine.run("waves")
+    assert isinstance(result, Completed)
+    res = _result(engine, "waves", result.final_node)
+
+    assert res.leaves_total == 2
+    assert res.leaves_landed == 2
+    by_id = {o.real_id: o for o in res.outcomes}
+    assert by_id[1].disposition == "completed"
+    assert by_id[1].merge_state == "merged"
+    assert by_id[2].disposition == "completed"
+    assert by_id[2].merge_state == "merged"
+    # The dependent was actually dispatched (own child log written), not
+    # merely reported as landed.
+    assert (tmp_path / f"fanout-{ROOT}__leaf-2.events.jsonl").exists()
+    # The hook was called once per landed leaf, with that leaf's own real id.
+    assert len(calls) == 2
+    assert calls[0][0] == 1
+    assert calls[1][0] == 2
+
+
+async def test_dependent_leaf_is_blocked_when_producer_never_merges(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Leaf 2 depends on leaf 1. The fake `leaf_merge` hook reports leaf 1 as
+    needs_human (never merged). Leaf 2 must NEVER be dispatched — no child
+    log, and its roll-up disposition is the synthetic "blocked" value."""
+    _make_pushable(repo)
+    _stub_test_detection(monkeypatch)
+
+    async def fake_merge(real_id: int, pr_number: int) -> str:
+        return "needs_human"
+
+    leaves = [
+        fanout.FanoutLeaf(real_id=1, title="producer", body="m"),
+        fanout.FanoutLeaf(real_id=2, title="dependent", body="m", deps=(1,)),
+    ]
+    engine = _engine(
+        repo, tmp_path, leaves=leaves, provider=_two_leaf_provider(),
+        dry_run=False, leaf_merge=fake_merge,
+    )
+    result = await engine.run("waves-blocked")
+    assert isinstance(result, Completed)
+    res = _result(engine, "waves-blocked", result.final_node)
+
+    by_id = {o.real_id: o for o in res.outcomes}
+    assert by_id[1].disposition == "completed"
+    assert by_id[1].merge_state == "needs_human"
+    assert by_id[2].disposition == "blocked"
+    assert by_id[2].merge_state is None
+    # Never dispatched: no child log for the dependent leaf at all.
+    assert not (tmp_path / f"fanout-{ROOT}__leaf-2.events.jsonl").exists()
+    # A blocked leaf buckets into leaves_failed (fanout_result's rollup),
+    # not leaves_needs_human — it never even ran, unlike leaf 1.
+    assert res.leaves_failed >= 1
+    assert res.verdict == "failed"
+
+
+async def test_wave_gating_is_a_noop_without_declared_deps(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A leaf_merge hook wired but no leaf declares any `deps` must take the
+    EXACT flat dispatch path — the hook is never even called, and no leaf's
+    outcome carries a merge_state (regression guard for the "safe by
+    default" design: dependency-aware wave dispatch is opt-in per-plan)."""
+    _make_pushable(repo)
+    _stub_test_detection(monkeypatch)
+    calls: list[tuple[int, int]] = []
+
+    async def fake_merge(real_id: int, pr_number: int) -> str:
+        calls.append((real_id, pr_number))
+        return "merged"
+
+    leaves = [
+        fanout.FanoutLeaf(real_id=1, title="one", body="m"),
+        fanout.FanoutLeaf(real_id=2, title="two", body="m"),  # no deps
+    ]
+    engine = _engine(
+        repo, tmp_path, leaves=leaves, provider=_two_leaf_provider(),
+        dry_run=False, leaf_merge=fake_merge,
+    )
+    result = await engine.run("flat-with-hook")
+    res = _result(engine, "flat-with-hook", result.final_node)
+
+    assert res.leaves_landed == 2
+    assert calls == []  # hook never invoked — no leaf declared a dependency
+    assert all(o.merge_state is None for o in res.outcomes)
+
+
+async def test_wave_gating_is_a_noop_without_a_hook(repo: Path, tmp_path: Path):
+    """A leaf declaring `deps` but no `leaf_merge` hook wired also takes the
+    flat dispatch path unchanged (e.g. a dry-run preview or a caller that
+    hasn't wired self-merge at all) — dependencies alone never activate
+    wave-gating."""
+    leaves = [
+        fanout.FanoutLeaf(real_id=1, title="producer", body="m"),
+        fanout.FanoutLeaf(real_id=2, title="dependent", body="m", deps=(1,)),
+    ]
+    engine = _engine(
+        repo, tmp_path, leaves=leaves, provider=_two_leaf_provider(),
+        dry_run=True, leaf_merge=None,
+    )
+    result = await engine.run("flat-no-hook")
+    res = _result(engine, "flat-no-hook", result.final_node)
+
+    assert res.leaves_total == 2
+    assert res.leaves_landed == 2  # both dispatched despite the declared dep
+    assert all(o.merge_state is None for o in res.outcomes)

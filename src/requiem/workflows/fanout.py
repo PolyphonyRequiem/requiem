@@ -35,9 +35,9 @@ child writes ``fanout-<root>__leaf-<real_id>.events.jsonl``
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from requiem.dsl import AgentRegistry, VerbRegistry, Workflow, WorkflowBuilder
 from requiem.kernel import Completed, Engine, Failed, Suspended
@@ -45,6 +45,23 @@ from requiem.outcomes import PermanentFailure, Success
 from requiem.plan_tree import PlanArtifactError, load_committed_leaves
 from requiem.toolbelt import Toolbelt
 from requiem.workflows import implementation as impl_mod
+from requiem.workflows.leaf_deps import (
+    compute_blocked,
+    releasable_leaves,
+    validate_dep_graph,
+)
+
+# Run #36 postmortem follow-up: a dependent leaf's coder can only see a
+# producer sibling's code once the producer's PR is actually MERGED into the
+# trunk (each leaf branches fresh `from_ref=base_branch`) — so wave-gating is
+# only meaningfully correct when paired with an inter-wave merge. This hook
+# is how `_dispatch_leaves` asks its caller to land a leaf's PR before
+# releasing any leaf that depends on it: `(real_id, pr_number) -> terminal
+# state` (mirrors `requiem.workflows.leaf_lifecycle`'s
+# "merged" | "already_merged" | "needs_human" | "failed"). ``None`` (the
+# default) preserves the pre-existing flat, non-wave-gated dispatch exactly —
+# see ``FanoutInputs.leaf_merge``.
+LeafMergeHook = Callable[[int, int], Any]
 
 MODULE = "requiem.workflows.fanout"
 
@@ -64,6 +81,10 @@ class FanoutLeaf:
     real_id: int
     title: str
     body: str = ""
+    # 0-based-resolved-to-real-id dependency edges (plan_tree.ResolvedLeaf.deps
+    # / planner ChildPlan.depends_on) — see leaf_deps.py for how these gate
+    # wave release. Empty for inline/test leaves and legacy plans.
+    deps: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +114,12 @@ class FanoutInputs:
     # keeps the dogfood loop unblocked while config bootstrap catches up.
     process_config: Any | None = None  # ProcessConfig — avoiding circular import
     doctrine: Any | None = None        # Doctrine
+    # Run #36 postmortem: when set, dependency-declaring leaves are dispatched
+    # in dependency-ordered waves, and a landed leaf's PR is merged (via this
+    # hook) before any leaf depending on it is released — see LeafMergeHook.
+    # None (the default) disables wave-gating entirely, preserving the
+    # original flat dispatch for every caller/test that doesn't wire it.
+    leaf_merge: LeafMergeHook | None = None
 
     def child_run_id(self, real_id: int) -> str:
         return f"fanout-{self.root_item_id}__leaf-{real_id}"
@@ -108,7 +135,7 @@ class LeafOutcome:
     """The roll-up record for one dispatched leaf."""
 
     real_id: int
-    disposition: str            # completed | needs_human | failed | error
+    disposition: str            # completed | needs_human | failed | error | blocked
     final_node: str
     child_run_id: str
     skipped: bool = False       # already terminal on a prior run (idempotent)
@@ -119,6 +146,14 @@ class LeafOutcome:
     # kanban backend's separate leaf_pr leg.
     pr_number: int | None = None
     branch_name: str = ""
+    # Set only on the dependency-aware wave path (FanoutInputs.leaf_merge):
+    # the terminal state ("merged" | "already_merged" | "needs_human" |
+    # "failed") returned by the merge hook for a landed leaf's PR. None means
+    # either the hook wasn't wired, the leaf never landed, or (disposition ==
+    # "blocked") the leaf was never dispatched at all because a dependency
+    # never merged. The caller (end_to_end) should NOT re-attempt
+    # leaf_lifecycle for a leaf that already carries a merge_state here.
+    merge_state: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,7 +174,8 @@ class FanoutResult:
 
 
 def _leaf_to_dict(leaf: FanoutLeaf) -> dict[str, Any]:
-    return {"real_id": leaf.real_id, "title": leaf.title, "body": leaf.body}
+    return {"real_id": leaf.real_id, "title": leaf.title, "body": leaf.body,
+            "deps": list(leaf.deps)}
 
 
 def _leaf_from_dict(d: dict[str, Any]) -> FanoutLeaf:
@@ -147,6 +183,7 @@ def _leaf_from_dict(d: dict[str, Any]) -> FanoutLeaf:
         real_id=int(d["real_id"]),
         title=str(d.get("title", "")),
         body=str(d.get("body", "")),
+        deps=tuple(int(x) for x in (d.get("deps") or ())),
     )
 
 
@@ -296,7 +333,8 @@ def build_verb_registry(inputs: FanoutInputs) -> VerbRegistry:
                     message=f"could not resolve implementable leaves: {e}",
                 )
             leaves = [
-                FanoutLeaf(real_id=r.real_id, title=r.title, body=r.body)
+                FanoutLeaf(real_id=r.real_id, title=r.title, body=r.body,
+                           deps=tuple(r.deps))
                 for r in resolved
             ]
         else:
@@ -422,25 +460,118 @@ def build_verb_registry(inputs: FanoutInputs) -> VerbRegistry:
             pr_number=pr_number, branch_name=branch_name,
         )
 
+    async def _dispatch_and_merge(leaf: FanoutLeaf, toolbelt: Toolbelt) -> LeafOutcome:
+        """``_dispatch_one`` plus, for a landed leaf, an inter-wave merge via
+        ``inputs.leaf_merge``. Only called on the dependency-aware wave path
+        (``_dispatch_waves``) — never on the flat/legacy path."""
+        outcome = await _dispatch_one(leaf, toolbelt)
+        if outcome.disposition == "completed" and outcome.pr_number is not None:
+            assert inputs.leaf_merge is not None  # only called when wired
+            try:
+                merge_state = await inputs.leaf_merge(leaf.real_id, outcome.pr_number)
+            except Exception as e:  # noqa: BLE001 — a merge-hook crash must not
+                # abandon the rest of the wave; report it as a needs-human
+                # merge outcome for THIS leaf and let the wave loop's
+                # blocking propagation handle any dependents.
+                merge_state = f"failed:{e}"
+            outcome = _dc_replace(outcome, merge_state=merge_state)
+        return outcome
+
+    async def _dispatch_waves(
+        leaves: list[FanoutLeaf], toolbelt: Toolbelt,
+    ) -> list[LeafOutcome]:
+        """Dependency-ordered dispatch: release a leaf only once every leaf it
+        depends on has actually MERGED (not merely landed) — see
+        ``LeafMergeHook``. Uses the same pure wave-scheduling primitives as
+        ``kanban_executor`` (``requiem.workflows.leaf_deps``)."""
+        by_id = {str(l.real_id): l for l in leaves}
+        deps_of = {lid: tuple(str(d) for d in l.deps) for lid, l in by_id.items()}
+
+        outcomes: dict[str, LeafOutcome] = {}
+        delivered: set[str] = set()
+        settled: set[str] = set()
+
+        while True:
+            nondelivered = settled - delivered
+            blocked = compute_blocked(deps_of, nondelivered=nondelivered, settled=settled)
+            wave_ids = releasable_leaves(
+                deps_of, delivered=delivered, settled=settled, blocked=blocked,
+            )
+            if not wave_ids:
+                break
+            wave = [by_id[lid] for lid in wave_ids]
+
+            if inputs.parallel:
+                import asyncio
+                sem = asyncio.Semaphore(max(1, inputs.max_parallel))
+
+                async def _guarded(leaf):
+                    async with sem:
+                        return await _dispatch_and_merge(leaf, toolbelt)
+
+                results = list(await asyncio.gather(*(_guarded(leaf) for leaf in wave)))
+            else:
+                results = [await _dispatch_and_merge(leaf, toolbelt) for leaf in wave]
+
+            for leaf, outcome in zip(wave, results):
+                lid = str(leaf.real_id)
+                outcomes[lid] = outcome
+                settled.add(lid)
+                if outcome.merge_state in ("merged", "already_merged"):
+                    delivered.add(lid)
+
+        # A leaf never released is permanently blocked — a dependency it
+        # needs settled non-delivered (needs_human/failed/blocked). Report
+        # it, don't silently drop it from the roll-up (run #36 §"Design for
+        # fanout.py": a synthetic, distinguishable disposition).
+        for lid, leaf in by_id.items():
+            if lid not in outcomes:
+                outcomes[lid] = LeafOutcome(
+                    real_id=leaf.real_id, disposition="blocked",
+                    final_node="(blocked: a declared dependency never merged)",
+                    child_run_id=inputs.child_run_id(leaf.real_id),
+                )
+
+        # Preserve the original resolution order for a stable, readable roll-up.
+        return [outcomes[str(l.real_id)] for l in leaves]
+
     @verbs.register("dispatch_leaves")
     async def _dispatch_leaves(ctx):
         resolved = (ctx.completed.get("resolve_leaves") or {}).get("value") or {}
         leaves = [_leaf_from_dict(d) for d in resolved.get("leaves", [])]
         toolbelt: Toolbelt = ctx.toolbelt
 
+        # GC first (parallel mode): prune stale worktree admin entries from a
+        # prior crashed run so a `git worktree add` on a reused path doesn't
+        # collide (ADR-0022). Best-effort — never block dispatch on cleanup.
         if inputs.parallel:
-            # Bounded concurrency: at most `max_parallel` leaves in flight.
-            import asyncio
-
-            # GC first: prune stale worktree admin entries from a prior crashed
-            # run so a `git worktree add` on a reused path doesn't collide
-            # (ADR-0022). Best-effort — never block dispatch on cleanup.
             from requiem.clients.fs import FilesystemClient, FsGitError
             try:
                 main_fs = toolbelt.fs or FilesystemClient(inputs.repo_path)
                 await main_fs.git_worktree_prune()
             except FsGitError:
                 pass
+
+        deps_of = {str(l.real_id): l.deps for l in leaves}
+        # Dependency-aware wave dispatch only activates when a merge hook is
+        # wired (so a producer's PR can actually land before a dependent
+        # leaf branches from the trunk) AND at least one leaf declares a
+        # real dependency. Every run without declared deps — which is every
+        # run before this feature, and most runs after it — takes the
+        # unchanged flat path below.
+        if inputs.leaf_merge is not None and any(deps_of.values()):
+            err, _ = validate_dep_graph(
+                {lid: tuple(str(d) for d in deps) for lid, deps in deps_of.items()}
+            )
+            if err:
+                return PermanentFailure(
+                    error_kind="fanout.bad_dep_graph",
+                    message=f"leaf dependency graph is invalid: {err}",
+                )
+            outcomes = await _dispatch_waves(leaves, toolbelt)
+        elif inputs.parallel:
+            # Bounded concurrency: at most `max_parallel` leaves in flight.
+            import asyncio
 
             sem = asyncio.Semaphore(max(1, inputs.max_parallel))
 
@@ -469,6 +600,7 @@ def build_verb_registry(inputs: FanoutInputs) -> VerbRegistry:
                     "final_node": o.final_node, "child_run_id": o.child_run_id,
                     "skipped": o.skipped,
                     "pr_number": o.pr_number, "branch_name": o.branch_name,
+                    "merge_state": o.merge_state,
                 }
                 for o in outcomes
             ],
@@ -576,6 +708,7 @@ def fanout_result(completed: dict, final_node: str) -> FanoutResult:
             final_node=str(o["final_node"]), child_run_id=str(o["child_run_id"]),
             skipped=bool(o.get("skipped", False)),
             pr_number=o.get("pr_number"), branch_name=str(o.get("branch_name") or ""),
+            merge_state=o.get("merge_state"),
         )
         for o in disp.get("outcomes", [])
     )

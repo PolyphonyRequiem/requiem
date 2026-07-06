@@ -385,6 +385,52 @@ async def _dispatch_in_process(
                 trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
             )
 
+    # Run #36 postmortem (fanout wave-gating): when leaves declare
+    # dependencies, `fanout` must actually merge a producer leaf's PR before
+    # releasing a leaf that depends on it — a dependent leaf's worktree
+    # branches fresh from trunk_branch, so it can only see a producer's code
+    # once that producer's PR has actually landed on the trunk (not merely
+    # opened). This hook drives the SAME leaf_lifecycle engine the tail loop
+    # below uses for a non-dependency-aware run, then re-syncs the local
+    # trunk ref (mirroring the pre-dispatch trunk_sync above) so the next
+    # wave's `create_branch` sees the merge. Wired only under the same
+    # live+github_repo+trunk_branch condition the tail loop already requires;
+    # fanout.py itself no-ops the entire wave path whenever this is None.
+    leaf_merge_hook: fanout_mod.LeafMergeHook | None = None
+    if live and github_repo is not None and trunk_branch is not None:
+        async def leaf_merge_hook(real_id: int, pr_number: int) -> str:
+            ll_inputs = leaf_lifecycle_mod.LeafLifecycleInputs(
+                repo=github_repo,
+                repo_path=repo_path,
+                leaf_id=str(real_id),
+                root_item_id=item_id,
+                pr_number=pr_number,
+                default_branch=base_branch or "main",
+                merge_strategy="squash",
+                dry_run=not live,
+            )
+            ll_run = f"leaflife-{item_id}-{real_id}"
+            ll_engine = leaf_lifecycle_factory(
+                log_dir,
+                inputs=ll_inputs,
+                toolbelt=_topology_toolbelt(twig, repo_client),
+                provider=provider,
+                **({"gate_handler": gate_handler} if gate_handler is not None else {}),
+            )
+            await ll_engine.run(ll_run)
+            ll_result = leaf_lifecycle_mod.build_result(_completed_map(log_dir, ll_run))
+            if ll_result.final_state in ("merged", "already_merged"):
+                try:
+                    await trunk_sync(repo_path, "origin", trunk_branch)
+                except FsGitError:
+                    # Best-effort: a dependent leaf still branches from
+                    # whatever the local ref holds; a stale sync surfaces
+                    # later as the same "not a commit" failure the
+                    # pre-dispatch trunk_sync above guards against, not
+                    # silently.
+                    pass
+            return ll_result.final_state
+
     fo_inputs = fanout_mod.FanoutInputs(
         root_item_id=item_id,
         repo=github_repo or str(item_id),
@@ -410,6 +456,7 @@ async def _dispatch_in_process(
         # path available as fallback.
         process_config=process_config,
         doctrine=_resolve_doctrine_for_repo(repo_path),
+        leaf_merge=leaf_merge_hook,
     )
     fo_run = f"fanout-{item_id}"
     fo_engine = fanout_factory(
@@ -462,11 +509,37 @@ async def _dispatch_in_process(
     # leaves need attention without abandoning the other leaves' attempts
     # (run #36: one bad merge previously abandoned every remaining one).
     leaf_notes: list[str] = []
+    for outcome in fo_result.outcomes:
+        if outcome.disposition == "blocked":
+            # Never dispatched: a declared dependency of this leaf settled
+            # non-delivered (needs_human/failed/itself blocked) — see
+            # fanout.py's `_dispatch_waves`. Already counted into
+            # leaves_failed by fanout_result's bucketing; note it by name so
+            # an operator doesn't have to dig through child logs to learn why.
+            leaf_notes.append(
+                f"leaf {outcome.real_id} was never dispatched: {outcome.final_node}"
+            )
     if live and github_repo is not None and trunk_branch is not None:
         for outcome in fo_result.outcomes:
             if outcome.disposition != "completed":
                 continue
             leaf_id = str(outcome.real_id)
+            if outcome.merge_state is not None:
+                # fanout's wave-gated dispatch (FanoutInputs.leaf_merge) already
+                # attempted this leaf's merge inline, between waves — adopt its
+                # result directly. Re-running leaf_lifecycle here would merge
+                # (or attempt to merge) the same PR twice.
+                clean_state = (
+                    "failed" if outcome.merge_state.startswith("failed:")
+                    else outcome.merge_state
+                )
+                leaf_lifecycle_results.append((leaf_id, clean_state))
+                if clean_state in {"needs_human", "failed"}:
+                    leaf_notes.append(
+                        f"leaf lifecycle stopped at {leaf_id} "
+                        f"({outcome.merge_state})."
+                    )
+                continue
             if outcome.pr_number is None:
                 leaf_lifecycle_results.append((leaf_id, "needs_human"))
                 leaf_notes.append(

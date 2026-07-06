@@ -1627,6 +1627,20 @@ class _DemoGhClient:
             raise self.raise_on_search
         return list(self.existing)
 
+    async def find_open_pr_for_branch(self, repo: str, *, head: str, limit: int = 30):
+        """ADR-0024 §6: structured PR-by-head-branch search, used by
+        `create_pr`'s idempotent-reuse check. Mirrors `GhClient`'s real
+        implementation (a `pr_search` delegation) so this demo/test double
+        stays a faithful stand-in wherever `create_pr` runs for real
+        (dry_run=False) against it."""
+        if self.raise_on_search is not None:
+            raise self.raise_on_search
+        return [
+            pr for pr in self.existing
+            if getattr(pr, "head", None) == head
+            and getattr(pr, "state", "").upper() == "OPEN"
+        ]
+
     async def pr_create(self, repo: str, *, title: str, body: str, head: str, base: str):
         if self.raise_on_create is not None:
             raise self.raise_on_create
