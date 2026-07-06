@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from requiem.clients.fs import FsGitError
 from requiem.end_to_end import run_pipeline
 from requiem.kernel import Completed
 
@@ -122,6 +123,12 @@ class _LifecycleCalls:
         self.inputs: list[object] = []
 
 
+async def _noop_trunk_sync(repo_path: Path, remote: str, branch: str) -> None:
+    """Stub for the run #35 trunk-sync hook — these tests use `tmp_path` as
+    `repo_path`, which isn't a real git repo, so the real `git fetch` must
+    never run here."""
+
+
 def _stub_leaf_lifecycle(calls: _LifecycleCalls, states: dict[str, str]):
     def leaf_lifecycle_factory(log_dir, *, inputs=None, toolbelt=None, provider=None,
                                gate_handler=None):
@@ -174,6 +181,7 @@ async def test_fanout_leaves_target_trunk_not_base_branch(tmp_path: Path):
         trunk_bootstrap_factory=_stub_trunk(),
         fanout_factory=_stub_fanout(fanout_calls, outcomes),
         leaf_lifecycle_factory=_stub_leaf_lifecycle(lifecycle_calls, {str(ROOT): "merged"}),
+        trunk_sync=_noop_trunk_sync,
     )
     assert len(fanout_calls.inputs) == 1
     assert fanout_calls.inputs[0].base_branch == f"feature/{ROOT}"
@@ -207,6 +215,7 @@ async def test_fanout_leaf_lifecycle_stops_on_first_blocker(tmp_path: Path):
         leaf_lifecycle_factory=_stub_leaf_lifecycle(
             lifecycle_calls, {"1": "blocked_by_ci", "2": "merged"},
         ),
+        trunk_sync=_noop_trunk_sync,
     )
     assert result.status == "paused"
     assert result.stage == "leaf_lifecycle"
@@ -233,6 +242,7 @@ async def test_fanout_needs_human_when_pr_number_missing(tmp_path: Path):
         trunk_bootstrap_factory=_stub_trunk(),
         fanout_factory=_stub_fanout(fanout_calls, outcomes),
         leaf_lifecycle_factory=_stub_leaf_lifecycle(lifecycle_calls, {}),
+        trunk_sync=_noop_trunk_sync,
     )
     assert result.status == "paused"
     assert result.stage == "leaf_lifecycle"
@@ -258,7 +268,73 @@ async def test_fanout_not_live_skips_self_merge(tmp_path: Path):
         trunk_bootstrap_factory=_stub_trunk(),
         fanout_factory=_stub_fanout(fanout_calls, outcomes),
         leaf_lifecycle_factory=_stub_leaf_lifecycle(lifecycle_calls, {}),
+        trunk_sync=_noop_trunk_sync,
     )
     assert result.status == "delivered"
     assert len(lifecycle_calls.inputs) == 0
     assert result.leaf_lifecycle_verdict is None
+
+
+async def test_fanout_syncs_trunk_branch_before_dispatch(tmp_path: Path):
+    """Run #35 postmortem: trunk_bootstrap creates feature/<root> purely via
+    the platform REST API (no working tree touched); the persistent local
+    worktree fanout dispatches into never learns about that ref through
+    ordinary git operations, so every leaf's `git checkout -b impl/<x>
+    feature/<root>` failed with "'feature/<root>' is not a commit"
+    (0/23 leaves landed). The driver must sync the trunk branch into the
+    local repo_path exactly once, before fan-out, whenever live+trunk exist."""
+    fanout_calls = _FanoutCalls()
+    lifecycle_calls = _LifecycleCalls()
+    sync_calls: list[tuple[Path, str, str]] = []
+
+    async def _recording_trunk_sync(repo_path: Path, remote: str, branch: str) -> None:
+        sync_calls.append((repo_path, remote, branch))
+
+    outcomes = [{
+        "real_id": ROOT, "disposition": "completed", "final_node": "end",
+        "child_run_id": f"fanout-{ROOT}__leaf-{ROOT}", "skipped": False,
+        "pr_number": 9001, "branch_name": f"impl/{ROOT}-{ROOT}",
+    }]
+    result = await run_pipeline(
+        ROOT, log_dir=tmp_path, board="requiem-test",
+        dispatch_backend="fanout", repo_path=tmp_path, github_repo=REPO,
+        base_branch="main", live=True,
+        planning_factory=_stub_planning(ROOT),
+        trunk_bootstrap_factory=_stub_trunk(),
+        fanout_factory=_stub_fanout(fanout_calls, outcomes),
+        leaf_lifecycle_factory=_stub_leaf_lifecycle(lifecycle_calls, {str(ROOT): "merged"}),
+        trunk_sync=_recording_trunk_sync,
+    )
+    assert result.status == "delivered", result.detail
+    assert sync_calls == [(tmp_path, "origin", f"feature/{ROOT}")]
+
+
+async def test_fanout_trunk_sync_failure_pauses_cleanly(tmp_path: Path):
+    """If the trunk sync itself fails (e.g. the fetch can't reach the
+    remote), fail closed to a paused PipelineResult with a clear detail —
+    never let every leaf crash into the same git error independently."""
+    fanout_calls = _FanoutCalls()
+    lifecycle_calls = _LifecycleCalls()
+
+    async def _failing_trunk_sync(repo_path: Path, remote: str, branch: str) -> None:
+        raise FsGitError(["fetch", remote, branch], 1, "fatal: could not read from remote")
+
+    outcomes = [{
+        "real_id": ROOT, "disposition": "completed", "final_node": "end",
+        "child_run_id": f"fanout-{ROOT}__leaf-{ROOT}", "skipped": False,
+        "pr_number": 9001, "branch_name": f"impl/{ROOT}-{ROOT}",
+    }]
+    result = await run_pipeline(
+        ROOT, log_dir=tmp_path, board="requiem-test",
+        dispatch_backend="fanout", repo_path=tmp_path, github_repo=REPO,
+        base_branch="main", live=True,
+        planning_factory=_stub_planning(ROOT),
+        trunk_bootstrap_factory=_stub_trunk(),
+        fanout_factory=_stub_fanout(fanout_calls, outcomes),
+        leaf_lifecycle_factory=_stub_leaf_lifecycle(lifecycle_calls, {}),
+        trunk_sync=_failing_trunk_sync,
+    )
+    assert result.status == "paused"
+    assert result.stage == "fanout"
+    assert "could not sync trunk branch" in result.detail
+    assert len(fanout_calls.inputs) == 0  # dispatch never even started

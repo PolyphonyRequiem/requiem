@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from requiem import branch_model
+from requiem.clients.fs import FilesystemClient, FsGitError
 from requiem.kernel import Completed, Engine
 from requiem.persistence import replay
 from requiem.toolbelt import Toolbelt
@@ -57,6 +58,18 @@ TrunkBootstrapFactory = Callable[..., Engine]
 LeafPrFactory = Callable[..., Engine]
 LeafLifecycleFactory = Callable[..., Engine]
 FeaturePrFactory = Callable[..., Engine]
+
+# Run #35 postmortem: trunk_bootstrap creates feature/<root> purely via the
+# platform's REST API (no working tree involved), so a persistent local
+# worktree used by the in-process fanout backend never learns about that ref
+# through ordinary git operations. `TrunkSync` is the injectable hook that
+# fetches it in locally before any leaf tries to branch from it; defaults to
+# a real `git fetch`, stubbed out in tests that don't use a real repo.
+TrunkSync = Callable[[Path, str, str], Any]
+
+
+async def _default_trunk_sync(repo_path: Path, remote: str, branch: str) -> None:
+    await FilesystemClient(repo_path).git_fetch_branch(remote, branch)
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,6 +332,7 @@ async def _dispatch_in_process(
     fanout_factory: Any,
     process_config: Any | None = None,  # ADR-0030 §1: optional context-pack input
     leaf_lifecycle_factory: Any = leaf_lifecycle_mod.build_engine,
+    trunk_sync: TrunkSync = _default_trunk_sync,
 ) -> "PipelineResult":
     """Phase 3 (in-process backend): dispatch leaves via requiem.workflows.fanout.
 
@@ -346,6 +360,30 @@ async def _dispatch_in_process(
             title=str(plan_record.get("item_title") or f"item {item_id}"),
             body=str(plan_record.get("summary") or ""),
         ),)
+
+    # Run #35 postmortem: trunk_bootstrap creates feature/<root> purely via
+    # the platform's REST API (no working tree involved — see
+    # workflows/trunk_bootstrap.py). repo_path is a persistent local
+    # worktree that never learns about that ref through ordinary git
+    # operations, so every leaf's `git checkout -b impl/<x> feature/<root>`
+    # failed with "'feature/<root>' is not a commit" (0/23 leaves landed).
+    # Sync it in once, here, before any leaf tries to branch from it.
+    if live and trunk_branch:
+        try:
+            await trunk_sync(repo_path, "origin", trunk_branch)
+        except FsGitError as e:
+            return PipelineResult(
+                item_id=item_id, stage="fanout", status="paused",
+                detail=(
+                    f"could not sync trunk branch {trunk_branch!r} into the "
+                    f"local worktree {repo_path} before dispatch: {e}"
+                ),
+                decomposable=decomposable, plan_artifact=plan_artifact,
+                committed_path=str(committed_path) if committed_path else None,
+                github_repo=github_repo_arg, ado_repo=ado_repo_arg,
+                base_branch=base_branch,
+                trunk_branch=trunk_branch, trunk_verdict=trunk_verdict,
+            )
 
     fo_inputs = fanout_mod.FanoutInputs(
         root_item_id=item_id,
@@ -578,6 +616,7 @@ async def run_pipeline(
     leaf_pr_factory: LeafPrFactory = leaf_pr_mod.build_engine,
     leaf_lifecycle_factory: LeafLifecycleFactory = leaf_lifecycle_mod.build_engine,
     fanout_factory: Any = fanout_mod.build_engine,
+    trunk_sync: TrunkSync = _default_trunk_sync,
 ) -> PipelineResult:
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -778,6 +817,7 @@ async def run_pipeline(
             fanout_factory=fanout_factory,
             process_config=process_config,
             leaf_lifecycle_factory=leaf_lifecycle_factory,
+            trunk_sync=trunk_sync,
         )
 
     real = Toolbelt.real()

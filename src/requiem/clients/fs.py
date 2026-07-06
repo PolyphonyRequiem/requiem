@@ -302,6 +302,27 @@ class FilesystemClient:
         """Switch HEAD to existing branch ``name``."""
         await self._git("checkout", name)
 
+    async def git_fetch_branch(self, remote: str, branch: str) -> None:
+        """Fetch ``branch`` from ``remote`` into a same-named local branch.
+
+        Does NOT touch the working tree or HEAD — it only makes ``branch``
+        resolvable as a local ref (``git checkout -b <x> <branch>`` needs
+        that; a bare name never resolves against a remote-tracking ref
+        like ``origin/<branch>``).
+
+        Requiem-owned trunk branches (``feature/<root>``) are created
+        purely via the platform's REST API (see
+        ``workflows/trunk_bootstrap.py`` — no working tree involved), so a
+        persistent local worktree used by the in-process fanout backend
+        never learns about them through ordinary git operations. This is
+        the missing sync step: call it once, before any leaf's
+        ``git_create_branch`` targets the trunk. The `+` force-refspec is
+        safe here — Requiem owns this ref and it should always mirror the
+        remote exactly, so overwriting a stale/absent local copy is
+        correct, not destructive.
+        """
+        await self._git("fetch", remote, f"+{branch}:refs/heads/{branch}")
+
     async def git_reset_hard(self, ref: str = "HEAD") -> None:
         """Discard all tracked-file modifications, reverting to ``ref``.
 
