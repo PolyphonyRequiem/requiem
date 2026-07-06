@@ -245,6 +245,28 @@ class ChildPlan(BaseModel):
     downstream render hint.
     """
 
+    depends_on: list[int] | None = None
+    """Optional 0-based indices into THIS SAME children list, naming sibling
+    children whose implementation must exist first.
+
+    This is a real dispatch-ordering contract, not a narrative "logically
+    follows" hint: both fan-out backends will not dispatch a leaf until
+    every declared dependency has landed (and, on the in-process backend,
+    merged into the trunk) — see ``requiem.workflows.leaf_deps``. A leaf
+    whose dependency never lands is reported ``blocked``, not silently
+    attempted with stale/missing context.
+
+    Use this ONLY for a genuine build-time prerequisite: the dependent
+    child's code would not compile, or would have nothing correct to
+    reference, without the dependency's changes already present in the
+    worktree (e.g. child 2 defines a shared config schema that child 5
+    migrates existing overrides onto; child 0 authors a service-resource
+    that child 3 wires output-chaining from). Do NOT use it to express a
+    preferred review/read order — most children should leave it unset.
+    Self-references, out-of-range indices, and references to a sibling
+    that is itself decomposed (not a leaf) are rejected.
+    """
+
 
 class PlannerOutput(BaseModel):
     summary: str
@@ -650,6 +672,24 @@ def build_verb_registry(
                 else ""
             )
 
+            # Dependency-declaration fix (2026-07-06 dogfood run #36): 3 of 4
+            # needs_human leaves were a coder correctly refusing to invent a
+            # sibling's schema/producer that hadn't landed in the worktree
+            # yet — the plan text implied a build order the dispatcher never
+            # enforced. Give the planner an explicit, indexable way to say
+            # so, instead of leaving it as narrative prose dispatch can't act
+            # on.
+            depends_on_line = (
+                "If a child you are proposing can only be correctly "
+                "implemented once ANOTHER child in this same list has "
+                "landed (e.g. it needs a shared schema/type/service-resource "
+                "that sibling defines), set that child's `depends_on` to the "
+                "0-based index/indices of the prerequisite sibling(s) in "
+                "THIS children list. Only use this for a real build-time "
+                "prerequisite — not a preferred read/review order. Most "
+                "children should leave it unset.\n"
+            )
+
             base = (
                 f"Plan work item AB#{item['item_id']} — \"{item['title']}\" "
                 f"(type={item['work_item_type']}, state={item['state']}).\n"
@@ -657,6 +697,7 @@ def build_verb_registry(
                 + description_line
                 + policy_line
                 + guidance_line
+                + depends_on_line
             )
             if iteration == 1:
                 return base + "Produce a first plan."
@@ -689,7 +730,9 @@ def build_verb_registry(
                     title = c.get("title", "(no title)")
                     wit = c.get("work_item_type", "(no type)")
                     desc = c.get("description", "") or ""
-                    child_block += f"    {i}. [{wit}] {title}\n"
+                    # 0-based slot, matching the planner's `depends_on`
+                    # index convention (requiem.plan_tree._synth_of).
+                    child_block += f"    {i}. [slot {i - 1}] [{wit}] {title}\n"
                     if desc:
                         # Indent the description so it visually nests under
                         # the title. NO truncation — see ADR-0025 dogfood
@@ -702,6 +745,9 @@ def build_verb_registry(
                         # output — show it complete.
                         desc_clean = desc.strip()
                         child_block += f"        {desc_clean}\n"
+                    deps = c.get("depends_on") or []
+                    if deps:
+                        child_block += f"        depends_on: slot(s) {deps}\n"
             else:
                 child_block = "\n  proposed children: none (leaf plan)\n"
 
@@ -729,6 +775,13 @@ def build_verb_registry(
                 "description above (not just the title) before approving — "
                 "escalate or request revision if a child invents scope "
                 "(e.g. work that already exists) not supported by it.\n"
+                "Also sanity-check any `depends_on` slot references: they "
+                "must point to a real sibling slot in THIS list (not "
+                "itself), and should only be set for a genuine build-time "
+                "prerequisite (the dependent child needs code/schema the "
+                "referenced sibling produces) — not merely a preferred "
+                "review order. Request revision if a dependency looks "
+                "wrong, missing, or spurious.\n"
                 f"Iteration: {iteration} of {ITER_CAP}. "
                 "Approve, request revision, or escalate."
             )

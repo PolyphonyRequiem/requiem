@@ -333,3 +333,129 @@ def test_needs_human_node_without_proposals_still_misaligned(tmp_path):
     with pytest.raises(PlanArtifactError) as ei:
         load_committed_leaves(tree_path, committed_path)
     assert ei.value.kind == "no_leaves"
+
+
+# ---- inter-leaf `depends_on` resolution (run #36 fanout follow-up) ----
+
+
+def test_depends_on_resolves_to_real_sibling_id(tmp_path):
+    """Grandchild A2 (slot 1 under Child A) declares depends_on=[0], naming
+    its sibling A1 (slot 0) — the resolved leaf's deps must be A1's real id.
+    """
+    tree = _tree()
+    tree["children"][0]["proposals"][1]["depends_on"] = [0]
+    leaves = load_committed_leaves(
+        _write(tmp_path / "t.json", tree),
+        _write(tmp_path / "c.json", _committed()),
+    )
+    by_real = {l.real_id: l for l in leaves}
+    assert by_real[8101].deps == ()
+    assert by_real[8102].deps == (8101,)
+
+
+def test_depends_on_absent_defaults_to_empty(tmp_path):
+    leaves = load_committed_leaves(
+        _write(tmp_path / "t.json", _tree()),
+        _write(tmp_path / "c.json", _committed()),
+    )
+    assert all(l.deps == () for l in leaves)
+
+
+def test_depends_on_self_reference_rejected(tmp_path):
+    tree = _tree()
+    tree["children"][0]["proposals"][0]["depends_on"] = [0]
+    with pytest.raises(PlanArtifactError) as ei:
+        load_committed_leaves(
+            _write(tmp_path / "t.json", tree),
+            _write(tmp_path / "c.json", _committed()),
+        )
+    assert ei.value.kind == "bad_depends_on"
+
+
+def test_depends_on_out_of_range_rejected(tmp_path):
+    tree = _tree()
+    tree["children"][0]["proposals"][0]["depends_on"] = [5]
+    with pytest.raises(PlanArtifactError) as ei:
+        load_committed_leaves(
+            _write(tmp_path / "t.json", tree),
+            _write(tmp_path / "c.json", _committed()),
+        )
+    assert ei.value.kind == "bad_depends_on"
+
+
+def test_depends_on_non_list_rejected(tmp_path):
+    tree = _tree()
+    tree["children"][0]["proposals"][0]["depends_on"] = "1"
+    with pytest.raises(PlanArtifactError) as ei:
+        load_committed_leaves(
+            _write(tmp_path / "t.json", tree),
+            _write(tmp_path / "c.json", _committed()),
+        )
+    assert ei.value.kind == "bad_depends_on"
+
+
+def test_depends_on_non_int_entries_rejected(tmp_path):
+    tree = _tree()
+    tree["children"][0]["proposals"][0]["depends_on"] = ["1"]
+    with pytest.raises(PlanArtifactError) as ei:
+        load_committed_leaves(
+            _write(tmp_path / "t.json", tree),
+            _write(tmp_path / "c.json", _committed()),
+        )
+    assert ei.value.kind == "bad_depends_on"
+
+
+def test_depends_on_targeting_a_decomposable_sibling_rejected(tmp_path):
+    """Root proposals[0] (Child A) is decomposable; a dependency naming it
+    is rejected — dependency-gating only makes sense between two leaves."""
+    tree = _tree()
+    tree["proposals"][1]["depends_on"] = [0]
+    with pytest.raises(PlanArtifactError) as ei:
+        load_committed_leaves(
+            _write(tmp_path / "t.json", tree),
+            _write(tmp_path / "c.json", _committed()),
+        )
+    assert ei.value.kind == "bad_depends_on"
+
+
+def test_depends_on_in_needs_human_branch_skips_leaf_check(tmp_path):
+    """In the needs_human branch every proposal is inherently a leaf (no
+    `children` list exists to check `decomposable` against), so depends_on
+    is resolved without the leaf-sibling check."""
+    tree = {
+        "schema_version": 2,
+        "verdict": "needs_human",
+        "plan_id": "plan-test",
+        "item_id": 100,
+        "item_title": "root",
+        "decomposable": True,
+        "current_depth": 0,
+        "approved_iteration": 1,
+        "proposals": [{"title": "A", "description": "...", "work_item_type": "Deliverable", "item_id": None}],
+        "children": [{
+            "item_id": 10001,
+            "plan_id": "child-10001",
+            "decomposable": True,
+            "final_verdict": "needs_human",
+            "proposals": [
+                {"title": "A.1", "description": "d1", "work_item_type": "Task", "item_id": None},
+                {"title": "A.2", "description": "d2", "work_item_type": "Task", "item_id": None,
+                 "depends_on": [0]},
+            ],
+            "children": [],
+        }],
+    }
+    committed = {
+        "schema_version": 1,
+        "plan_id": "plan-test",
+        "root_item_id": 100,
+        "id_map": {"10001": 5001, "1000101": 5002, "1000102": 5003},
+        "ledger": [],
+    }
+    leaves = load_committed_leaves(
+        _write(tmp_path / "t.json", tree),
+        _write(tmp_path / "c.json", committed),
+    )
+    by_title = {l.title: l for l in leaves}
+    assert by_title["A.1"].deps == ()
+    assert by_title["A.2"].deps == (5002,)

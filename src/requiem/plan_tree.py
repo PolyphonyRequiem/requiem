@@ -68,6 +68,7 @@ class ResolvedLeaf:
     work_item_type: str
     review_group: str | None = None
     depth: int = 0
+    deps: tuple[int, ...] = ()
 
 
 def _synth_of(prop: dict[str, Any], parent_synth: int, index: int) -> int:
@@ -181,6 +182,59 @@ def _map_real(prop: dict[str, Any], synth: int, id_map: dict[int, int]) -> int:
     return mapped
 
 
+def _resolve_deps(
+    prop: dict[str, Any],
+    *,
+    own_index: int,
+    proposals: list[dict[str, Any]],
+    children: list[dict[str, Any]] | None,
+    parent_synth: int,
+    id_map: dict[int, int],
+) -> tuple[int, ...]:
+    """Resolve a proposal's ``depends_on`` slot indices to real ADO ids.
+
+    ``depends_on`` (planner output, see ``planning.ChildPlan``) is a list of
+    0-based indices into the SAME ``proposals`` list ``prop`` belongs to —
+    never a cross-subtree reference in this v1 scope. Fails loud
+    (:class:`PlanArtifactError`, ``kind="bad_depends_on"``) on anything that
+    would make the dependency ungrounded: a non-list value, non-int entries,
+    a self-reference, an out-of-range index, or (when ``children`` is known,
+    i.e. the normal decomposable-branch path) a reference to a sibling that
+    is itself decomposed rather than a leaf — dependency-gating only makes
+    sense between two leaves the dispatcher actually schedules.
+    """
+    raw = prop.get("depends_on")
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not all(isinstance(d, int) for d in raw):
+        raise PlanArtifactError(
+            f"node synth {parent_synth}: proposal[{own_index}].depends_on "
+            f"is {raw!r}, expected a list of ints",
+            kind="bad_depends_on",
+        )
+    resolved: list[int] = []
+    for d in raw:
+        if d == own_index or not (0 <= d < len(proposals)):
+            raise PlanArtifactError(
+                f"node synth {parent_synth}: proposal[{own_index}].depends_on "
+                f"references invalid slot {d} (valid: 0..{len(proposals) - 1}, "
+                "excluding self)",
+                kind="bad_depends_on",
+            )
+        if children is not None and children[d].get("decomposable") is not False:
+            raise PlanArtifactError(
+                f"node synth {parent_synth}: proposal[{own_index}].depends_on "
+                f"references slot {d}, which is not a leaf (decomposable is "
+                f"{children[d].get('decomposable')!r}) — dependencies must "
+                "target a leaf sibling",
+                kind="bad_depends_on",
+            )
+        dep_prop = proposals[d]
+        dep_synth = _synth_of(dep_prop, parent_synth, d)
+        resolved.append(_map_real(dep_prop, dep_synth, id_map))
+    return tuple(resolved)
+
+
 def _walk(
     node: dict[str, Any],
     *,
@@ -233,6 +287,14 @@ def _walk(
                     work_item_type=str(prop["work_item_type"]),
                     review_group=prop.get("review_group"),
                     depth=depth + 1,
+                    deps=_resolve_deps(
+                        prop,
+                        own_index=i,
+                        proposals=proposals,
+                        children=None,
+                        parent_synth=parent_synth,
+                        id_map=id_map,
+                    ),
                 )
             )
         return
@@ -275,6 +337,14 @@ def _walk(
                     work_item_type=str(prop["work_item_type"]),
                     review_group=prop.get("review_group"),
                     depth=depth + 1,
+                    deps=_resolve_deps(
+                        prop,
+                        own_index=i,
+                        proposals=proposals,
+                        children=children,
+                        parent_synth=parent_synth,
+                        id_map=id_map,
+                    ),
                 )
             )
         else:

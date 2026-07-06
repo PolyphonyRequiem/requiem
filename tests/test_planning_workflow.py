@@ -345,6 +345,152 @@ async def test_review_group_round_trips_into_plan_tree(log_dir: Path):
     assert groups["Update tests"] is None
 
 
+# ---- inter-leaf depends_on (run #36 fanout follow-up) -------------------
+
+
+def test_child_plan_depends_on_optional_and_unvalidated():
+    """`depends_on` defaults to None, accepts a list of 0-based sibling
+    slot indices with no closed-schema validation at this layer (real
+    validation — range/self-ref/leaf-only — happens in plan_tree at
+    resolution time, where the full sibling list is known), and legacy
+    planner JSON omitting the field still validates."""
+    from requiem.workflows.planning import ChildPlan, PlannerOutput
+
+    bare = ChildPlan(title="t", description="d", work_item_type="Task")
+    assert bare.depends_on is None
+
+    dependent = ChildPlan(
+        title="t", description="d", work_item_type="Task", depends_on=[0, 2],
+    )
+    assert dependent.depends_on == [0, 2]
+
+    legacy = PlannerOutput.model_validate(
+        {
+            "summary": "s",
+            "decomposable": True,
+            "children": [
+                {"title": "t", "description": "d", "work_item_type": "Task"}
+            ],
+            "estimated_complexity": "small",
+            "rationale": "r",
+        }
+    )
+    assert legacy.children[0].depends_on is None
+
+
+async def test_depends_on_round_trips_into_plan_tree(log_dir: Path):
+    """A planner-declared `depends_on` survives into the `.plan.tree.json`
+    proposals unchanged (plan_tree.py, not planning.py, resolves slot
+    indices to real ids) — an undeclared sibling carries None."""
+    planner_output = _decomposable_planner_output()
+    planner_output["children"][1]["depends_on"] = [0]
+    # Third child intentionally left unlabelled to prove optionality.
+
+    provider = FakeProvider(
+        scripts={
+            "planner": [
+                planner_output,
+                _leaf_planner_output(),
+                _leaf_planner_output(),
+                _leaf_planner_output(),
+            ],
+            "plan_reviewer": [
+                {"verdict": "approve", "feedback": "Good cuts."},
+                {"verdict": "approve", "feedback": "ok."},
+                {"verdict": "approve", "feedback": "ok."},
+                {"verdict": "approve", "feedback": "ok."},
+            ],
+        }
+    )
+    twig = _twig()
+    for slot in (1, 2, 3):
+        child_id = ITEM_ID * 100 + slot
+        twig.items[child_id] = TwigItem(
+            id=child_id,
+            title=f"Child slot {slot}",
+            state="New",
+            area_path="Polyphony\\Engine",
+            work_item_type="Task",
+            parent_id=ITEM_ID,
+            raw={},
+        )
+    engine = build_engine(log_dir, item_id=ITEM_ID, twig=twig, provider=provider)
+    result = await engine.run("dep")
+    assert isinstance(result, Completed), result
+
+    tree = log_dir / "dep.plan.tree.json"
+    payload = json.loads(tree.read_text(encoding="utf-8"))
+    deps = {p["title"]: p.get("depends_on") for p in payload["proposals"]}
+    assert deps["Migrate verbs to ErrorKind"] == [0]
+    assert deps["Define ErrorKind enum"] is None
+    assert deps["Update tests"] is None
+
+
+def test_planner_prompt_mentions_depends_on_guidance():
+    """The planner is told about depends_on so it has a way to express a
+    real build-time prerequisite instead of leaving it as unenforceable
+    prose (run #36: 3/4 needs_human leaves were exactly this gap)."""
+    from requiem.workflows.planning import build_verb_registry
+
+    verbs = build_verb_registry(
+        item_id=ITEM_ID, parent_plan_id=None, max_depth=3, current_depth=0,
+        ancestor_item_ids=(), twig=_twig(), log_dir=Path("."),
+    )
+
+    class _Ctx:
+        completed = {
+            "fetch_item": {
+                "value": {
+                    "item_id": ITEM_ID, "title": "t", "work_item_type": "Feature",
+                    "state": "New", "description": "",
+                }
+            },
+        }
+
+    prompt = verbs.get("planner_prompt_1")(_Ctx())
+    assert "depends_on" in prompt
+    assert "0-based" in prompt
+
+
+def test_reviewer_prompt_renders_declared_depends_on():
+    """The reviewer sees each child's slot index and any declared deps, so
+    it can sanity-check a dependency before approving the plan."""
+    from requiem.workflows.planning import build_verb_registry
+
+    verbs = build_verb_registry(
+        item_id=ITEM_ID, parent_plan_id=None, max_depth=3, current_depth=0,
+        ancestor_item_ids=(), twig=_twig(), log_dir=Path("."),
+    )
+
+    class _Ctx:
+        completed = {
+            "fetch_item": {
+                "value": {
+                    "item_id": ITEM_ID, "title": "t", "work_item_type": "Feature",
+                    "state": "New", "description": "",
+                }
+            },
+            "planner_1": {
+                "value": {
+                    "parsed": {
+                        "summary": "s", "decomposable": True,
+                        "estimated_complexity": "small", "rationale": "r",
+                        "children": [
+                            {"title": "A", "description": "", "work_item_type": "Task"},
+                            {"title": "B", "description": "", "work_item_type": "Task",
+                             "depends_on": [0]},
+                        ],
+                    }
+                }
+            },
+        }
+
+    prompt = verbs.get("reviewer_prompt_1")(_Ctx())
+    assert "slot 0" in prompt
+    assert "slot 1" in prompt
+    assert "depends_on: slot(s) [0]" in prompt
+
+
 # ---- revise loop -------------------------------------------------------
 
 
@@ -380,11 +526,50 @@ async def test_revise_then_approve_iteration_2(log_dir: Path):
     assert completed["planner_2"]["value"]["parsed"]["summary"].startswith("Tightened")
 
 
+async def test_stalled_revision_escalates_to_human(log_dir: Path):
+    """A revision pass that makes no planner progress escalates immediately."""
+    provider = FakeProvider(
+        scripts={
+            "planner": [
+                _leaf_planner_output(),
+                _leaf_planner_output(),
+            ],
+            "plan_reviewer": [
+                {"verdict": "revise", "feedback": "Tighten the summary."},
+                {"verdict": "revise", "feedback": "Tighten the summary."},
+            ],
+        }
+    )
+    engine = build_engine(
+        log_dir,
+        item_id=ITEM_ID,
+        twig=_twig(),
+        provider=provider,
+        gate_handler=_proceed_handler,
+    )
+    result = await engine.run("stalled")
+    assert isinstance(result, Completed), result
+    assert result.final_node == "end_needs_human"
+
+    completed = completed_from_log(engine.log_path("stalled"))
+    plan = project_plan_result(completed)
+    assert plan is not None
+    assert plan.final_verdict == "needs_human"
+    assert "planner_1" in completed
+    assert "planner_2" in completed
+    assert "planner_3" not in completed
+    assert completed["router_2"]["kind"] == "permanent_failure"
+    assert completed["router_2"]["error_kind"] == "escalate"
+
+
 async def test_max_revisions_escalates_to_human(log_dir: Path):
     """Reviewer revises every iteration → router_3 escalates → human gate."""
     provider = FakeProvider(
         scripts={
-            "planner": [_leaf_planner_output()] * ITER_CAP,
+            "planner": [
+                {**_leaf_planner_output(), "summary": f"Revision {i}"}
+                for i in range(1, ITER_CAP + 1)
+            ],
             "plan_reviewer": [
                 {"verdict": "revise", "feedback": "not yet"},
             ]
@@ -879,7 +1064,10 @@ async def test_escalation_writes_sidecar_with_reviewer_feedback(log_dir: Path):
     )
     provider = FakeProvider(
         scripts={
-            "planner": [_leaf_planner_output()] * ITER_CAP,
+            "planner": [
+                {**_leaf_planner_output(), "summary": f"Revision {i}"}
+                for i in range(1, ITER_CAP + 1)
+            ],
             "plan_reviewer": [
                 {"verdict": "revise", "feedback": REVIEWER_FEEDBACK},
             ]
