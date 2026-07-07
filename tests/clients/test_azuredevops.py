@@ -407,6 +407,7 @@ def test_pr_complete_patches_completion_options_with_strategy() -> None:
             "status": "active",
             "sourceRefName": "refs/heads/impl/700-1",
             "targetRefName": "refs/heads/feature/700",
+            "lastMergeSourceCommit": {"commitId": "head-sha-700-1"},
         },
         {
             "pullRequestId": 42,
@@ -426,11 +427,47 @@ def test_pr_complete_patches_completion_options_with_strategy() -> None:
     assert calls[1]["body"] == {
         "status": "completed",
         "completionOptions": {"mergeStrategy": "squash"},
+        "lastMergeSourceCommit": {"commitId": "head-sha-700-1"},
     }
     assert result.number == 42
     assert result.merged is True
     assert result.merge_sha == "merge-ado-42"
     assert result.strategy == "squash"
+
+
+def test_pr_complete_falls_back_to_branch_sha_when_last_merge_source_commit_missing() -> None:
+    """ADO's PR resource should always carry lastMergeSourceCommit once
+    mergeability is computed, but if it's ever absent, pr_complete must
+    still supply *some* commit id (falling back to the live branch tip)
+    rather than send the PATCH with it omitted (HTTP 400)."""
+    client, calls = _stub_client([
+        {
+            "status": "active",
+            "sourceRefName": "refs/heads/impl/700-1",
+            "targetRefName": "refs/heads/feature/700",
+            # lastMergeSourceCommit deliberately omitted.
+        },
+        {"value": [{"objectId": "fallback-head-sha"}]},
+        {
+            "pullRequestId": 42,
+            "status": "completed",
+            "lastMergeCommit": {"commitId": "merge-ado-42"},
+        },
+    ])
+    result = asyncio.run(client.pr_complete(
+        "Contoso/P/repo",
+        42,
+        strategy="squash",
+        expected_head="impl/700-1",
+        expected_base="feature/700",
+    ))
+    assert calls[2]["method"] == "PATCH"
+    assert calls[2]["body"] == {
+        "status": "completed",
+        "completionOptions": {"mergeStrategy": "squash"},
+        "lastMergeSourceCommit": {"commitId": "fallback-head-sha"},
+    }
+    assert result.merged is True
 
 
 # ---- FakeAdoClient in-memory behaviour ----------------------------------

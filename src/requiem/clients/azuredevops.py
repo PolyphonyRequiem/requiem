@@ -534,12 +534,25 @@ class AdoClient:
                 merge_sha=merge_sha,
                 strategy=strategy,
             )
+        # ADO's completePullRequest rejects the PATCH with HTTP 400
+        # ("You must specify a valid LastMergeSourceCommit") unless we echo
+        # back the source commit it already told us about. This also
+        # doubles as ADO's own optimistic-concurrency check: the merge
+        # only proceeds if the source ref is still at this exact commit.
+        last_merge_source_commit = live.get("lastMergeSourceCommit")
+        if not (
+            isinstance(last_merge_source_commit, dict)
+            and last_merge_source_commit.get("commitId")
+        ):
+            head_sha = await self.branch_sha(repo, live_head)
+            last_merge_source_commit = {"commitId": head_sha}
         payload = await self._request(
             "PATCH",
             url,
             body={
                 "status": "completed",
                 "completionOptions": {"mergeStrategy": merge_strategy},
+                "lastMergeSourceCommit": last_merge_source_commit,
             },
         )
         merge_commit = payload.get("lastMergeCommit") or {}
