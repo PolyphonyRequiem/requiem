@@ -166,7 +166,9 @@ async def test_comments_loop_synthesizes_addresses_pushes_then_merges(log_dir: P
             ], "non_actionable": []},
         ],
         "comment_addresser": [
-            {"commits": ["newsha111111111"], "summary": "applied 2 items",
+            {"file_changes": [
+                {"path": "a.py", "operation": "modify", "content": "# fixed\n"},
+            ], "summary": "applied 2 items",
              "items_addressed": [1, 2, 3]},
         ],
     })
@@ -222,7 +224,9 @@ async def test_address_loop_max_iterations_yields_needs_human(log_dir: Path):
         {"file": "a.py", "line_range": [1, 2], "change_summary": "fix",
          "original_comment_ids": [1]},
     ], "non_actionable": []}
-    addr = lambda sha: {"commits": [sha], "summary": "", "items_addressed": [1]}
+    addr = lambda sha: {"file_changes": [
+        {"path": "a.py", "operation": "modify", "content": f"# {sha}\n"},
+    ], "summary": "", "items_addressed": [1]}
     provider = FakeProvider(scripts={
         "comment_synthesizer": [syn] * 4,
         "comment_addresser":  [addr("sha-aaa"), addr("sha-bbb"),
@@ -254,7 +258,9 @@ async def test_no_progress_detection_yields_needs_human(log_dir: Path):
         {"file": "a.py", "line_range": [1, 2], "change_summary": "fix",
          "original_comment_ids": [1]},
     ], "non_actionable": []}
-    addr = lambda sha: {"commits": [sha], "summary": "", "items_addressed": [1]}
+    addr = lambda sha: {"file_changes": [
+        {"path": "a.py", "operation": "modify", "content": f"# {sha}\n"},
+    ], "summary": "", "items_addressed": [1]}
     provider = FakeProvider(scripts={
         "comment_synthesizer": [syn, syn],
         "comment_addresser":  [addr("stuck-sha"), addr("stuck-sha")],
@@ -349,7 +355,9 @@ async def test_inv_restart_resume_mid_polling_completes(log_dir: Path):
         {"file": "a.py", "line_range": [1, 2], "change_summary": "fix",
          "original_comment_ids": [1]},
     ], "non_actionable": []}
-    addr = {"commits": ["push-1"], "summary": "", "items_addressed": [1]}
+    addr = {"file_changes": [
+        {"path": "a.py", "operation": "modify", "content": "# push-1\n"},
+    ], "summary": "", "items_addressed": [1]}
     provider1 = FakeProvider(scripts={
         "comment_synthesizer": [syn],
         "comment_addresser":  [addr],
@@ -423,7 +431,9 @@ async def test_inv_cancel_short_circuits_mid_loop(log_dir: Path):
         {"file": "a.py", "line_range": [1, 2], "change_summary": "fix",
          "original_comment_ids": [1]},
     ], "non_actionable": []}
-    addr = {"commits": ["sha-aaa"], "summary": "", "items_addressed": [1]}
+    addr = {"file_changes": [
+        {"path": "a.py", "operation": "modify", "content": "# sha-aaa\n"},
+    ], "summary": "", "items_addressed": [1]}
     provider = FakeProvider(scripts={
         "comment_synthesizer": [syn] * 2,
         "comment_addresser":  [addr, addr],
@@ -569,7 +579,9 @@ async def test_dry_run_skips_mutations(log_dir: Path):
         {"file": "a.py", "line_range": [1, 2], "change_summary": "fix",
          "original_comment_ids": [1]},
     ], "non_actionable": []}
-    addr = {"commits": ["fakesha111111111"], "summary": "",
+    addr = {"file_changes": [
+        {"path": "a.py", "operation": "modify", "content": "# fakesha\n"},
+    ], "summary": "",
             "items_addressed": [1]}
     provider = FakeProvider(scripts={
         "comment_synthesizer": [syn],

@@ -56,14 +56,16 @@ honour this by mapping ``GhUnknownError`` and ``GhAuthError`` to
 from __future__ import annotations
 
 import asyncio
+import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol
 
 from pydantic import BaseModel, Field
 
 from requiem.agent import AgentSpec, FakeProvider
+from requiem.clients.fs import FilesystemClient, FsGitError
 from requiem.clients.gh import (
     GhAuthError,
     GhClient,
@@ -74,6 +76,7 @@ from requiem.clients.gh import (
     GhServerError,
     GhUnknownError,
 )
+from requiem.coder_output import FileChange, apply_file_changes
 from requiem.dsl import AgentRegistry, VerbRegistry, Workflow, WorkflowBuilder
 from requiem.kernel import Engine
 from requiem.outcomes import (
@@ -125,14 +128,19 @@ class CommentSynthesis(BaseModel):
 
 
 class AddressResult(BaseModel):
-    """What the coder agent reports after editing the repo.
+    """What the coder agent reports after describing its fix.
 
-    ``commits`` is the list of commit SHAs the agent created (ordered
-    oldest → newest). Empty list means "agent ran but produced no
-    changes" — the workflow routes that to NeedsHuman.
+    ``file_changes`` is the load-bearing field — every entry becomes a
+    real disk mutation when ``apply_addressal`` runs, then *our* code
+    commits and pushes it. The agent never commits itself: the
+    CopilotProvider deliberately blocks shell/write-capable builtins
+    for every agent call (see ``providers/copilot.py``), so an agent
+    can only ever describe changes, never execute git. Empty list
+    means "agent found nothing it could safely change" — the workflow
+    routes that to NeedsHuman.
     """
 
-    commits: list[str]
+    file_changes: list[FileChange] = Field(default_factory=list)
     summary: str = ""
     items_addressed: list[int] = Field(default_factory=list)
 
@@ -156,10 +164,12 @@ COMMENT_ADDRESSER = AgentSpec(
     name="comment_addresser",
     charter=(
         "You receive a list of actionable review items and the repo "
-        "checkout path. You make minimal, focused edits that address "
-        "every item, commit them, and report the commit SHAs. If you "
-        "cannot address an item safely, leave commits empty and explain "
-        "in summary; the workflow will surface it to a human."
+        "checkout path. You have read-only tools to inspect the repo — "
+        "you cannot run git or write files yourself. Return an "
+        "AddressResult with the minimal set of file_changes (full file "
+        "content per changed file) that addresses every item. If you "
+        "cannot address an item safely, leave file_changes empty and "
+        "explain in summary; the workflow will surface it to a human."
     ),
     response_model=AddressResult,
 )
@@ -559,6 +569,15 @@ def build_verb_registry(
 
     verbs = VerbRegistry()
 
+    def _require_fs(ctx) -> FilesystemClient | PermanentFailure:
+        fs = ctx.toolbelt.fs
+        if fs is None:
+            return PermanentFailure(
+                error_kind="toolbelt.missing_client",
+                message="pr_lifecycle workflow requires toolbelt.fs",
+            )
+        return fs
+
     @verbs.register("start_run")
     def _start(ctx):
         return Success(
@@ -734,30 +753,57 @@ def build_verb_registry(
         )
         return (
             f"Repo checkout: {repo_path}\n"
-            "Apply the following actionable items via minimal commits. "
-            "Return AddressResult with the new commit SHAs.\n\n"
+            "Apply the following actionable items. Return AddressResult "
+            "with file_changes (full content per changed file) — you "
+            "cannot commit yourself.\n\n"
             f"{body}"
         )
+
+    @verbs.register("apply_addressal")
+    def _apply_addressal(ctx):
+        parsed = ctx.completed["address_comments"]["value"]["parsed"]
+        raw_changes = parsed.get("file_changes") or []
+        if dry_run:
+            return Success(value={
+                "applied_paths": [],
+                "dry_run": True,
+                "change_count": len(raw_changes),
+            })
+        fs = _require_fs(ctx)
+        if isinstance(fs, PermanentFailure):
+            return fs
+        return apply_file_changes(repo_path, fs, raw_changes)
 
     @verbs.register("push_addressal")
     async def _push_addressal(ctx):
         addr_outcome = ctx.completed["address_comments"]["value"]
         parsed = addr_outcome.get("parsed") or {}
-        commits = parsed.get("commits") or []
-        if not commits:
-            return PermanentFailure(
-                error_kind="needs_human.no_changes",
-                message="agent reported zero commits — nothing to push",
-                details={"summary": parsed.get("summary", "")},
-            )
         if dry_run:
+            applied = ctx.completed["apply_addressal"]["value"]
             return Success(
                 value={
-                    "sha": commits[-1],
+                    "sha": None,
                     "pushed": False,
                     "reason": "dry_run",
-                    "commits": commits,
+                    "change_count": applied.get("change_count", 0),
                 }
+            )
+        fs = _require_fs(ctx)
+        if isinstance(fs, PermanentFailure):
+            return fs
+        message = f"address review comments: {parsed.get('summary', '')[:200]}".strip()
+        try:
+            if await fs.git_is_clean():
+                # Idempotent resume: a prior commit already landed.
+                commit_sha = None
+            else:
+                await fs._git("add", "-A")  # noqa: SLF001 — staging shortcut
+                commit_sha = await fs.git_commit(message or "address review comments")
+        except FsGitError as e:
+            return PermanentFailure(
+                error_kind="needs_human.commit_failed",
+                message=f"git commit failed: {e.stderr.strip() or e}",
+                details={"stderr": e.stderr},
             )
         # Use the head branch from fetch_pr — that's what we push to.
         branch = ctx.completed["fetch_pr"]["value"]["head"]
@@ -773,7 +819,7 @@ def build_verb_registry(
                 "sha": sha,
                 "pushed": True,
                 "branch": branch,
-                "commits": commits,
+                "commit_sha": commit_sha,
             },
             inspected_artifacts=(f"commit:{sha}",),
         )
@@ -955,9 +1001,12 @@ def build_workflow() -> Workflow:
             .edge("synthesize_comments", on="bad_output",         to="needs_human_end")
             .edge("synthesize_comments", on="permanent_failure",  to="needs_human_end")
         .agent("address_comments", agent="comment_addresser", prompt_verb="address_prompt")
-            .edge("address_comments", on="success",            to="push_addressal")
+            .edge("address_comments", on="success",            to="apply_addressal")
             .edge("address_comments", on="bad_output",         to="needs_human_end")
             .edge("address_comments", on="permanent_failure",  to="needs_human_end")
+        .script("apply_addressal", verb="apply_addressal")
+            .edge("apply_addressal", on="success",            to="push_addressal")
+            .edge("apply_addressal", on="permanent_failure",  to="needs_human_end")
         .script("push_addressal", verb="push_addressal", retry_max=2)
             .edge("push_addressal", on="success",            to="check_progress")
             .edge("push_addressal", on="retry_exhausted",    to="needs_human_end")
@@ -987,6 +1036,7 @@ def build_workflow() -> Workflow:
             "dispatch_poll":        "Dispatched on poll result",
             "synthesize_comments":  "Synthesised comments",
             "address_comments":     "Addressed comments",
+            "apply_addressal":      "Applied addressal file changes",
             "push_addressal":       "Pushed addressal commits",
             "check_progress":       "Checked loop progress",
             "check_can_merge":      "Checked mergeability",
@@ -1089,12 +1139,47 @@ def _default_fake_provider() -> FakeProvider:
         ],
         "comment_addresser": [
             {
-                "commits": ["b1c2d3e4f5a6b7c8"],
-                "summary": "applied 2 items across 1 commit",
+                "file_changes": [
+                    {
+                        "path": "src/llm/openai.py",
+                        "operation": "modify",
+                        "content": "# (demo placeholder content)\n",
+                    },
+                ],
+                "summary": "applied 2 items across 1 file",
                 "items_addressed": [101, 102, 103],
             },
         ],
     })
+
+
+def _ensure_demo_git_repo(repo_path: Path) -> None:
+    """Make ``repo_path`` a real (throwaway) git repo for the smoke run.
+
+    ``apply_addressal``/``push_addressal`` do real ``fs.git_commit()``
+    calls whenever ``dry_run`` is False — which is ``build_engine``'s own
+    default. Mirrors ``implementation.py``'s ``_make_demo_inputs``: a
+    plain ``mkdir``'d stub isn't a git repo, so the CLI's bare
+    ``build_engine(log_dir)`` smoke run would crash the first time it hit
+    a real commit (ADR-0032 addendum, comment_addresser gap).
+    """
+    repo_path.mkdir(parents=True, exist_ok=True)
+    if (repo_path / ".git").exists():
+        return
+    subprocess.run(["git", "init", "-q"], cwd=repo_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "demo@requiem.local"],
+        cwd=repo_path, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Requiem Demo"],
+        cwd=repo_path, check=True,
+    )
+    (repo_path / "README.md").write_text(
+        "# pr_lifecycle workflow demo repo\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "add", "-A"], cwd=repo_path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=repo_path, check=True)
 
 
 def build_engine(
@@ -1122,6 +1207,13 @@ def build_engine(
     """
     if repo_path is None:
         repo_path = log_dir / "repo_stub"
+        _ensure_demo_git_repo(repo_path)
+    else:
+        # Explicit repo_path may not exist yet (e.g. a parent workflow's
+        # shim points at a checkout it hasn't materialised in this call).
+        # FilesystemClient's constructor requires the path to exist even
+        # when dry_run means it's never actually touched, so make sure
+        # it's there.
         repo_path.mkdir(parents=True, exist_ok=True)
     if toolkit is None:
         toolkit = _default_fake_toolkit()
@@ -1146,7 +1238,10 @@ def build_engine(
         verbs=verbs,
         agents=build_agent_registry(),
         provider=provider,
-        toolbelt=Toolbelt.real(),
+        # fs bound to this PR's checkout — apply_addressal/push_addressal
+        # need real file+git ops in repo_path, not Toolbelt.real()'s
+        # cwd-bound default (ADR-0032 addendum, comment_addresser gap).
+        toolbelt=_dc_replace(Toolbelt.real(), fs=FilesystemClient(repo_path)),
         log_dir=log_dir,
         gate_handler=gate_handler or _default_gate_handler,
     )
@@ -1245,8 +1340,8 @@ def _detail_synthesize(value: dict) -> str:
 
 def _detail_address(value: dict) -> str:
     parsed = (value.get("parsed") or {})
-    n = len(parsed.get("commits") or [])
-    return f"{n} commit(s)"
+    n = len(parsed.get("file_changes") or [])
+    return f"{n} file change(s)"
 
 
 def _detail_push(value: dict) -> str:
@@ -1267,6 +1362,11 @@ def _detail_merge(value: dict) -> str:
     return f"{value.get('strategy', '?')} → {str(value.get('merge_sha', ''))[:8]}"
 
 
+def _detail_apply_addressal(value: dict) -> str:
+    n = value.get("change_count", 0)
+    return f"{n} file(s) applied" + (" (dry-run)" if value.get("dry_run") else "")
+
+
 def render_hints() -> dict:
     return {
         "artifact_name": "PR lifecycle",
@@ -1275,6 +1375,7 @@ def render_hints() -> dict:
             "poll_review":         _detail_poll_review,
             "synthesize_comments": _detail_synthesize,
             "address_comments":    _detail_address,
+            "apply_addressal":     _detail_apply_addressal,
             "push_addressal":      _detail_push,
             "check_progress":      _detail_check_progress,
             "merge_pr":            _detail_merge,

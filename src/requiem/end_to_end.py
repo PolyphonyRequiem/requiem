@@ -27,7 +27,7 @@ spawn (the executor's own dispatch dry-run).
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -413,7 +413,10 @@ async def _dispatch_in_process(
             ll_engine = leaf_lifecycle_factory(
                 log_dir,
                 inputs=ll_inputs,
-                toolbelt=_topology_toolbelt(twig, repo_client),
+                toolbelt=_dc_replace(
+                    _topology_toolbelt(twig, repo_client),
+                    fs=FilesystemClient(ll_inputs.repo_path),
+                ),
                 provider=provider,
                 **({"gate_handler": gate_handler} if gate_handler is not None else {}),
             )
@@ -562,7 +565,10 @@ async def _dispatch_in_process(
             ll_engine = leaf_lifecycle_factory(
                 log_dir,
                 inputs=ll_inputs,
-                toolbelt=_topology_toolbelt(twig, repo_client),
+                toolbelt=_dc_replace(
+                    _topology_toolbelt(twig, repo_client),
+                    fs=FilesystemClient(ll_inputs.repo_path),
+                ),
                 provider=provider,
                 **({"gate_handler": gate_handler} if gate_handler is not None else {}),
             )
@@ -1032,7 +1038,10 @@ async def run_pipeline(
             ll_engine = leaf_lifecycle_factory(
                 log_dir,
                 inputs=ll_inputs,
-                toolbelt=_topology_toolbelt(twig, repo_client),
+                toolbelt=_dc_replace(
+                    _topology_toolbelt(twig, repo_client),
+                    fs=FilesystemClient(ll_inputs.repo_path),
+                ),
                 provider=provider,
                 **({"gate_handler": gate_handler} if gate_handler is not None else {}),
             )

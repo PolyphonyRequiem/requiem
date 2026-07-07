@@ -6,11 +6,14 @@ out of scope and human-gated elsewhere.
 """
 from __future__ import annotations
 
+import subprocess
+from dataclasses import replace as _dc_replace
 from pathlib import Path
 
 import pytest
 
 from requiem.agent import FakeProvider
+from requiem.clients.fs import FilesystemClient
 from requiem.clients.repo import (
     RepoCompleteResult,
     RepoMergeabilityReport,
@@ -18,6 +21,7 @@ from requiem.clients.repo import (
 )
 from requiem.kernel import Completed
 from requiem.persistence import replay
+from requiem.toolbelt import Toolbelt
 from requiem.workflows.leaf_lifecycle import (
     FakeLeafLifecycleToolkit,
     LeafLifecycleInputs,
@@ -34,6 +38,31 @@ def log_dir(tmp_path: Path) -> Path:
     d = tmp_path / "runs"
     d.mkdir()
     return d
+
+
+@pytest.fixture
+def repo_path(tmp_path: Path) -> Path:
+    """A tiny, hermetic git repo — separate from ``log_dir`` — that
+    ``apply_addressal``/``push_addressal`` can safely commit into via a
+    real ``FilesystemClient``.
+    """
+    p = tmp_path / "repo"
+    p.mkdir()
+    _git(p, "init", "-q")
+    _git(p, "config", "user.email", "test@requiem.local")
+    _git(p, "config", "user.name", "Test")
+    (p / "README.md").write_text("# repo\n", encoding="utf-8")
+    _git(p, "add", "-A")
+    _git(p, "commit", "-q", "-m", "initial")
+    return p
+
+
+def _git(cwd: Path, *args: str) -> str:
+    r = subprocess.run(
+        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True,
+    )
+    return r.stdout
+
 
 
 def _pr(*, state: str = "open", merged: bool = False,
@@ -94,10 +123,11 @@ def _provider(*, reviewer=None, synth=None, addresser=None) -> FakeProvider:
 
 def _engine(log_dir: Path, *, toolkit: FakeLeafLifecycleToolkit,
             provider: FakeProvider | None = None,
+            repo_path: Path | None = None,
             dry_run=False, max_iterations=3, default_branch="main"):
     inputs = LeafLifecycleInputs(
         repo=REPO,
-        repo_path=log_dir,
+        repo_path=repo_path or log_dir,
         leaf_id="1",
         root_item_id=ROOT,
         pr_number=41,
@@ -105,11 +135,17 @@ def _engine(log_dir: Path, *, toolkit: FakeLeafLifecycleToolkit,
         dry_run=dry_run,
         max_iterations=max_iterations,
     )
+    toolbelt = (
+        _dc_replace(Toolbelt.real(), fs=FilesystemClient(repo_path))
+        if repo_path is not None
+        else None
+    )
     return build_engine(
         log_dir,
         inputs=inputs,
         toolkit=toolkit,
         provider=provider or _provider(),
+        toolbelt=toolbelt,
     )
 
 
@@ -133,7 +169,7 @@ async def test_happy_path_approves_and_merges(log_dir: Path):
     assert tk.complete_calls[0]["strategy"] == "squash"
 
 
-async def test_request_changes_loops_once_then_merges(log_dir: Path):
+async def test_request_changes_loops_once_then_merges(log_dir: Path, repo_path: Path):
     tk = _toolkit(push_shas=["push-sha-1"])
     provider = _provider(
         reviewer=[
@@ -160,10 +196,12 @@ async def test_request_changes_loops_once_then_merges(log_dir: Path):
             }
         ],
         addresser=[
-            {"commits": ["push-sha-1"], "summary": "fixed", "items_addressed": [1]}
+            {"file_changes": [
+                {"path": "app.py", "operation": "modify", "content": "# fixed\n"},
+            ], "summary": "fixed", "items_addressed": [1]}
         ],
     )
-    engine = _engine(log_dir, toolkit=tk, provider=provider)
+    engine = _engine(log_dir, toolkit=tk, provider=provider, repo_path=repo_path)
     result = await engine.run("loop")
     assert result.final_node == "end_merged"
     res = build_result(_completed_map(log_dir / "loop.events.jsonl"))
@@ -205,7 +243,7 @@ async def test_reviewer_needs_human_routes_to_needs_human(log_dir: Path):
     assert res.final_state == "needs_human"
 
 
-async def test_max_iterations_escalates(log_dir: Path):
+async def test_max_iterations_escalates(log_dir: Path, repo_path: Path):
     tk = _toolkit(push_shas=["sha-1", "sha-2"])
     review1 = {
         "verdict": "request_changes",
@@ -229,7 +267,9 @@ async def test_max_iterations_escalates(log_dir: Path):
         }],
         "non_actionable": [],
     }
-    addr = {"commits": ["sha-x"], "summary": "fixed", "items_addressed": [1]}
+    addr = {"file_changes": [
+        {"path": "a.py", "operation": "modify", "content": "# sha-x\n"},
+    ], "summary": "fixed", "items_addressed": [1]}
     engine = _engine(
         log_dir,
         toolkit=tk,
@@ -239,6 +279,7 @@ async def test_max_iterations_escalates(log_dir: Path):
             addresser=[addr, addr],
         ),
         max_iterations=1,
+        repo_path=repo_path,
     )
     result = await engine.run("max_iter")
     assert result.final_node == "needs_human_end"
@@ -246,7 +287,7 @@ async def test_max_iterations_escalates(log_dir: Path):
     assert completed["check_progress"]["error_kind"] == "needs_human.max_iterations"
 
 
-async def test_same_sha_twice_trips_no_progress(log_dir: Path):
+async def test_same_sha_twice_trips_no_progress(log_dir: Path, repo_path: Path):
     tk = _toolkit(push_shas=["same-sha", "same-sha"])
     review = {
         "verdict": "request_changes",
@@ -259,11 +300,14 @@ async def test_same_sha_twice_trips_no_progress(log_dir: Path):
         }],
         "non_actionable": [],
     }
-    addr = {"commits": ["same-sha"], "summary": "fixed", "items_addressed": [1]}
+    addr = {"file_changes": [
+        {"path": "a.py", "operation": "modify", "content": "# same-sha\n"},
+    ], "summary": "fixed", "items_addressed": [1]}
     engine = _engine(
         log_dir,
         toolkit=tk,
         provider=_provider(reviewer=[review, review], synth=[synth, synth], addresser=[addr, addr]),
+        repo_path=repo_path,
     )
     result = await engine.run("no_progress")
     assert result.final_node == "needs_human_end"
@@ -271,7 +315,7 @@ async def test_same_sha_twice_trips_no_progress(log_dir: Path):
     assert completed["check_progress"]["error_kind"] == "needs_human.no_progress"
 
 
-async def test_same_findings_twice_on_new_sha_escalates(log_dir: Path):
+async def test_same_findings_twice_on_new_sha_escalates(log_dir: Path, repo_path: Path):
     tk = _toolkit(push_shas=["sha-1", "sha-2"])
     review = {
         "verdict": "request_changes",
@@ -284,11 +328,14 @@ async def test_same_findings_twice_on_new_sha_escalates(log_dir: Path):
         }],
         "non_actionable": [],
     }
-    addr = {"commits": ["sha-x"], "summary": "fixed", "items_addressed": [1]}
+    addr = {"file_changes": [
+        {"path": "a.py", "operation": "modify", "content": "# sha-x\n"},
+    ], "summary": "fixed", "items_addressed": [1]}
     engine = _engine(
         log_dir,
         toolkit=tk,
         provider=_provider(reviewer=[review, review], synth=[synth, synth], addresser=[addr, addr]),
+        repo_path=repo_path,
     )
     result = await engine.run("same_findings")
     assert result.final_node == "needs_human_end"

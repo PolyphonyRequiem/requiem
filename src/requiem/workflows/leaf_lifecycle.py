@@ -21,7 +21,8 @@ reviewer and comment-addresser agents)::
       → dispatch_review
           ├─ approve         → check_can_merge → merge_pr → end_merged
           ├─ request_changes → synthesize_comments → address_comments
-          │                    → push_addressal → check_progress → prepare_review
+          │                    → apply_addressal → push_addressal
+          │                    → check_progress → prepare_review
           └─ needs_human     → needs_human_end
 
 Fail-closed rules:
@@ -52,6 +53,7 @@ from requiem.clients.azuredevops import (
     AdoServerError,
     AdoUnknownError,
 )
+from requiem.clients.fs import FsGitError
 from requiem.clients.gh import (
     GhAuthError,
     GhClientError,
@@ -67,6 +69,7 @@ from requiem.clients.repo import (
     RepoMergeabilityReport,
     RepoPullRequest,
 )
+from requiem.coder_output import apply_file_changes
 from requiem.dsl import AgentRegistry, VerbRegistry, Workflow, WorkflowBuilder
 from requiem.kernel import Engine
 from requiem.outcomes import Outcome, PermanentFailure, RetryableFailure, Success
@@ -392,6 +395,15 @@ def build_verb_registry(
     verbs = VerbRegistry()
     protected_bases = {inputs.default_branch, "main", "master"}
 
+    def _require_fs(ctx):
+        fs = ctx.toolbelt.fs
+        if fs is None:
+            return PermanentFailure(
+                error_kind="toolbelt.missing_client",
+                message="leaf_lifecycle workflow requires toolbelt.fs",
+            )
+        return fs
+
     @verbs.register("start_run")
     def _start(ctx):
         return Success(
@@ -655,29 +667,57 @@ def build_verb_registry(
         return (
             f"Repo checkout: {inputs.repo_path}\n"
             f"Branch: {inputs.expected_head}\n"
-            "Apply the following actionable items via minimal commits and return "
-            "AddressResult with the new commit SHAs.\n\n"
+            "Apply the following actionable items. Return AddressResult "
+            "with file_changes (full content per changed file) — you "
+            "cannot commit yourself.\n\n"
             f"{rendered}"
         )
 
+    @verbs.register("apply_addressal")
+    def _apply_addressal(ctx):
+        parsed = ctx.completed["address_comments"]["value"]["parsed"]
+        raw_changes = parsed.get("file_changes") or []
+        if inputs.dry_run:
+            return Success(value={
+                "applied_paths": [],
+                "dry_run": True,
+                "change_count": len(raw_changes),
+            })
+        fs = _require_fs(ctx)
+        if isinstance(fs, PermanentFailure):
+            return fs
+        return apply_file_changes(inputs.repo_path, fs, raw_changes)
+
     @verbs.register("push_addressal")
     async def _push_addressal(ctx):
-        parsed = ctx.completed["address_comments"]["value"]["parsed"]
-        commits = list(parsed.get("commits") or [])
-        if not commits:
-            return PermanentFailure(
-                error_kind="needs_human.no_changes",
-                message="agent reported zero commits — nothing to push",
-                details={"summary": parsed.get("summary", "")},
-            )
+        addr_outcome = ctx.completed["address_comments"]["value"]
+        parsed = addr_outcome.get("parsed") or {}
         if inputs.dry_run:
+            applied = ctx.completed["apply_addressal"]["value"]
             return Success(
                 value={
-                    "sha": commits[-1],
+                    "sha": None,
                     "pushed": False,
-                    "commits": commits,
                     "reason": "dry_run",
+                    "change_count": applied.get("change_count", 0),
                 }
+            )
+        fs = _require_fs(ctx)
+        if isinstance(fs, PermanentFailure):
+            return fs
+        message = f"address review comments: {parsed.get('summary', '')[:200]}".strip()
+        try:
+            if await fs.git_is_clean():
+                # Idempotent resume: a prior commit already landed.
+                commit_sha = None
+            else:
+                await fs._git("add", "-A")  # noqa: SLF001 — staging shortcut
+                commit_sha = await fs.git_commit(message or "address review comments")
+        except FsGitError as e:
+            return PermanentFailure(
+                error_kind="needs_human.commit_failed",
+                message=f"git commit failed: {e.stderr.strip() or e}",
+                details={"stderr": e.stderr},
             )
         try:
             sha = await toolkit.git_push(inputs.repo_path, inputs.expected_head)
@@ -689,7 +729,10 @@ def build_verb_registry(
                 attempt=ctx.attempt,
                 operation="git_push",
             )
-        return Success(value={"sha": sha, "pushed": True, "commits": commits})
+        return Success(
+            value={"sha": sha, "pushed": True, "commit_sha": commit_sha},
+            inspected_artifacts=(f"commit:{sha}",),
+        )
 
     @verbs.register("check_progress")
     def _check_progress(ctx):
@@ -878,9 +921,12 @@ def build_workflow() -> Workflow:
             .edge("synthesize_comments", on="bad_output", to="needs_human_end")
             .edge("synthesize_comments", on="permanent_failure", to="needs_human_end")
         .agent("address_comments", agent="comment_addresser", prompt_verb="address_prompt")
-            .edge("address_comments", on="success", to="push_addressal")
+            .edge("address_comments", on="success", to="apply_addressal")
             .edge("address_comments", on="bad_output", to="needs_human_end")
             .edge("address_comments", on="permanent_failure", to="needs_human_end")
+        .script("apply_addressal", verb="apply_addressal")
+            .edge("apply_addressal", on="success", to="push_addressal")
+            .edge("apply_addressal", on="permanent_failure", to="needs_human_end")
         .script("push_addressal", verb="push_addressal", retry_max=2)
             .edge("push_addressal", on="success", to="check_progress")
             .edge("push_addressal", on="retry_exhausted", to="needs_human_end")
@@ -910,6 +956,7 @@ def build_workflow() -> Workflow:
             "dispatch_review": "Dispatched review verdict",
             "synthesize_comments": "Synthesised reviewer findings",
             "address_comments": "Addressed reviewer findings",
+            "apply_addressal": "Applied addressal file changes",
             "push_addressal": "Pushed addressal commits",
             "check_progress": "Checked review-loop progress",
             "check_can_merge": "Checked leaf mergeability",
