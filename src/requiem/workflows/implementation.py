@@ -1054,7 +1054,50 @@ def build_verb_registry(
                 message=f"git push origin {branch_name} failed: {e.stderr.strip() or e}",
                 details={"stderr": e.stderr},
             )
-        return Success(value={"pushed": True, "remote": "origin", "branch": branch_name})
+        status_posted = await _post_local_tests_status(ctx)
+        return Success(value={
+            "pushed": True,
+            "remote": "origin",
+            "branch": branch_name,
+            "status_posted": status_posted,
+        })
+
+    async def _post_local_tests_status(ctx) -> bool:
+        """Best-effort: post a real commit status reflecting the
+        already-passed ``run_tests`` result (ADR-0032 follow-up).
+
+        Leaf PRs land on an ephemeral ``feature/<root>`` trunk with no
+        build-validation policy attached, so nothing else ever posts a
+        commit status there and ``leaf_lifecycle.check_tests_passed``
+        (which reads exactly this signal via ``pr_mergeability``) sees
+        "unknown" forever and escalates to needs_human on every leaf. We
+        reach this node only after ``run_tests`` genuinely passed
+        (apply_changes -> run_tests -> commit_changes -> push_branch is
+        the only path in), so posting "success" here is honest evidence,
+        not an optimistic shortcut — the gate itself stays strict.
+
+        Deliberately swallows all errors: a missing/failed status post
+        just leaves the leaf at "unknown" as before (safe, pre-existing
+        failure mode), it must never fail the push itself.
+        """
+        sha = ctx.completed.get("commit_changes", {}).get("value", {}).get("sha")
+        if not sha:
+            return False
+        repo_client = ctx.toolbelt.repo or ctx.toolbelt.gh
+        poster = getattr(repo_client, "post_commit_status", None)
+        if poster is None:
+            return False
+        try:
+            await poster(
+                inputs.repo,
+                sha,
+                context="requiem/local-tests",
+                state="success",
+                description="requiem: local test run passed before push",
+            )
+        except Exception:  # noqa: BLE001 — best-effort, never fail the push
+            return False
+        return True
 
     # ---- create_pr ----------------------------------------------------
 

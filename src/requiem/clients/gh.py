@@ -59,7 +59,7 @@ import time
 from dataclasses import dataclass, field  # noqa: F401  (back-compat re-export)
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 
 # ---- typed value object ------------------------------------------------
@@ -542,6 +542,29 @@ class GhClient:
             merged=bool(payload.get("merged", False)),
             merge_sha=str(payload.get("sha")) if payload.get("sha") else None,
             strategy=strategy,
+        )
+
+    async def post_commit_status(
+        self,
+        repo: str,
+        sha: str,
+        *,
+        context: str,
+        state: Literal["success", "failure", "pending"],
+        description: str = "",
+    ) -> None:
+        """Post a commit status onto ``sha`` (ADR-0032 §self-merge evidence).
+
+        GitHub's vocabulary already matches ours 1:1 (``success`` /
+        ``failure`` / ``pending``), unlike ADO. See
+        :meth:`AdoClient.post_commit_status` for why this exists: leaf PRs
+        on an ephemeral trunk have no CI wired up, so ``pr_mergeability``'s
+        ``checks_state`` would otherwise be permanently "unknown".
+        """
+        await self.api(
+            f"repos/{repo}/statuses/{sha}",
+            method="POST",
+            body={"state": state, "context": context, "description": description},
         )
 
     async def api(

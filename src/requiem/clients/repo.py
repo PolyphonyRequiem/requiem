@@ -271,3 +271,19 @@ class MergeCapableRepoPlatform(RepoPlatform, Protocol):
         merge if the live source/target branches no longer match.
         """
         ...
+
+
+# ---- post_commit_status (ADR-0032 follow-up) -----------------------------
+#
+# `AdoClient` and `GhClient` both also implement an async
+# `post_commit_status(repo, sha, *, context, state, description="")` method
+# (states: "success" | "failure" | "pending"). It is deliberately **not**
+# part of either Protocol above: it exists to let `implementation.py`'s
+# `push_branch` record the local `run_tests` result as real evidence on the
+# ephemeral `feature/<root>` trunk (which has no CI wired up, so
+# `pr_mergeability`'s `checks_state` would otherwise be permanently
+# "unknown"). Callers reach it via `getattr(repo_client, "post_commit_status",
+# None)` and treat it as fully best-effort — adding it to the narrow Protocol
+# would force every fake/double in the codebase to grow a matching method for
+# a capability most call sites never need.
+

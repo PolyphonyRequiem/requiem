@@ -267,6 +267,31 @@ def test_pr_mergeability_without_any_checks_reports_unknown() -> None:
     assert report.checks_state == "unknown"
 
 
+def test_post_commit_status_posts_to_statuses_endpoint() -> None:
+    """ADR-0032 follow-up: mirrors AdoClient.post_commit_status — GitHub's
+    vocabulary already matches ours 1:1 so no state remapping needed."""
+    client = GhClient()
+    calls: list[dict[str, Any]] = []
+
+    async def fake_api(endpoint: str, method: str = "GET", body=None):
+        calls.append({"endpoint": endpoint, "method": method, "body": body})
+        return {}
+
+    client.api = fake_api  # type: ignore[method-assign]
+    asyncio.run(client.post_commit_status(
+        "acme/widgets", "deadbeef",
+        context="requiem/local-tests", state="success",
+        description="requiem: local test run passed before push",
+    ))
+    assert calls[0]["endpoint"] == "repos/acme/widgets/statuses/deadbeef"
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["body"] == {
+        "state": "success",
+        "context": "requiem/local-tests",
+        "description": "requiem: local test run passed before push",
+    }
+
+
 def test_pr_complete_refuses_to_mutate_on_expected_head_mismatch() -> None:
     client = GhClient()
     touched = {"api": False}

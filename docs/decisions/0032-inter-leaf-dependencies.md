@@ -144,3 +144,45 @@ made the absence far more damaging than it needed to be. The
 safe-by-default activation condition (hook wired AND a declared dependency)
 is load-bearing for why this change carries near-zero regression risk
 despite touching the live dispatch path; worth recording explicitly.
+
+## Addendum (2026-06-28): a fourth, deeper root cause — self-merge had *never* worked
+
+Run #37 validated the wave-gating fix above end-to-end (10/22 leaves
+correctly landed, 11 correctly reported `blocked` on their unmet
+dependencies) but surfaced a **separate, structural** reason self-merge
+still landed 0/10: `leaf_lifecycle.check_tests_passed` requires
+`pr_mergeability(...).checks_state == "success"`, and that signal is read
+from ADO's `commits/{sha}/statuses` feed (`_ado_commit_status_signal` in
+`azuredevops.py`). The ephemeral `feature/<root>` trunk has **no
+build-validation branch policy attached** — nothing ADO-side ever posts a
+commit status there — so `checks_state` was permanently `"unknown"`, never
+transient. Every leaf's merge attempt hit `needs_human.tests_status_unknown`
+on the first try, with no retry loop (this node has none, unlike its
+siblings). This is very likely why self-merge has never once succeeded
+across runs #34–#37, independent of (and compounding) the wave-gating bug
+above.
+
+`check_tests_passed`'s docstring is explicit that this is a **deliberate
+fail-closed gate** ("must be explicitly green before review… never an
+optimistic merge") — so the fix is to give it real evidence, not to relax
+it. `implementation.py`'s `push_branch` verb now calls a new best-effort
+`post_commit_status(repo, sha, *, context, state, description)` method
+(implemented on both `AdoClient` and `GhClient`, deliberately **not** added
+to the `RepoPlatform`/`MergeCapableRepoPlatform` Protocols — see the note in
+`clients/repo.py` — since it's a narrow, optional capability most call
+sites never need) right after a successful push, posting
+`context="requiem/local-tests", state="success"` for the commit that
+`run_tests` has *just* verified locally (the only path into `push_branch` is
+`apply_changes -> run_tests -> commit_changes -> push_branch`, so this is
+honest evidence, not a shortcut). `check_tests_passed` itself is unchanged
+— it still requires a genuine `"success"` signal, it just now has one to
+find.
+
+`leaf_lifecycle.push_addressal` (the post-review-fix push path) is
+deliberately left unchanged: it pushes revision commits with no fresh
+`run_tests` re-run before them, so posting a status there would be the
+optimistic-merge shortcut the gate exists to prevent. Revision commits
+correctly stay at `checks_state="unknown"` and route to
+`needs_human.tests_status_unknown` until re-verified — a pre-existing,
+intentionally conservative gap, not a regression from this fix.
+

@@ -338,6 +338,51 @@ def test_pr_mergeability_with_no_commit_statuses_reports_unknown() -> None:
     assert report.checks_state == "unknown"
 
 
+def test_post_commit_status_posts_to_commit_statuses_endpoint() -> None:
+    """ADR-0032 follow-up: implementation.py's push_branch posts a real
+    commit status here so leaf_lifecycle's check_tests_passed (which reads
+    exactly this feed via pr_mergeability) isn't permanently 'unknown' on
+    the ephemeral trunk."""
+    client, calls = _stub_client([{}])
+    asyncio.run(client.post_commit_status(
+        "Contoso/P/repo", "deadbeef",
+        context="requiem/local-tests", state="success",
+        description="requiem: local test run passed before push",
+    ))
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["url"].endswith("/commits/deadbeef/statuses")
+    assert calls[0]["body"]["state"] == "succeeded"
+    assert calls[0]["body"]["context"]["name"] == "requiem/local-tests"
+
+
+def test_fake_ado_client_post_commit_status_feeds_pr_mergeability() -> None:
+    """The fake's post_commit_status must actually influence a subsequent
+    pr_mergeability call (mirrors the real client reading the same feed
+    it was just posted to) so tests can exercise the check_tests_passed
+    happy path without hitting real ADO."""
+    fake = FakeAdoClient(
+        refs={("Contoso/P/repo", "impl/700-1"): "headsha42"},
+        open_prs=[
+            RepoPullRequest(
+                number=42, title="leaf", state="open", merged=False,
+                merged_at=None, head="impl/700-1", base="feature/700",
+                url="https://example.test/pr/42",
+                raw={"_repo": "Contoso/P/repo", "mergeStatus": "succeeded"},
+            ),
+        ],
+    )
+    before = asyncio.run(fake.pr_mergeability("Contoso/P/repo", 42))
+    assert before.checks_state == "unknown"
+
+    asyncio.run(fake.post_commit_status(
+        "Contoso/P/repo", "headsha42",
+        context="requiem/local-tests", state="success",
+    ))
+    after = asyncio.run(fake.pr_mergeability("Contoso/P/repo", 42))
+    assert after.checks_state == "success"
+    assert fake.posted_statuses[0]["sha"] == "headsha42"
+
+
 def test_pr_complete_refuses_to_patch_on_expected_base_mismatch() -> None:
     client, calls = _stub_client([{
         "status": "active",

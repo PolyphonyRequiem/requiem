@@ -38,7 +38,7 @@ import base64
 import json
 import os
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from requiem.clients.repo import (
     RepoCompleteResult,
@@ -455,6 +455,40 @@ class AdoClient:
             policies_satisfied=(merge_status == "succeeded"),
         )
 
+    async def post_commit_status(
+        self,
+        repo: str,
+        sha: str,
+        *,
+        context: str,
+        state: Literal["success", "failure", "pending"],
+        description: str = "",
+    ) -> None:
+        """Post a commit status onto ``sha`` (ADR-0032 §self-merge evidence).
+
+        ADO's leaf-PR ``checks_state`` (``_ado_commit_status_signal`` above)
+        is computed from this same ``commits/{sha}/statuses`` feed. Leaf PRs
+        land on an ephemeral ``feature/<root>`` trunk with no build-validation
+        branch policy attached — nothing else will ever post a status there —
+        so without this, ``checks_state`` stays "unknown" forever and
+        ``leaf_lifecycle.check_tests_passed`` can never see a green signal.
+        Callers post this once local tests (``implementation.py``'s
+        ``run_tests``) have actually verified the commit, so the gate stays
+        genuinely fail-closed on real evidence rather than being relaxed.
+        """
+        state_map = {"success": "succeeded", "failure": "failed", "pending": "pending"}
+        body = {
+            "state": state_map[state],
+            "description": description,
+            "context": {"name": context, "genre": "requiem"},
+        }
+        await self._request(
+            "POST",
+            f"{self._repo_base(repo)}/commits/{sha}/statuses",
+            body=body,
+            params={"api-version": "7.1-preview.1"},
+        )
+
     async def pr_complete(
         self,
         repo: str,
@@ -696,6 +730,10 @@ class FakeAdoClient:
         self.created_refs: list[tuple[str, str, str]] = []  # (repo, branch, sha)
         self.created_prs: list[dict[str, Any]] = []
         self.completed_prs: list[dict[str, Any]] = []
+        self.posted_statuses: list[dict[str, Any]] = []
+        # (repo, sha) -> list of ADO-shaped status rows, mirrors the real
+        # commits/{sha}/statuses feed post_commit_status writes to.
+        self._statuses_by_sha: dict[tuple[str, str], list[dict[str, Any]]] = {}
 
     @staticmethod
     def _infer_repo(pr: RepoPullRequest) -> str:
@@ -807,9 +845,14 @@ class FakeAdoClient:
             mergeable = None
         else:
             mergeable = False
-        checks_state = _ado_commit_status_signal(
-            {"value": pr.raw.get("statuses") or []}
-        )
+        # Merge test-seeded pr.raw["statuses"] with anything posted via
+        # post_commit_status against the PR's head sha, mirroring how the
+        # real client reads commits/{sha}/statuses independently of the
+        # PR payload itself.
+        head_sha = self._refs.get((repo, pr.head))
+        posted = self._statuses_by_sha.get((repo, head_sha), []) if head_sha else []
+        rows = list(pr.raw.get("statuses") or []) + posted
+        checks_state = _ado_commit_status_signal({"value": rows})
         return RepoMergeabilityReport(
             mergeable=mergeable,
             mergeable_state=status,
@@ -817,6 +860,27 @@ class FakeAdoClient:
             conflicts=(status == "conflicts"),
             policies_satisfied=(status == "succeeded"),
         )
+
+    async def post_commit_status(
+        self,
+        repo: str,
+        sha: str,
+        *,
+        context: str,
+        state: Literal["success", "failure", "pending"],
+        description: str = "",
+    ) -> None:
+        state_map = {"success": "succeeded", "failure": "failed", "pending": "pending"}
+        row = {
+            "state": state_map[state],
+            "description": description,
+            "context": {"name": context, "genre": "requiem"},
+        }
+        self._statuses_by_sha.setdefault((repo, sha), []).append(row)
+        self.posted_statuses.append({
+            "repo": repo, "sha": sha, "context": context,
+            "state": state, "description": description,
+        })
 
     async def pr_complete(
         self,

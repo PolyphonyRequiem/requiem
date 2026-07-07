@@ -96,6 +96,7 @@ class FakeGh:
     pr_number: int = 99
     existing_prs: list[GhPullRequest] = field(default_factory=list)
     created_calls: list[dict[str, Any]] = field(default_factory=list)
+    posted_statuses: list[dict[str, Any]] = field(default_factory=list)
     raise_on_search: Exception | None = None
     raise_on_create: Exception | None = None
 
@@ -140,6 +141,14 @@ class FakeGh:
             "title": title, "body": body, "head": head, "base": base, "url": url
         })
         return pr
+
+    async def post_commit_status(
+        self, repo: str, sha: str, *, context: str, state: str, description: str = "",
+    ) -> None:
+        self.posted_statuses.append({
+            "repo": repo, "sha": sha, "context": context,
+            "state": state, "description": description,
+        })
 
 
 def _make_item(item_id: int = 12345, *, title: str = "Refactor outcome dispatch") -> TwigItem:
@@ -374,10 +383,26 @@ async def test_happy_path_pr_created(repo_path: Path, tmp_path: Path) -> None:
     assert result.disposition == "completed"
     assert result.final_node == "end_handoff"
 
+    completed = {
+        e["node_id"]: e["payload"]["outcome"]
+        for e in replay(engine.log_path("happy"))
+        if e["kind"] == "verb_completed"
+    }
+
     # gh.pr_create called exactly once
     assert len(gh.created_calls) == 1
     assert gh.created_calls[0]["head"] == "feature/12345"
     assert gh.created_calls[0]["base"] == "main"
+
+    # ADR-0032 follow-up: push_branch posts a real commit status reflecting
+    # the already-passed run_tests result, so leaf_lifecycle's
+    # check_tests_passed has genuine evidence instead of a permanently
+    # "unknown" checks_state on the ephemeral trunk.
+    commit_sha = completed["commit_changes"]["value"]["sha"]
+    assert len(gh.posted_statuses) == 1
+    assert gh.posted_statuses[0]["sha"] == commit_sha
+    assert gh.posted_statuses[0]["state"] == "success"
+    assert gh.posted_statuses[0]["context"] == "requiem/local-tests"
 
     # The PR was linked back via twig.comment
     assert len(twig.comments) == 1
@@ -387,11 +412,6 @@ async def test_happy_path_pr_created(repo_path: Path, tmp_path: Path) -> None:
     assert (repo_path / "MARKER.md").read_text(encoding="utf-8") == "hello\n"
 
     # ImplementationResult round-trips out of the completed projection.
-    completed = {
-        e["node_id"]: e["payload"]["outcome"]
-        for e in replay(engine.log_path("happy"))
-        if e["kind"] == "verb_completed"
-    }
     impl_result = ImplementationResult.from_completed(completed)
     assert impl_result.pr_number == 42
     assert impl_result.tests_passed is True
