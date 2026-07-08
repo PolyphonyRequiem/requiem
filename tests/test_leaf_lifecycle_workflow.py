@@ -157,9 +157,9 @@ def _completed_map(log_path: Path) -> dict[str, dict]:
     return out
 
 
-async def test_happy_path_approves_and_merges(log_dir: Path):
+async def test_happy_path_approves_and_merges(log_dir: Path, repo_path: Path):
     tk = _toolkit()
-    engine = _engine(log_dir, toolkit=tk)
+    engine = _engine(log_dir, toolkit=tk, repo_path=repo_path)
     result = await engine.run("happy")
     assert isinstance(result, Completed)
     assert result.final_node == "end_merged"
@@ -167,6 +167,52 @@ async def test_happy_path_approves_and_merges(log_dir: Path):
     assert res.final_state == "merged"
     assert res.merge_sha == "merge-sha-41"
     assert tk.complete_calls[0]["strategy"] == "squash"
+
+
+async def test_approve_prunes_context_pack_before_merge(log_dir: Path, repo_path: Path):
+    """Run #39 postmortem: every leaf writes its own `.requiem/AGENTS.md`
+    (+ siblings) at the SAME fixed path. Once any leaf's copy lands on
+    trunk, every other leaf's differing copy at that identical path is a
+    guaranteed, spurious merge conflict — not a real code conflict. The
+    fix prunes the pack from the leaf branch before it ever reaches
+    `check_can_merge`/`merge_pr`, so trunk never sees it at all.
+    """
+    from requiem.context_pack import CONTEXT_PACK_DIR
+
+    pack_dir = repo_path / CONTEXT_PACK_DIR
+    pack_dir.mkdir()
+    (pack_dir / "AGENTS.md").write_text("# Context for leaf: 1\n", encoding="utf-8")
+    (pack_dir / ".plan_hash").write_text("deadbeef\n", encoding="utf-8")
+    _git(repo_path, "add", "-A")
+    _git(repo_path, "commit", "-q", "-m", "chore(context): requiem context pack for leaf 1")
+
+    tk = _toolkit()
+    engine = _engine(log_dir, toolkit=tk, repo_path=repo_path)
+    result = await engine.run("prune")
+    assert result.final_node == "end_merged"
+
+    completed = _completed_map(log_dir / "prune.events.jsonl")
+    prune_outcome = completed["prune_context_pack"]
+    assert prune_outcome["value"]["pruned"] is True
+    assert prune_outcome["value"]["commit_sha"] is not None
+
+    assert not pack_dir.exists()
+    log_msg = _git(repo_path, "log", "-1", "--format=%s")
+    assert "drop requiem context-pack scaffold" in log_msg
+
+
+async def test_prune_context_pack_is_idempotent_when_absent(log_dir: Path, repo_path: Path):
+    """No context pack ever landed on this leaf branch (e.g. a config
+    without ADR-0030's context-pack step) — pruning is a safe no-op that
+    still reaches the merge instead of erroring.
+    """
+    tk = _toolkit()
+    engine = _engine(log_dir, toolkit=tk, repo_path=repo_path)
+    result = await engine.run("prune_absent")
+    assert result.final_node == "end_merged"
+    completed = _completed_map(log_dir / "prune_absent.events.jsonl")
+    assert completed["prune_context_pack"]["value"]["pruned"] is False
+    assert completed["prune_context_pack"]["value"]["commit_sha"] is None
 
 
 async def test_request_changes_loops_once_then_merges(log_dir: Path, repo_path: Path):
@@ -352,10 +398,10 @@ async def test_same_findings_twice_on_new_sha_escalates(log_dir: Path, repo_path
         (_mergeable(mergeable=None, state="unknown", checks="success", policies=False), "needs_human.mergeability_unknown"),
     ],
 )
-async def test_mergeability_fail_closed_paths(log_dir: Path, report, error_kind):
+async def test_mergeability_fail_closed_paths(log_dir: Path, repo_path: Path, report, error_kind):
     precheck = _mergeable()
     tk = _toolkit(mergeability=[precheck, report])
-    engine = _engine(log_dir, toolkit=tk)
+    engine = _engine(log_dir, toolkit=tk, repo_path=repo_path)
     result = await engine.run(f"mergeability_{error_kind.split('.')[-1]}")
     assert result.final_node == "needs_human_end"
     completed = _completed_map(log_dir / f"mergeability_{error_kind.split('.')[-1]}.events.jsonl")

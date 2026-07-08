@@ -19,7 +19,7 @@ reviewer and comment-addresser agents)::
       → prepare_review
       → review_leaf
       → dispatch_review
-          ├─ approve         → check_can_merge → merge_pr → end_merged
+          ├─ approve         → prune_context_pack → check_can_merge → merge_pr → end_merged
           ├─ request_changes → synthesize_comments → address_comments
           │                    → apply_addressal → push_addressal
           │                    → check_progress → prepare_review
@@ -38,6 +38,7 @@ Fail-closed rules:
 from __future__ import annotations
 
 import hashlib
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,6 +55,7 @@ from requiem.clients.azuredevops import (
     AdoUnknownError,
 )
 from requiem.clients.fs import FsGitError
+from requiem.context_pack import CONTEXT_PACK_DIR
 from requiem.clients.gh import (
     GhAuthError,
     GhClientError,
@@ -780,6 +782,68 @@ def build_verb_registry(
             }
         )
 
+    @verbs.register("prune_context_pack")
+    async def _prune_context_pack(ctx):
+        # Every leaf writes its OWN context pack to the SAME fixed path
+        # (`.requiem/AGENTS.md` + siblings — see context_pack.py). That's
+        # fine while the leaf branch is alone, but once ANY leaf's copy
+        # lands on the shared trunk, every OTHER leaf's differing copy at
+        # that identical path becomes an unavoidable, spurious merge
+        # conflict — not a real code conflict, just two leaves independently
+        # "adding" the same path with different content. Run #39 postmortem:
+        # this was the actual cause behind 1/6 landed leaves'
+        # `needs_human.conflicts` (and would eventually hit every leaf after
+        # the first one to merge). The pack is requiem-internal scratch
+        # state for the review/address loop (mirrors `cleanup_worktree`'s
+        # `.requiem` exclude in implementation.py) — nothing downstream of
+        # `check_can_merge` reads it, so it's safe (and correct) to prune it
+        # from the branch entirely before trunk ever sees it.
+        if inputs.dry_run:
+            return Success(value={"pruned": False, "reason": "dry_run"})
+        fs = _require_fs(ctx)
+        if isinstance(fs, PermanentFailure):
+            return fs
+        pack_dir = inputs.repo_path / CONTEXT_PACK_DIR
+        try:
+            if pack_dir.exists():
+                shutil.rmtree(pack_dir)
+            if await fs.git_is_clean():
+                # Idempotent resume: either there was never a pack to
+                # prune, or a prior attempt committed the removal but
+                # died before the push below — either way, nothing new
+                # to commit here.
+                commit_sha = None
+            else:
+                commit_sha = await fs.git_commit(
+                    "chore(context): drop requiem context-pack scaffold before merge",
+                    paths=[Path(CONTEXT_PACK_DIR)],
+                )
+        except FsGitError as e:
+            return PermanentFailure(
+                error_kind="needs_human.commit_failed",
+                message=f"failed to prune context pack: {e.stderr.strip() or e}",
+                details={"stderr": e.stderr},
+            )
+        except OSError as e:
+            return PermanentFailure(
+                error_kind="needs_human.commit_failed",
+                message=f"failed to remove {CONTEXT_PACK_DIR}: {e}",
+            )
+        try:
+            sha = await toolkit.git_push(inputs.repo_path, inputs.expected_head)
+        except Exception as e:  # noqa: BLE001
+            return _map_platform_error(
+                e,
+                run_id=ctx.run_id,
+                node_id=ctx.node_id,
+                attempt=ctx.attempt,
+                operation="git_push",
+            )
+        return Success(
+            value={"pruned": commit_sha is not None, "commit_sha": commit_sha, "sha": sha},
+            inspected_artifacts=(f"commit:{sha}",),
+        )
+
     @verbs.register("check_can_merge")
     async def _check_can_merge(ctx):
         try:
@@ -914,7 +978,7 @@ def build_workflow() -> Workflow:
             .edge("review_leaf", on="permanent_failure", to="needs_human_end")
         .script("dispatch_review", verb="dispatch_review")
             .edge("dispatch_review", on="success", to="synthesize_comments")
-            .edge("dispatch_review", on="permanent_failure:review.approved", to="check_can_merge")
+            .edge("dispatch_review", on="permanent_failure:review.approved", to="prune_context_pack")
             .edge("dispatch_review", on="permanent_failure", to="needs_human_end")
         .agent("synthesize_comments", agent="comment_synthesizer", prompt_verb="synth_prompt")
             .edge("synthesize_comments", on="success", to="address_comments")
@@ -934,6 +998,10 @@ def build_workflow() -> Workflow:
         .script("check_progress", verb="check_progress")
             .edge("check_progress", on="success", to="check_tests_passed")
             .edge("check_progress", on="permanent_failure", to="needs_human_end")
+        .script("prune_context_pack", verb="prune_context_pack", retry_max=2)
+            .edge("prune_context_pack", on="success", to="check_can_merge")
+            .edge("prune_context_pack", on="retry_exhausted", to="needs_human_end")
+            .edge("prune_context_pack", on="permanent_failure", to="needs_human_end")
         .script("check_can_merge", verb="check_can_merge", retry_max=2)
             .edge("check_can_merge", on="success", to="merge_pr")
             .edge("check_can_merge", on="retry_exhausted", to="needs_human_end")
@@ -959,6 +1027,7 @@ def build_workflow() -> Workflow:
             "apply_addressal": "Applied addressal file changes",
             "push_addressal": "Pushed addressal commits",
             "check_progress": "Checked review-loop progress",
+            "prune_context_pack": "Pruned requiem context-pack scaffold before merge",
             "check_can_merge": "Checked leaf mergeability",
             "merge_pr": "Merged leaf PR",
             "end_merged": "Leaf PR lifecycle",
