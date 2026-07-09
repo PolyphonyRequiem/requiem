@@ -19,7 +19,7 @@ from requiem.clients.repo import (
     RepoMergeabilityReport,
     RepoPullRequest,
 )
-from requiem.kernel import Completed
+from requiem.kernel import Completed, Suspended
 from requiem.persistence import replay
 from requiem.toolbelt import Toolbelt
 from requiem.workflows.leaf_lifecycle import (
@@ -255,6 +255,154 @@ async def test_request_changes_loops_once_then_merges(log_dir: Path, repo_path: 
     assert res.iterations == 1
     assert res.comments_addressed == 1
     assert len(tk.complete_calls) == 1
+
+
+async def test_approve_with_non_blocking_comments_reconciles_and_merges(
+    log_dir: Path, repo_path: Path
+):
+    tk = _toolkit()
+    provider = _provider(reviewer=[{
+        "verdict": "approve",
+        "summary": "safe with optional cleanup",
+        "comments": [
+            {
+                "file": "app.py",
+                "line": 10,
+                "body": "consider renaming this later",
+                "severity": "minor",
+            },
+            {
+                "file": "README.md",
+                "line": None,
+                "body": "small wording nit",
+                "severity": "nit",
+            },
+        ],
+    }])
+    engine = _engine(log_dir, toolkit=tk, provider=provider, repo_path=repo_path)
+
+    result = await engine.run("approve_non_blocking")
+
+    assert result.final_node == "end_merged"
+    completed = _completed_map(log_dir / "approve_non_blocking.events.jsonl")
+    assert completed["dispatch_review"]["error_kind"] == "review.inconsistent"
+    assert (
+        completed["reconcile_review_inconsistency"]["value"]["method"]
+        == "accepted_non_blocking_comments"
+    )
+    assert completed["verify_review_reconciliation"]["error_kind"] == "review.approved"
+    assert "deliberate_review_inconsistency" not in completed
+
+
+async def test_approve_with_actionable_comments_enters_rework_loop(
+    log_dir: Path, repo_path: Path
+):
+    tk = _toolkit(push_shas=["push-sha-1"])
+    provider = _provider(
+        reviewer=[
+            {
+                "verdict": "approve",
+                "summary": "safe after one concrete fix",
+                "comments": [{
+                    "file": "app.py",
+                    "line": 10,
+                    "body": "fix the unsafe branch",
+                    "severity": "major",
+                }],
+            },
+            {"verdict": "approve", "comments": [], "summary": "now good"},
+        ],
+        synth=[{
+            "actionable_items": [{
+                "file": "app.py",
+                "line_range": [10, 10],
+                "change_summary": "fix the unsafe branch",
+                "original_comment_ids": [1],
+            }],
+            "non_actionable": [],
+        }],
+        addresser=[{
+            "file_changes": [{
+                "path": "app.py",
+                "operation": "modify",
+                "content": "# fixed\n",
+            }],
+            "summary": "fixed",
+            "items_addressed": [1],
+        }],
+    )
+    engine = _engine(log_dir, toolkit=tk, provider=provider, repo_path=repo_path)
+
+    result = await engine.run("approve_actionable")
+
+    assert result.final_node == "end_merged"
+    completed = _completed_map(log_dir / "approve_actionable.events.jsonl")
+    assert (
+        completed["reconcile_review_inconsistency"]["value"]["method"]
+        == "promoted_actionable_comments"
+    )
+    assert completed["verify_review_reconciliation"]["kind"] == "success"
+    assert build_result(completed).comments_addressed == 1
+
+
+async def test_ambiguous_review_gets_one_bounded_reviewer_deliberation(
+    log_dir: Path, repo_path: Path
+):
+    tk = _toolkit()
+    provider = _provider(reviewer=[
+        {
+            "verdict": "request_changes",
+            "comments": [],
+            "summary": "something should change",
+        },
+        {"verdict": "approve", "comments": [], "summary": "safe as-is"},
+    ])
+    engine = _engine(log_dir, toolkit=tk, provider=provider, repo_path=repo_path)
+
+    result = await engine.run("review_deliberation")
+
+    assert result.final_node == "end_merged"
+    completed = _completed_map(log_dir / "review_deliberation.events.jsonl")
+    assert (
+        completed["reconcile_review_inconsistency"]["error_kind"]
+        == "review.deliberation_required"
+    )
+    assert completed["deliberate_review_inconsistency"]["kind"] == "success"
+    attempts = completed["verify_review_reconciliation"]["details"]["recovery_attempts"]
+    assert [attempt["kind"] for attempt in attempts] == [
+        "deterministic_reconciliation",
+        "reviewer_deliberation",
+    ]
+
+
+async def test_unresolved_review_inconsistency_suspends_with_escalation_brief(
+    log_dir: Path
+):
+    tk = _toolkit()
+    provider = _provider(reviewer=[
+        {
+            "verdict": "request_changes",
+            "comments": [],
+            "summary": "something should change",
+        },
+        {
+            "verdict": "needs_human",
+            "comments": [],
+            "summary": "requirements are ambiguous",
+        },
+    ])
+    engine = _engine(log_dir, toolkit=tk, provider=provider)
+
+    result = await engine.run("review_escalation")
+
+    assert isinstance(result, Suspended)
+    assert result.node_id == "verify_review_reconciliation"
+    assert result.options == ("retry_review", "abort")
+    completed = _completed_map(log_dir / "review_escalation.events.jsonl")
+    brief = completed["verify_review_reconciliation"]["context"]
+    assert brief["trigger"]["problem_kind"] == "review.inconsistent"
+    assert brief["recommended_option"] == "retry_review"
+    assert len(brief["recovery_attempts"]) == 2
 
 
 async def test_tests_not_passed_precondition_blocks_before_review(log_dir: Path):

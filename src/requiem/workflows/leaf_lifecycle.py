@@ -19,11 +19,15 @@ reviewer and comment-addresser agents)::
       → prepare_review
       → review_leaf
       → dispatch_review
-          ├─ approve         → prune_context_pack → check_can_merge → merge_pr → end_merged
-          ├─ request_changes → synthesize_comments → address_comments
-          │                    → apply_addressal → push_addressal
-          │                    → check_progress → prepare_review
-          └─ needs_human     → needs_human_end
+          ├─ approve             → prune_context_pack → check_can_merge → merge_pr → end_merged
+          ├─ request_changes     → synthesize_comments → address_comments
+          │                        → apply_addressal → push_addressal
+          │                        → check_progress → prepare_review
+          ├─ inconsistent review → reconcile_review_inconsistency
+          │                        ├─ deterministic → verify_review_reconciliation
+          │                        └─ ambiguous → deliberate_review_inconsistency
+          │                                      → verify_review_reconciliation
+          └─ needs_human         → needs_human_end
 
 Fail-closed rules:
 
@@ -38,6 +42,7 @@ Fail-closed rules:
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -74,7 +79,13 @@ from requiem.clients.repo import (
 from requiem.coder_output import apply_file_changes
 from requiem.dsl import AgentRegistry, VerbRegistry, Workflow, WorkflowBuilder
 from requiem.kernel import Engine
-from requiem.outcomes import Outcome, PermanentFailure, RetryableFailure, Success
+from requiem.outcomes import (
+    NeedsHuman,
+    Outcome,
+    PermanentFailure,
+    RetryableFailure,
+    Success,
+)
 from requiem.review_schemas import LeafReviewReport
 from requiem.toolbelt import Toolbelt
 from requiem.workflows.pr_lifecycle import (
@@ -406,6 +417,12 @@ def build_verb_registry(
             )
         return fs
 
+    def _actionable_review(ctx) -> dict[str, Any]:
+        dispatch = ctx.completed["dispatch_review"]
+        if dispatch.get("kind") == "success":
+            return dispatch["value"]
+        return ctx.completed["verify_review_reconciliation"]["value"]
+
     @verbs.register("start_run")
     def _start(ctx):
         return Success(
@@ -613,8 +630,9 @@ def build_verb_registry(
         if verdict == "approve":
             if comments:
                 return PermanentFailure(
-                    error_kind="needs_human.review_inconsistent",
+                    error_kind="review.inconsistent",
                     message="reviewer approved but still emitted comments",
+                    details={"report": parsed},
                 )
             return PermanentFailure(
                 error_kind="review.approved",
@@ -628,13 +646,15 @@ def build_verb_registry(
             )
         if verdict != "request_changes":
             return PermanentFailure(
-                error_kind="needs_human.review_inconsistent",
+                error_kind="review.inconsistent",
                 message=f"unexpected review verdict {verdict!r}",
+                details={"report": parsed},
             )
         if not comments:
             return PermanentFailure(
-                error_kind="needs_human.review_inconsistent",
+                error_kind="review.inconsistent",
                 message="reviewer requested changes but emitted no comments",
+                details={"report": parsed},
             )
         return Success(
             value={
@@ -644,9 +664,171 @@ def build_verb_registry(
             }
         )
 
+    @verbs.register("reconcile_review_inconsistency")
+    def _reconcile_review_inconsistency(ctx):
+        trigger = ctx.completed["dispatch_review"]
+        report = dict((trigger.get("details") or {}).get("report") or {})
+        verdict = report.get("verdict")
+        comments = list(report.get("comments") or [])
+        summary = str(report.get("summary", ""))
+
+        if verdict == "approve" and comments:
+            actionable = [
+                comment
+                for comment in comments
+                if comment.get("severity") in {"blocker", "major"}
+            ]
+            canonical_verdict = "request_changes" if actionable else "approve"
+            method = (
+                "promoted_actionable_comments"
+                if actionable
+                else "accepted_non_blocking_comments"
+            )
+            return Success(
+                value={
+                    "report": {
+                        "verdict": canonical_verdict,
+                        "comments": comments,
+                        "summary": summary,
+                    },
+                    "method": method,
+                    "trigger": {
+                        "error_kind": trigger.get("error_kind"),
+                        "message": trigger.get("message"),
+                    },
+                }
+            )
+
+        return PermanentFailure(
+            error_kind="review.deliberation_required",
+            message="review report cannot be reconciled mechanically",
+            details={
+                "report": report,
+                "trigger": {
+                    "error_kind": trigger.get("error_kind"),
+                    "message": trigger.get("message"),
+                },
+            },
+        )
+
+    @verbs.register("review_inconsistency_prompt")
+    def _review_inconsistency_prompt(ctx):
+        trigger = ctx.completed["dispatch_review"]
+        report = (trigger.get("details") or {}).get("report") or {}
+        return (
+            "Reconcile this internally inconsistent leaf-review report. "
+            "Return a fresh canonical LeafReviewReport. Use `approve` only if "
+            "the leaf is safe to merge as-is and every retained comment is "
+            "non-blocking (`minor` or `nit`). Use `request_changes` only with "
+            "one or more concrete `blocker` or `major` comments Requiem can "
+            "address. Use `needs_human` only for genuinely ambiguous risk that "
+            "cannot be resolved from the report and diff context already "
+            "available to you.\n\n"
+            f"Original report:\n{json.dumps(report, indent=2, sort_keys=True)}"
+        )
+
+    @verbs.register("verify_review_reconciliation")
+    def _verify_review_reconciliation(ctx):
+        recovery = ctx.completed["reconcile_review_inconsistency"]
+        if recovery.get("kind") == "success":
+            recovery_value = recovery["value"]
+            report = dict(recovery_value["report"])
+            attempts = [
+                {
+                    "kind": "deterministic_reconciliation",
+                    "result": recovery_value["method"],
+                }
+            ]
+        else:
+            report = dict(
+                ctx.completed["deliberate_review_inconsistency"]["value"]["parsed"]
+            )
+            attempts = [
+                {
+                    "kind": "deterministic_reconciliation",
+                    "result": "ambiguous",
+                },
+                {
+                    "kind": "reviewer_deliberation",
+                    "result": report.get("verdict"),
+                },
+            ]
+
+        verdict = report.get("verdict")
+        comments = list(report.get("comments") or [])
+        summary = str(report.get("summary", ""))
+        actionable = [
+            comment
+            for comment in comments
+            if comment.get("severity") in {"blocker", "major"}
+        ]
+
+        if verdict == "approve" and not actionable:
+            return PermanentFailure(
+                error_kind="review.approved",
+                message="review inconsistency reconciled as safe to merge",
+                details={"report": report, "recovery_attempts": attempts},
+            )
+
+        if verdict == "request_changes" and comments:
+            return Success(
+                value={
+                    "summary": summary,
+                    "comments": comments,
+                    "fingerprint": _fingerprint_comments(comments),
+                    "recovery_attempts": attempts,
+                }
+            )
+
+        if verdict == "approve" and actionable:
+            return Success(
+                value={
+                    "summary": summary,
+                    "comments": comments,
+                    "fingerprint": _fingerprint_comments(comments),
+                    "recovery_attempts": attempts
+                    + [
+                        {
+                            "kind": "authoritative_verifier",
+                            "result": "promoted_actionable_comments",
+                        }
+                    ],
+                }
+            )
+
+        trigger = ctx.completed["dispatch_review"]
+        return NeedsHuman(
+            gate="review_inconsistent",
+            prompt=(
+                "Review reconciliation still cannot establish a safe canonical "
+                "disposition. Retry the reviewer with human guidance or abort "
+                "this leaf."
+            ),
+            options=("retry_review", "abort"),
+            context={
+                "trigger": {
+                    "source_node": "dispatch_review",
+                    "problem_kind": trigger.get("error_kind"),
+                    "message": trigger.get("message"),
+                },
+                "evidence": {"original_report": (trigger.get("details") or {}).get("report")},
+                "recovery_attempts": attempts,
+                "remaining_uncertainty": {
+                    "verdict": verdict,
+                    "comments": comments,
+                    "summary": summary,
+                },
+                "recommended_option": "retry_review",
+                "rationale": (
+                    "A fresh review is safer than inferring approval or inventing "
+                    "actionable changes from an incomplete report."
+                ),
+            },
+        )
+
     @verbs.register("synth_prompt")
     def _synth_prompt(ctx):
-        review = ctx.completed["dispatch_review"]["value"]
+        review = _actionable_review(ctx)
         rendered = "\n".join(
             f"#{i} {c['file']}:{c.get('line') or '?'} [{c['severity']}] {c['body']}"
             for i, c in enumerate(review.get("comments", []), start=1)
@@ -739,7 +921,7 @@ def build_verb_registry(
     @verbs.register("check_progress")
     def _check_progress(ctx):
         cur_sha = ctx.completed["push_addressal"]["value"]["sha"]
-        review = ctx.completed["dispatch_review"]["value"]
+        review = _actionable_review(ctx)
         prior = (ctx.completed.get("check_progress") or {}).get("value") or {}
         iteration = int(prior.get("iteration", 0)) + 1
         last_sha = prior.get("last_sha")
@@ -979,7 +1161,22 @@ def build_workflow() -> Workflow:
         .script("dispatch_review", verb="dispatch_review")
             .edge("dispatch_review", on="success", to="synthesize_comments")
             .edge("dispatch_review", on="permanent_failure:review.approved", to="prune_context_pack")
+            .edge("dispatch_review", on="permanent_failure:review.inconsistent", to="reconcile_review_inconsistency")
             .edge("dispatch_review", on="permanent_failure", to="needs_human_end")
+        .script("reconcile_review_inconsistency", verb="reconcile_review_inconsistency")
+            .edge("reconcile_review_inconsistency", on="success", to="verify_review_reconciliation")
+            .edge("reconcile_review_inconsistency", on="permanent_failure:review.deliberation_required", to="deliberate_review_inconsistency")
+            .edge("reconcile_review_inconsistency", on="permanent_failure", to="needs_human_end")
+        .agent("deliberate_review_inconsistency", agent="leaf_reviewer", prompt_verb="review_inconsistency_prompt")
+            .edge("deliberate_review_inconsistency", on="success", to="verify_review_reconciliation")
+            .edge("deliberate_review_inconsistency", on="bad_output", to="needs_human_end")
+            .edge("deliberate_review_inconsistency", on="permanent_failure", to="needs_human_end")
+        .script("verify_review_reconciliation", verb="verify_review_reconciliation")
+            .edge("verify_review_reconciliation", on="success", to="synthesize_comments")
+            .edge("verify_review_reconciliation", on="permanent_failure:review.approved", to="prune_context_pack")
+            .edge("verify_review_reconciliation", on="needs_human:retry_review", to="review_leaf")
+            .edge("verify_review_reconciliation", on="needs_human:abort", to="needs_human_end")
+            .edge("verify_review_reconciliation", on="permanent_failure", to="needs_human_end")
         .agent("synthesize_comments", agent="comment_synthesizer", prompt_verb="synth_prompt")
             .edge("synthesize_comments", on="success", to="address_comments")
             .edge("synthesize_comments", on="bad_output", to="needs_human_end")
@@ -1022,6 +1219,9 @@ def build_workflow() -> Workflow:
             "prepare_review": "Prepared local leaf review context",
             "review_leaf": "Reviewed leaf PR",
             "dispatch_review": "Dispatched review verdict",
+            "reconcile_review_inconsistency": "Reconciled inconsistent review evidence",
+            "deliberate_review_inconsistency": "Deliberated on inconsistent review evidence",
+            "verify_review_reconciliation": "Verified reconciled review disposition",
             "synthesize_comments": "Synthesised reviewer findings",
             "address_comments": "Addressed reviewer findings",
             "apply_addressal": "Applied addressal file changes",
