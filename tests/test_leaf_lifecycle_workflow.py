@@ -22,6 +22,7 @@ from requiem.clients.repo import (
 from requiem.kernel import Completed, Suspended
 from requiem.persistence import replay
 from requiem.toolbelt import Toolbelt
+from requiem.workflows import leaf_lifecycle as leaf_lifecycle_module
 from requiem.workflows.leaf_lifecycle import (
     FakeLeafLifecycleToolkit,
     LeafLifecycleInputs,
@@ -167,6 +168,77 @@ async def test_happy_path_approves_and_merges(log_dir: Path, repo_path: Path):
     assert res.final_state == "merged"
     assert res.merge_sha == "merge-sha-41"
     assert tk.complete_calls[0]["strategy"] == "squash"
+
+
+async def test_async_merge_completion_is_confirmed_by_authoritative_requery(
+    log_dir: Path, repo_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(leaf_lifecycle_module, "MERGE_CONFIRMATION_RETRY_DELAY_S", 0.0)
+    merged_pr = _dc_replace(
+        _pr(state="merged", merged=True),
+        raw={
+            "mergeStatus": "succeeded",
+            "lastMergeCommit": {"commitId": "merge-sha-41"},
+        },
+    )
+    tk = _toolkit(prs=[_pr(), _pr(), _pr(), _pr(), merged_pr])
+    tk.complete_result = RepoCompleteResult(
+        number=41,
+        merged=False,
+        merge_sha=None,
+        strategy="squash",
+    )
+    engine = _engine(log_dir, toolkit=tk, repo_path=repo_path)
+
+    result = await engine.run("async_merge_confirmation")
+
+    assert result.final_node == "end_merged"
+    completed = _completed_map(log_dir / "async_merge_confirmation.events.jsonl")
+    assert completed["merge_pr"]["error_kind"] == "merge.not_confirmed"
+    assert completed["verify_merge_confirmation"]["value"] == {
+        "merged": True,
+        "merge_sha": "merge-sha-41",
+        "strategy": "squash",
+        "confirmation_method": "authoritative_pr_requery",
+        "confirmation_attempt": 2,
+    }
+    assert len(tk.complete_calls) == 1
+    lifecycle_result = build_result(completed)
+    assert lifecycle_result.final_state == "merged"
+    assert lifecycle_result.merge_sha == "merge-sha-41"
+
+
+async def test_unresolved_merge_confirmation_suspends_with_escalation_brief(
+    log_dir: Path, repo_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(leaf_lifecycle_module, "MERGE_CONFIRMATION_RETRY_DELAY_S", 0.0)
+    tk = _toolkit()
+    tk.complete_result = RepoCompleteResult(
+        number=41,
+        merged=False,
+        merge_sha=None,
+        strategy="squash",
+    )
+    engine = _engine(log_dir, toolkit=tk, repo_path=repo_path)
+
+    result = await engine.run("unresolved_merge_confirmation")
+
+    assert isinstance(result, Suspended)
+    assert result.node_id == "verify_merge_confirmation"
+    assert result.options == ("retry_verification", "abort")
+    completed = _completed_map(log_dir / "unresolved_merge_confirmation.events.jsonl")
+    brief = completed["verify_merge_confirmation"]["context"]
+    assert brief["trigger"]["problem_kind"] == "merge.not_confirmed"
+    assert brief["recovery_attempts"] == [
+        {
+            "kind": "authoritative_pr_requery",
+            "attempts": 3,
+            "result": "pr_open_not_merged",
+        }
+    ]
+    assert brief["recommended_option"] == "retry_verification"
+    assert len(tk.complete_calls) == 1
+    assert build_result(completed).final_state == "needs_human"
 
 
 async def test_approve_prunes_context_pack_before_merge(log_dir: Path, repo_path: Path):

@@ -19,7 +19,9 @@ reviewer and comment-addresser agents)::
       → prepare_review
       → review_leaf
       → dispatch_review
-          ├─ approve             → prune_context_pack → check_can_merge → merge_pr → end_merged
+          ├─ approve             → prune_context_pack → check_can_merge → merge_pr
+          │                                                           ├─ confirmed → end_merged
+          │                                                           └─ unconfirmed → verify_merge_confirmation
           ├─ request_changes     → synthesize_comments → address_comments
           │                        → apply_addressal → push_addressal
           │                        → check_progress → prepare_review
@@ -96,6 +98,8 @@ from requiem.workflows.pr_lifecycle import (
 
 MODULE = "requiem.workflows.leaf_lifecycle"
 LeafLifecycleState = Literal["merged", "already_merged", "needs_human", "failed"]
+MERGE_CONFIRMATION_RETRY_MAX = 2
+MERGE_CONFIRMATION_RETRY_DELAY_S = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,6 +351,35 @@ def _fingerprint_comments(comments: list[dict[str, Any]]) -> str:
         )
     )
     return hashlib.sha256(repr(canon).encode("utf-8")).hexdigest()
+
+
+def _merge_sha_from_pr(pr: RepoPullRequest) -> str | None:
+    for raw_field, id_field in (
+        ("lastMergeCommit", "commitId"),
+        ("mergeCommit", "oid"),
+    ):
+        commit = pr.raw.get(raw_field)
+        if isinstance(commit, dict) and commit.get(id_field):
+            return str(commit[id_field])
+    return None
+
+
+def _merge_confirmation_evidence(pr: RepoPullRequest) -> dict[str, Any]:
+    return {
+        "pr_number": pr.number,
+        "pr_state": pr.state,
+        "merged": pr.merged,
+        "merged_at": pr.merged_at.isoformat() if pr.merged_at else None,
+        "head": pr.head,
+        "base": pr.base,
+        "merge_status": pr.raw.get("mergeStatus"),
+        "completion_queue_time": pr.raw.get("completionQueueTime"),
+        "closed_date": pr.raw.get("closedDate"),
+        "merge_failure_type": pr.raw.get("mergeFailureType"),
+        "merge_failure_message": pr.raw.get("mergeFailureMessage"),
+        "merge_sha": _merge_sha_from_pr(pr),
+        "url": pr.url,
+    }
 
 
 def _map_platform_error(
@@ -1107,8 +1140,16 @@ def build_verb_registry(
             )
         if not result.merged:
             return PermanentFailure(
-                error_kind="needs_human.merge_not_confirmed",
+                error_kind="merge.not_confirmed",
                 message="merge completion did not confirm a merged PR",
+                details={
+                    "completion_result": {
+                        "number": result.number,
+                        "merged": result.merged,
+                        "merge_sha": result.merge_sha,
+                        "strategy": result.strategy,
+                    }
+                },
             )
         return Success(
             value={
@@ -1116,6 +1157,102 @@ def build_verb_registry(
                 "merge_sha": result.merge_sha,
                 "strategy": result.strategy,
             }
+        )
+
+    # ADO may return active/queued from the completion PATCH and close the PR
+    # shortly afterward. Re-query authoritatively without repeating the merge.
+    @verbs.register("verify_merge_confirmation")
+    async def _verify_merge_confirmation(ctx):
+        try:
+            pr = await toolkit.pr_view(inputs.repo, inputs.pr_number)
+        except Exception as e:  # noqa: BLE001
+            return _map_platform_error(
+                e,
+                run_id=ctx.run_id,
+                node_id=ctx.node_id,
+                attempt=ctx.attempt,
+                operation="verify_merge_confirmation",
+            )
+
+        evidence = _merge_confirmation_evidence(pr)
+        scope_matches = (
+            pr.head == inputs.expected_head and pr.base == inputs.expected_base
+        )
+        if pr.merged and scope_matches:
+            merge_sha = evidence["merge_sha"]
+            artifacts = (pr.url,) + ((f"commit:{merge_sha}",) if merge_sha else ())
+            return Success(
+                value={
+                    "merged": True,
+                    "merge_sha": merge_sha,
+                    "strategy": inputs.merge_strategy,
+                    "confirmation_method": "authoritative_pr_requery",
+                    "confirmation_attempt": ctx.attempt,
+                },
+                inspected_artifacts=artifacts,
+            )
+
+        if (
+            scope_matches
+            and pr.state == "open"
+            and ctx.attempt <= MERGE_CONFIRMATION_RETRY_MAX
+        ):
+            return RetryableFailure(
+                retry_key=f"{ctx.run_id}:{ctx.node_id}:merge_confirmation",
+                error_kind="merge.confirmation_pending",
+                message=(
+                    "merge completion is not authoritative yet; "
+                    f"PR state={pr.state!r}, merge status={evidence['merge_status']!r}"
+                ),
+                attempt=ctx.attempt,
+                after=MERGE_CONFIRMATION_RETRY_DELAY_S,
+            )
+
+        trigger = ctx.completed["merge_pr"]
+        retry_recommended = scope_matches and pr.state == "open"
+        return NeedsHuman(
+            gate="merge_not_confirmed",
+            prompt=(
+                "Authoritative PR state still does not prove the leaf merged. "
+                "Retry the read-only verification or abort this leaf."
+            ),
+            options=("retry_verification", "abort"),
+            context={
+                "trigger": {
+                    "source_node": "merge_pr",
+                    "problem_kind": trigger.get("error_kind"),
+                    "message": trigger.get("message"),
+                },
+                "evidence": evidence,
+                "recovery_attempts": [
+                    {
+                        "kind": "authoritative_pr_requery",
+                        "attempts": ctx.attempt,
+                        "result": (
+                            "scope_mismatch"
+                            if not scope_matches
+                            else f"pr_{pr.state}_not_merged"
+                        ),
+                    }
+                ],
+                "remaining_uncertainty": {
+                    "expected_head": inputs.expected_head,
+                    "expected_base": inputs.expected_base,
+                    "observed_head": pr.head,
+                    "observed_base": pr.base,
+                    "pr_state": pr.state,
+                    "merge_status": evidence["merge_status"],
+                },
+                "recommended_option": (
+                    "retry_verification" if retry_recommended else "abort"
+                ),
+                "rationale": (
+                    "The PR is still open, so another authoritative read may "
+                    "observe an asynchronous completion."
+                    if retry_recommended
+                    else "The PR is not merged or no longer matches the expected leaf scope."
+                ),
+            },
         )
 
     return verbs
@@ -1205,8 +1342,27 @@ def build_workflow() -> Workflow:
             .edge("check_can_merge", on="permanent_failure", to="needs_human_end")
         .script("merge_pr", verb="merge_pr", retry_max=2)
             .edge("merge_pr", on="success", to="end_merged")
+            .edge(
+                "merge_pr",
+                on="permanent_failure:merge.not_confirmed",
+                to="verify_merge_confirmation",
+            )
             .edge("merge_pr", on="retry_exhausted", to="needs_human_end")
             .edge("merge_pr", on="permanent_failure", to="needs_human_end")
+        .script(
+            "verify_merge_confirmation",
+            verb="verify_merge_confirmation",
+            retry_max=MERGE_CONFIRMATION_RETRY_MAX,
+        )
+            .edge("verify_merge_confirmation", on="success", to="end_merged")
+            .edge(
+                "verify_merge_confirmation",
+                on="needs_human:retry_verification",
+                to="verify_merge_confirmation",
+            )
+            .edge("verify_merge_confirmation", on="needs_human:abort", to="needs_human_end")
+            .edge("verify_merge_confirmation", on="retry_exhausted", to="needs_human_end")
+            .edge("verify_merge_confirmation", on="permanent_failure", to="needs_human_end")
         .terminate("end_merged", disposition="completed")
         .terminate("end_already_merged", disposition="completed")
         .terminate("needs_human_end", disposition="failed")
@@ -1230,6 +1386,7 @@ def build_workflow() -> Workflow:
             "prune_context_pack": "Pruned requiem context-pack scaffold before merge",
             "check_can_merge": "Checked leaf mergeability",
             "merge_pr": "Merged leaf PR",
+            "verify_merge_confirmation": "Verified leaf merge completion",
             "end_merged": "Leaf PR lifecycle",
             "end_already_merged": "Leaf PR lifecycle",
             "needs_human_end": "Leaf PR lifecycle",
@@ -1329,6 +1486,9 @@ def build_engine(
 def build_result(completed: dict[str, dict[str, Any]]) -> LeafLifecycleResult:
     fetch = (completed.get("fetch_pr") or {}).get("value") or {}
     merge = (completed.get("merge_pr") or {}).get("value") or {}
+    verification = completed.get("verify_merge_confirmation") or {}
+    if verification.get("kind") == "success":
+        merge = verification.get("value") or merge
     progress = (completed.get("check_progress") or {}).get("value") or {}
     initial = completed.get("check_initial_state") or {}
 
@@ -1344,6 +1504,8 @@ def build_result(completed: dict[str, dict[str, Any]]) -> LeafLifecycleResult:
         and str(o.get("error_kind", "")).startswith("needs_human")
         for o in completed.values()
     ):
+        final_state = "needs_human"
+    elif any(o.get("kind") == "needs_human" for o in completed.values()):
         final_state = "needs_human"
     elif any(o.get("kind") == "permanent_failure" for o in completed.values()):
         final_state = "failed"
