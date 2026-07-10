@@ -267,6 +267,22 @@ async def test_approve_prunes_context_pack_before_merge(log_dir: Path, repo_path
     prune_outcome = completed["prune_context_pack"]
     assert prune_outcome["value"]["pruned"] is True
     assert prune_outcome["value"]["commit_sha"] is not None
+    assert prune_outcome["value"]["status_posted"] is True
+    assert tk.posted_statuses == [{
+        "repo": REPO,
+        "sha": "push-sha-1",
+        "context": "requiem/local-tests",
+        "state": "success",
+        "description": (
+            "requiem: local tests passed before framework-only "
+            "context-pack cleanup"
+        ),
+    }]
+    call_names = [name for name, _args in tk.calls]
+    push_index = call_names.index("git_push")
+    status_index = call_names.index("post_commit_status")
+    mergeability_index = call_names.index("pr_mergeability", status_index)
+    assert push_index < status_index < mergeability_index
 
     assert not pack_dir.exists()
     log_msg = _git(repo_path, "log", "-1", "--format=%s")
@@ -283,8 +299,11 @@ async def test_prune_context_pack_is_idempotent_when_absent(log_dir: Path, repo_
     result = await engine.run("prune_absent")
     assert result.final_node == "end_merged"
     completed = _completed_map(log_dir / "prune_absent.events.jsonl")
-    assert completed["prune_context_pack"]["value"]["pruned"] is False
-    assert completed["prune_context_pack"]["value"]["commit_sha"] is None
+    prune_value = completed["prune_context_pack"]["value"]
+    assert prune_value["pruned"] is False
+    assert prune_value["commit_sha"] is None
+    assert prune_value["status_posted"] is True
+    assert tk.posted_statuses[0]["sha"] == "push-sha-1"
 
 
 async def test_request_changes_loops_once_then_merges(log_dir: Path, repo_path: Path):

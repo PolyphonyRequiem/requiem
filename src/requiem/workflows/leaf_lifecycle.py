@@ -147,6 +147,15 @@ class LeafLifecycleResult:
 class LeafLifecycleToolkit(Protocol):
     async def pr_view(self, repo: str, number: int) -> RepoPullRequest: ...
     async def branch_sha(self, repo: str, branch: str) -> str: ...
+    async def post_commit_status(
+        self,
+        repo: str,
+        sha: str,
+        *,
+        context: str,
+        state: Literal["success", "failure", "pending"],
+        description: str = "",
+    ) -> None: ...
     async def pr_mergeability(
         self, repo: str, number: int
     ) -> RepoMergeabilityReport: ...
@@ -172,6 +181,26 @@ class RealLeafLifecycleToolkit:
 
     async def branch_sha(self, repo: str, branch: str) -> str:
         return await self._repo.branch_sha(repo, branch)
+
+    async def post_commit_status(
+        self,
+        repo: str,
+        sha: str,
+        *,
+        context: str,
+        state: Literal["success", "failure", "pending"],
+        description: str = "",
+    ) -> None:
+        poster = getattr(self._repo, "post_commit_status", None)
+        if poster is None:
+            raise RuntimeError("repository platform cannot post commit statuses")
+        await poster(
+            repo,
+            sha,
+            context=context,
+            state=state,
+            description=description,
+        )
 
     async def pr_mergeability(
         self, repo: str, number: int
@@ -259,8 +288,10 @@ class FakeLeafLifecycleToolkit:
     raise_on_mergeability: Exception | None = None
     raise_on_complete: Exception | None = None
     raise_on_push: Exception | None = None
+    raise_on_post_status: Exception | None = None
     calls: list[tuple[str, tuple[Any, ...]]] = field(default_factory=list)
     complete_calls: list[dict[str, Any]] = field(default_factory=list)
+    posted_statuses: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self._pr_idx = 0
@@ -281,6 +312,28 @@ class FakeLeafLifecycleToolkit:
         sha = self.branch_sha_snapshots[min(self._sha_idx, len(self.branch_sha_snapshots) - 1)]
         self._sha_idx += 1
         return sha
+
+    async def post_commit_status(
+        self,
+        repo: str,
+        sha: str,
+        *,
+        context: str,
+        state: Literal["success", "failure", "pending"],
+        description: str = "",
+    ) -> None:
+        self.calls.append(
+            ("post_commit_status", (repo, sha, context, state, description))
+        )
+        if self.raise_on_post_status is not None:
+            raise self.raise_on_post_status
+        self.posted_statuses.append({
+            "repo": repo,
+            "sha": sha,
+            "context": context,
+            "state": state,
+            "description": description,
+        })
 
     async def pr_mergeability(
         self, repo: str, number: int
@@ -1054,8 +1107,32 @@ def build_verb_registry(
                 attempt=ctx.attempt,
                 operation="git_push",
             )
+        try:
+            await toolkit.post_commit_status(
+                inputs.repo,
+                sha,
+                context="requiem/local-tests",
+                state="success",
+                description=(
+                    "requiem: local tests passed before framework-only "
+                    "context-pack cleanup"
+                ),
+            )
+        except Exception as e:  # noqa: BLE001
+            return _map_platform_error(
+                e,
+                run_id=ctx.run_id,
+                node_id=ctx.node_id,
+                attempt=ctx.attempt,
+                operation="post_commit_status",
+            )
         return Success(
-            value={"pruned": commit_sha is not None, "commit_sha": commit_sha, "sha": sha},
+            value={
+                "pruned": commit_sha is not None,
+                "commit_sha": commit_sha,
+                "sha": sha,
+                "status_posted": True,
+            },
             inspected_artifacts=(f"commit:{sha}",),
         )
 
