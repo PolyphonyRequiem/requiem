@@ -15,6 +15,7 @@ def _args(tmp_path: Path, command: list[str]) -> argparse.Namespace:
         item=42,
         ado_repo="microsoft/CloudVault/cloudvault-service-api",
         repo_path=tmp_path,
+        scenario_cwd=None,
         lease_dir=tmp_path / "leases",
         remote="origin",
         log_dir=tmp_path / "runs",
@@ -109,3 +110,55 @@ def test_launcher_holds_lease_through_child_exit(tmp_path: Path) -> None:
     assert env["REQUIEM_LEASE_TOKEN"] == "7"
     assert env["REQUIEM_LEASE_ROOT_ITEM"] == "42"
     assert FakeLease.instances[-1].assertions >= 2
+
+
+def test_launcher_separates_cleanup_repo_from_scenario_cwd(
+    tmp_path: Path,
+) -> None:
+    cleanup_repo = tmp_path / "cleanup-repo"
+    scenario_cwd = tmp_path / "scenario-workspace"
+    cleanup_repo.mkdir()
+    scenario_cwd.mkdir()
+    args = _args(cleanup_repo, ["--", "python", "run.py"])
+    args.scenario_cwd = scenario_cwd
+    child = SimpleNamespace(returncode=0)
+    child.poll = lambda: 0
+
+    with (
+        patch("requiem.launcher.FencedRootLease", FakeLease),
+        patch(
+            "requiem.launcher.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 0),
+        ) as cleanup,
+        patch("requiem.launcher.subprocess.Popen", return_value=child) as popen,
+    ):
+        assert run_launcher(args) == 0
+
+    assert cleanup.call_args.kwargs["cwd"] == cleanup_repo.resolve()
+    assert popen.call_args.kwargs["cwd"] == scenario_cwd.resolve()
+
+
+def test_launcher_defaults_scenario_cwd_to_callers_directory(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cleanup_repo = tmp_path / "cleanup-repo"
+    caller_cwd = tmp_path / "caller-workspace"
+    cleanup_repo.mkdir()
+    caller_cwd.mkdir()
+    args = _args(cleanup_repo, ["--", "python", "run.py"])
+    child = SimpleNamespace(returncode=0)
+    child.poll = lambda: 0
+    monkeypatch.chdir(caller_cwd)
+
+    with (
+        patch("requiem.launcher.FencedRootLease", FakeLease),
+        patch(
+            "requiem.launcher.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 0),
+        ),
+        patch("requiem.launcher.subprocess.Popen", return_value=child) as popen,
+    ):
+        assert run_launcher(args) == 0
+
+    assert popen.call_args.kwargs["cwd"] == caller_cwd.resolve()

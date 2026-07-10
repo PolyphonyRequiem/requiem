@@ -192,7 +192,7 @@ For the architecture, invariants, and decision provenance:
 | `requiem describe <module>` | Print nodes, edges, registered agents, retry budgets, humanize map. |
 | `requiem clean --item <id>` | Remove local run artifacts for one work item; idempotency manifests are preserved unless `--include-manifest` is explicit. |
 | `requiem pre-run-cleanup --item <id> --ado-repo <org/project/repo> --repo-path <path>` | Write a read-only stale-run cleanup manifest for canonical `feature/<root>` and `impl/<root>-*` state. Mutation is launcher-only via fenced `--apply`. |
-| `requiem-launch ... -- <scenario-command>` | Acquire the shared root lease, apply pre-run cleanup, then hold and renew the lease until the Scenario process exits. |
+| `requiem-launch ... -- <scenario-command>` | Acquire the shared root lease, apply pre-run cleanup in `--repo-path`, then run the Scenario from `--scenario-cwd` (or the caller directory) while holding and renewing the lease. |
 
 The `module` argument is any importable Python module exposing
 `build_engine(log_dir) -> Engine` or `build_workflow() -> Workflow`. See
@@ -222,10 +222,17 @@ requiem-launch \
   --item <root-id> \
   --ado-repo <org/project/repository> \
   --repo-path <checkout> \
+  --scenario-cwd <twig-workspace> \
   --lease-dir <shared-lease-directory> \
   --log-dir <run-logs> \
   -- python -m requiem.end_to_end <scenario-arguments>
 ```
+
+`--repo-path` identifies the checkout whose Requiem-owned refs and local state
+cleanup may mutate. It does not control the Scenario process's working
+directory. `--scenario-cwd` identifies the Twig-initialized workspace the
+Scenario command needs; when omitted, the launcher preserves the directory
+from which it was invoked.
 
 Cleanup abandons matching active PRs, compare-and-deletes remote `impl` refs
 then `feature/<root>`, removes matching local refs, clears existing local run

@@ -73,6 +73,13 @@ def _terminate(child: subprocess.Popen[object]) -> None:
 
 def run_launcher(args: argparse.Namespace) -> int:
     command = _normalise_command(args.command)
+    scenario_cwd = (
+        Path(args.scenario_cwd).resolve()
+        if args.scenario_cwd is not None
+        else Path.cwd().resolve()
+    )
+    if not scenario_cwd.is_dir():
+        raise ValueError(f"Scenario working directory does not exist: {scenario_cwd}")
     manifest_path = (
         Path(args.manifest).resolve()
         if args.manifest
@@ -109,7 +116,7 @@ def run_launcher(args: argparse.Namespace) -> int:
         })
         child = subprocess.Popen(
             command,
-            cwd=Path(args.repo_path).resolve(),
+            cwd=scenario_cwd,
             env=env,
         )
         try:
@@ -136,6 +143,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--item", type=int, required=True)
     parser.add_argument("--ado-repo", required=True)
     parser.add_argument("--repo-path", type=Path, required=True)
+    parser.add_argument(
+        "--scenario-cwd",
+        type=Path,
+        default=None,
+        help=(
+            "Working directory for the Scenario command. Defaults to the "
+            "directory from which requiem-launch was invoked."
+        ),
+    )
     parser.add_argument(
         "--lease-dir",
         type=Path,
