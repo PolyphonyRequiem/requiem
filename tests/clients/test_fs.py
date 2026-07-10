@@ -249,6 +249,48 @@ async def test_git_op_on_non_git_tree_raises(tmp_path: Path):
         await fs.git_current_branch()
 
 
+async def test_git_remote_url_reads_named_remote(
+    fs: FilesystemClient, repo: Path
+) -> None:
+    _git(
+        repo,
+        "remote",
+        "add",
+        "origin",
+        "https://dev.azure.com/contoso/project/_git/repo",
+    )
+    assert await fs.git_remote_url() == (
+        "https://dev.azure.com/contoso/project/_git/repo"
+    )
+
+
+async def test_git_local_branches_and_compare_delete(
+    fs: FilesystemClient, repo: Path
+) -> None:
+    _git(repo, "branch", "impl/42-7")
+    branches = await fs.git_local_branches()
+    expected_sha = branches["impl/42-7"]
+    assert branches["main"] == expected_sha
+
+    await fs.git_delete_branch_ref(
+        "impl/42-7",
+        expected_sha=expected_sha,
+    )
+    assert "impl/42-7" not in await fs.git_local_branches()
+
+
+async def test_git_delete_branch_ref_rejects_sha_drift(
+    fs: FilesystemClient, repo: Path
+) -> None:
+    _git(repo, "branch", "impl/42-7")
+    with pytest.raises(FsGitError):
+        await fs.git_delete_branch_ref(
+            "impl/42-7",
+            expected_sha="1" * 40,
+        )
+    assert "impl/42-7" in await fs.git_local_branches()
+
+
 # ---- worktree cleanup primitives (run-#30 follow-up) ----------------
 #
 # The implementation workflow needs to scrub a poisoned worktree on

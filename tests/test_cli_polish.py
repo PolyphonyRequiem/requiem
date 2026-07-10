@@ -227,5 +227,11 @@ def test_parser_accepts_every_subcommand():
     parser.parse_args(["events", "r", "--raw", "--follow"])
     parser.parse_args(["list-runs"])
     parser.parse_args(["cancel", "r"])
+    parser.parse_args([
+        "pre-run-cleanup",
+        "--item", "42",
+        "--ado-repo", "org/project/repo",
+        "--repo-path", ".",
+    ])
     parser.parse_args(["run", "mod", "--interactive"])
     parser.parse_args(["resume", "mod", "r", "-i"])

@@ -1,4 +1,4 @@
-"""Requiem CLI — argparse plumbing and four subcommands.
+"""Requiem CLI — argparse plumbing and operational subcommands.
 
 * ``requiem run <workflow_module>``
     Streams customer-English narration as the engine runs, then prints a
@@ -856,45 +856,10 @@ def cmd_clean(args: argparse.Namespace) -> int:
     #      the manifest is the ONLY surviving cross-run idempotency
     #      hook). Pass --include-manifest to nuke them too — that's the
     #      explicit "I really want a fresh seed" path.
-    always_patterns = [
-        # top-level events + sidecars
-        f"plan-{item_id}.events.jsonl",
-        f"plan-{item_id}.plan.md",
-        f"plan-{item_id}.plan.tree.json",
-        # one-level subworkflows (planning recursion, fanout)
-        f"plan-{item_id}__child_*.events.jsonl",
-        f"plan-{item_id}__child_*.plan.md",
-        f"plan-{item_id}__child_*.plan.tree.json",
-        f"plan-{item_id}-plan-{item_id}__child_*.events.jsonl",
-        # deeper recursion (two+ levels — Scenario → Feature → Task)
-        f"plan-{item_id}__child_*__child_*.events.jsonl",
-        f"plan-{item_id}__child_*__child_*.plan.md",
-        f"plan-{item_id}__child_*__child_*.plan.tree.json",
-        f"plan-{item_id}__child_*__child_*__child_*.events.jsonl",
-        f"plan-{item_id}__child_*__child_*__child_*.plan.md",
-        f"plan-{item_id}__child_*__child_*__child_*.plan.tree.json",
-        f"plan-{item_id}__child_*__child_*__child_*__child_*.events.jsonl",
-        f"plan-{item_id}__child_*__child_*__child_*__child_*.plan.md",
-        f"plan-{item_id}__child_*__child_*__child_*__child_*.plan.tree.json",
-        # commit/trunk/exec/leafpr/featurepr event logs
-        f"commit-{item_id}.events.jsonl",
-        f"trunk-{item_id}.events.jsonl",
-        f"exec-{item_id}.events.jsonl",
-        f"fanout-{item_id}.events.jsonl",
-        f"fanout-{item_id}__leaf-*.events.jsonl",
-        f"leafpr-{item_id}.events.jsonl",
-        f"featurepr-{item_id}.events.jsonl",
-    ]
-    manifest_patterns = [
-        # commit_plan's idempotency manifest — preserve by default
-        # so retries can recognise prior ADO children.
-        f"commit-{item_id}.plan.committed.json",
-        # leaf-pr-map — points at real PR numbers
-        f"leaf-pr-map-{item_id}.json",
-    ]
-    patterns = list(always_patterns)
-    if getattr(args, "include_manifest", False):
-        patterns.extend(manifest_patterns)
+    patterns = _clean_patterns(
+        item_id,
+        include_manifest=getattr(args, "include_manifest", False),
+    )
     matched: list[Path] = []
     if log_dir.exists():
         for pat in patterns:
@@ -971,6 +936,112 @@ def cmd_clean(args: argparse.Namespace) -> int:
         + ("; artifacts kept" if keep_artifacts else ""),
         style="green",
     )
+    return EXIT_CODE_OK
+
+
+def _clean_patterns(item_id: int, *, include_manifest: bool) -> list[str]:
+    """Artifact globs owned by ``requiem clean`` for one root item."""
+    always_patterns = [
+        # top-level events + sidecars
+        f"plan-{item_id}.events.jsonl",
+        f"plan-{item_id}.plan.md",
+        f"plan-{item_id}.plan.tree.json",
+        # one-level subworkflows (planning recursion, fanout)
+        f"plan-{item_id}__child_*.events.jsonl",
+        f"plan-{item_id}__child_*.plan.md",
+        f"plan-{item_id}__child_*.plan.tree.json",
+        f"plan-{item_id}-plan-{item_id}__child_*.events.jsonl",
+        # deeper recursion (two+ levels — Scenario → Feature → Task)
+        f"plan-{item_id}__child_*__child_*.events.jsonl",
+        f"plan-{item_id}__child_*__child_*.plan.md",
+        f"plan-{item_id}__child_*__child_*.plan.tree.json",
+        f"plan-{item_id}__child_*__child_*__child_*.events.jsonl",
+        f"plan-{item_id}__child_*__child_*__child_*.plan.md",
+        f"plan-{item_id}__child_*__child_*__child_*.plan.tree.json",
+        f"plan-{item_id}__child_*__child_*__child_*__child_*.events.jsonl",
+        f"plan-{item_id}__child_*__child_*__child_*__child_*.plan.md",
+        f"plan-{item_id}__child_*__child_*__child_*__child_*.plan.tree.json",
+        # commit/trunk/exec/leafpr/featurepr event logs
+        f"commit-{item_id}.events.jsonl",
+        f"trunk-{item_id}.events.jsonl",
+        f"exec-{item_id}.events.jsonl",
+        f"fanout-{item_id}.events.jsonl",
+        f"fanout-{item_id}__leaf-*.events.jsonl",
+        f"leafpr-{item_id}.events.jsonl",
+        f"featurepr-{item_id}.events.jsonl",
+    ]
+    manifest_patterns = [
+        # commit_plan's idempotency manifest — preserve by default
+        # so retries can recognise prior ADO children.
+        f"commit-{item_id}.plan.committed.json",
+        # leaf-pr-map — points at real PR numbers
+        f"leaf-pr-map-{item_id}.json",
+    ]
+    patterns = list(always_patterns)
+    if include_manifest:
+        patterns.extend(manifest_patterns)
+    return patterns
+
+
+def cmd_pre_run_cleanup(args: argparse.Namespace) -> int:
+    """Plan or apply stale PR/ref cleanup for one ADO Scenario root."""
+    from requiem.clients.azuredevops import AdoClient
+    from requiem.clients.fs import FilesystemClient
+    from requiem.lease import validate_lease_record
+    from requiem.pre_run_cleanup import run_pre_run_cleanup
+
+    lease_identity: dict[str, object] | None = None
+    lease_check = None
+    if args.apply:
+        if (
+            args.lease_record is None
+            or args.lease_token is None
+            or args.lease_holder is None
+        ):
+            raise SystemExit(
+                "requiem: pre-run-cleanup --apply requires --lease-record, "
+                "--lease-token, and --lease-holder"
+            )
+        lease_identity = {
+            "record": str(Path(args.lease_record).resolve()),
+            "token": args.lease_token,
+            "holder": args.lease_holder,
+        }
+
+        def _check_lease() -> None:
+            validate_lease_record(
+                Path(args.lease_record),
+                token=args.lease_token,
+                holder=args.lease_holder,
+                repo=args.ado_repo,
+                root_item=args.item,
+            )
+
+        lease_check = _check_lease
+
+    result = asyncio.run(run_pre_run_cleanup(
+        repo=args.ado_repo,
+        repo_path=Path(args.repo_path),
+        root_item=args.item,
+        log_dir=Path(args.log_dir),
+        repo_client=AdoClient(),
+        git=FilesystemClient(Path(args.repo_path)),
+        apply=args.apply,
+        manifest_path=Path(args.manifest) if args.manifest else None,
+        remote=args.remote,
+        limit=args.limit,
+        lease_check=lease_check,
+        lease_identity=lease_identity,
+    ))
+    action = "completed" if result.status == "completed" else "planned"
+    _say(
+        f"pre-run cleanup {action}: "
+        f"{len(result.before.active_prs)} PR(s), "
+        f"{len(result.before.remote_refs)} remote ref(s), "
+        f"{len(result.before.local_refs)} local ref(s)",
+        style="green" if result.status == "completed" else "yellow",
+    )
+    _say(f"manifest: {result.manifest_path}", style="dim")
     return EXIT_CODE_OK
 
 
@@ -1119,6 +1190,49 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     cl.set_defaults(func=cmd_clean)
+
+    pre = sub.add_parser(
+        "pre-run-cleanup",
+        help="plan or apply fenced stale PR/ref cleanup before Scenario launch",
+    )
+    pre.add_argument(
+        "--item",
+        type=int,
+        required=True,
+        help="Root ADO work-item id whose canonical feature/impl refs are owned.",
+    )
+    pre.add_argument(
+        "--ado-repo",
+        required=True,
+        help="ADO repo identity 'org/project/repository'.",
+    )
+    pre.add_argument(
+        "--repo-path",
+        required=True,
+        help="Local checkout whose canonical local refs should be removed.",
+    )
+    pre.add_argument("--remote", default="origin")
+    pre.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR))
+    pre.add_argument(
+        "--manifest",
+        default=None,
+        help="Audit manifest path (default: timestamped file under --log-dir).",
+    )
+    pre.add_argument(
+        "--limit",
+        type=int,
+        default=1000,
+        help="Maximum refs/PRs per authoritative read; reaching it fails closed.",
+    )
+    pre.add_argument(
+        "--apply",
+        action="store_true",
+        help="Mutate after revalidation; default is a read-only plan.",
+    )
+    pre.add_argument("--lease-record", default=None, help=argparse.SUPPRESS)
+    pre.add_argument("--lease-token", type=int, default=None, help=argparse.SUPPRESS)
+    pre.add_argument("--lease-holder", default=None, help=argparse.SUPPRESS)
+    pre.set_defaults(func=cmd_pre_run_cleanup)
 
     st = sub.add_parser(
         "state",

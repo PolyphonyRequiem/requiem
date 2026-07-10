@@ -190,12 +190,48 @@ For the architecture, invariants, and decision provenance:
 | `requiem list-runs` | List runs under `--log-dir` with workflow / start time / status / duration / event count. |
 | `requiem cancel <run_id>` | Write a `cancel_requested` event into the log; the engine short-circuits at the next loop tick or on the next resume. |
 | `requiem describe <module>` | Print nodes, edges, registered agents, retry budgets, humanize map. |
+| `requiem clean --item <id>` | Remove local run artifacts for one work item; idempotency manifests are preserved unless `--include-manifest` is explicit. |
+| `requiem pre-run-cleanup --item <id> --ado-repo <org/project/repo> --repo-path <path>` | Write a read-only stale-run cleanup manifest for canonical `feature/<root>` and `impl/<root>-*` state. Mutation is launcher-only via fenced `--apply`. |
+| `requiem-launch ... -- <scenario-command>` | Acquire the shared root lease, apply pre-run cleanup, then hold and renew the lease until the Scenario process exits. |
 
 The `module` argument is any importable Python module exposing
 `build_engine(log_dir) -> Engine` or `build_workflow() -> Workflow`. See
 `src/requiem/workflows/code_review_demo.py` for the canonical shape; the
 workflow itself records its own module path (Wagner builder `.module(...)`)
 so post-hoc commands re-import without an explicit flag.
+
+### Fenced Scenario launches
+
+Use `requiem-launch` for live Scenario runs that may leave stale PRs or
+Requiem-owned refs. `--lease-dir` must be shared by every launcher that can
+target the same ADO repository. Cleanup plans by default:
+
+```text
+requiem pre-run-cleanup --item <root-id> \
+  --ado-repo <org/project/repository> \
+  --repo-path <checkout> \
+  --log-dir <run-logs>
+```
+
+The launcher is the only supported mutation path. It acquires the fenced
+`(repo, root-item)` lease, invokes cleanup with `--apply`, and keeps renewing
+the lease through the child process's terminal state:
+
+```text
+requiem-launch \
+  --item <root-id> \
+  --ado-repo <org/project/repository> \
+  --repo-path <checkout> \
+  --lease-dir <shared-lease-directory> \
+  --log-dir <run-logs> \
+  -- python -m requiem.end_to_end <scenario-arguments>
+```
+
+Cleanup abandons matching active PRs, compare-and-deletes remote `impl` refs
+then `feature/<root>`, removes matching local refs, clears existing local run
+state, and records before/after evidence in a durable manifest. It refuses to
+mutate on checked-out candidate branches, observed-state drift, incomplete
+reads, lease loss, or any API/git failure.
 
 Exit codes:
 

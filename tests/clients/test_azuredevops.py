@@ -203,6 +203,46 @@ def test_ensure_branch_ref_raises_unknown_when_post_fails_and_ref_absent():
         ))
 
 
+def test_list_branch_refs_uses_prefix_and_returns_typed_refs():
+    client, calls = _stub_client([{"value": [
+        {"name": "refs/heads/impl/42-1", "objectId": "sha-1"},
+    ]}])
+    refs = asyncio.run(client.list_branch_refs(
+        "Contoso/P/repo", prefix="impl/42-", limit=50,
+    ))
+    assert [(ref.name, ref.sha) for ref in refs] == [
+        ("impl/42-1", "sha-1"),
+    ]
+    assert calls[0]["params"] == {
+        "filter": "heads/impl/42-",
+        "$top": "50",
+    }
+
+
+def test_list_branch_refs_fails_closed_at_limit():
+    client, _ = _stub_client([{"value": [
+        {"name": "refs/heads/impl/42-1", "objectId": "sha-1"},
+    ]}])
+    with pytest.raises(AdoUnknownError, match="incomplete"):
+        asyncio.run(client.list_branch_refs(
+            "Contoso/P/repo", prefix="impl/42-", limit=1,
+        ))
+
+
+def test_delete_branch_ref_uses_expected_sha_as_cas_guard():
+    client, calls = _stub_client([{"value": [{"success": True}]}])
+    asyncio.run(client.delete_branch_ref(
+        "Contoso/P/repo",
+        "impl/42-1",
+        expected_sha="expected-sha",
+    ))
+    assert calls[0]["body"] == [{
+        "name": "refs/heads/impl/42-1",
+        "oldObjectId": "expected-sha",
+        "newObjectId": AdoClient._NULL_OBJECT_ID,
+    }]
+
+
 def test_find_open_pr_for_branch_passes_refs_heads_prefix_and_status_active():
     """ADO's searchCriteria.sourceRefName requires the refs/heads/ prefix
     on the wire. The Protocol contract is bare branch names; the client
@@ -237,6 +277,51 @@ def test_find_open_pr_for_branch_strips_refs_heads_in_results():
     assert prs[0].base == "feature/100"
     assert prs[0].state == "open"
     assert prs[0].number == 42
+
+
+def test_list_active_prs_is_target_agnostic():
+    client, calls = _stub_client([{"value": [{
+        "pullRequestId": 42,
+        "title": "leaf",
+        "status": "active",
+        "sourceRefName": "refs/heads/impl/100-1",
+        "targetRefName": "refs/heads/release/not-the-trunk",
+    }]}])
+    prs = asyncio.run(client.list_active_prs("Contoso/P/repo", limit=10))
+    assert prs[0].head == "impl/100-1"
+    assert prs[0].base == "release/not-the-trunk"
+    assert calls[0]["params"] == {
+        "searchCriteria.status": "active",
+        "$top": "10",
+    }
+
+
+def test_abandon_pr_revalidates_head_then_patches_status():
+    client, calls = _stub_client([
+        {
+            "pullRequestId": 42,
+            "title": "leaf",
+            "status": "active",
+            "sourceRefName": "refs/heads/impl/100-1",
+            "targetRefName": "refs/heads/feature/100",
+        },
+        {
+            "pullRequestId": 42,
+            "title": "leaf",
+            "status": "abandoned",
+            "sourceRefName": "refs/heads/impl/100-1",
+            "targetRefName": "refs/heads/feature/100",
+        },
+    ])
+    abandoned = asyncio.run(client.abandon_pr(
+        "Contoso/P/repo",
+        42,
+        expected_head="impl/100-1",
+    ))
+    assert abandoned.state == "closed"
+    assert calls[0]["method"] == "GET"
+    assert calls[1]["method"] == "PATCH"
+    assert calls[1]["body"] == {"status": "abandoned"}
 
 
 def test_pr_view_translates_completed_status_to_merged_with_closed_date():

@@ -289,6 +289,43 @@ class FilesystemClient:
             raise
         return True
 
+    async def git_remote_url(self, remote: str = "origin") -> str:
+        """Return the configured URL for ``remote``."""
+        return (await self._git("remote", "get-url", remote)).strip()
+
+    async def git_local_branches(self) -> dict[str, str]:
+        """Return every local branch and its current object id."""
+        out = await self._git(
+            "for-each-ref",
+            "--format=%(refname:short)%00%(objectname)",
+            "refs/heads",
+        )
+        branches: dict[str, str] = {}
+        for line in out.splitlines():
+            name, sep, sha = line.partition("\x00")
+            if not sep or not name or not sha:
+                raise FsGitError(
+                    ["git", "for-each-ref"],
+                    -1,
+                    f"invalid for-each-ref output: {line!r}",
+                )
+            branches[name] = sha
+        return branches
+
+    async def git_delete_branch_ref(
+        self,
+        name: str,
+        *,
+        expected_sha: str,
+    ) -> None:
+        """Compare-and-delete one local branch without switching worktrees."""
+        await self._git(
+            "update-ref",
+            "-d",
+            f"refs/heads/{name}",
+            expected_sha,
+        )
+
     async def git_create_branch(self, name: str, from_ref: str) -> None:
         """Create branch ``name`` from ``from_ref`` and check it out.
 

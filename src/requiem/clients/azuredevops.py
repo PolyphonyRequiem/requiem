@@ -37,6 +37,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -100,6 +101,14 @@ class AdoServerError(AdoClientError):
 
 class AdoUnknownError(AdoClientError):
     """Anything else — per Ravel L-1, NeedsHuman not silent retry."""
+
+
+@dataclass(frozen=True, slots=True)
+class AdoBranchRef:
+    """One ADO Git branch ref with its authoritative object id."""
+
+    name: str
+    sha: str
 
 
 def _ado_commit_status_signal(payload: dict[str, Any]) -> str:
@@ -354,6 +363,80 @@ class AdoClient:
                 url=url,
             )
 
+    async def list_branch_refs(
+        self,
+        repo: str,
+        *,
+        prefix: str,
+        limit: int = 1000,
+    ) -> list[AdoBranchRef]:
+        """List branch refs whose bare name starts with ``prefix``.
+
+        Reaching ``limit`` is treated as an incomplete read rather than a
+        successful truncation. Destructive callers must never act on a partial
+        inventory.
+        """
+        url = f"{self._repo_base(repo)}/refs"
+        payload = await self._request(
+            "GET",
+            url,
+            params={"filter": f"heads/{prefix}", "$top": str(limit)},
+        )
+        values = payload.get("value") if isinstance(payload, dict) else None
+        if not isinstance(values, list):
+            raise AdoUnknownError(
+                f"ADO refs GET returned an invalid value list: {payload!r}",
+                url=url,
+            )
+        if len(values) >= limit:
+            raise AdoUnknownError(
+                f"ADO refs GET reached limit={limit}; refusing an incomplete read",
+                url=url,
+            )
+        refs: list[AdoBranchRef] = []
+        for entry in values:
+            name = self._strip_refs_heads(str((entry or {}).get("name", "")))
+            sha = str((entry or {}).get("objectId", ""))
+            if not name or not sha:
+                raise AdoUnknownError(
+                    f"ADO refs GET returned an invalid ref entry: {entry!r}",
+                    url=url,
+                )
+            refs.append(AdoBranchRef(name=name, sha=sha))
+        return refs
+
+    async def delete_branch_ref(
+        self,
+        repo: str,
+        branch: str,
+        *,
+        expected_sha: str,
+    ) -> None:
+        """Compare-and-delete one branch ref at ``expected_sha``."""
+        url = f"{self._repo_base(repo)}/refs"
+        payload = await self._request(
+            "POST",
+            url,
+            body=[{
+                "name": f"refs/heads/{branch}",
+                "oldObjectId": expected_sha,
+                "newObjectId": self._NULL_OBJECT_ID,
+            }],
+        )
+        values = payload.get("value") if isinstance(payload, dict) else None
+        if not isinstance(values, list) or len(values) != 1:
+            raise AdoUnknownError(
+                f"ADO ref deletion returned an invalid response: {payload!r}",
+                url=url,
+            )
+        entry = values[0]
+        if entry.get("success") is not True:
+            raise AdoUnknownError(
+                f"ADO refused compare-and-delete for {branch!r} at "
+                f"{expected_sha}: {entry.get('customMessage', '(no message)')}",
+                url=url,
+            )
+
     # ---- RepoPlatform: PR ops ---------------------------------------
 
     async def find_open_pr_for_branch(
@@ -376,6 +459,65 @@ class AdoClient:
         )
         values = payload.get("value", []) if isinstance(payload, dict) else []
         return [self._to_repo_pr(repo, item) for item in values]
+
+    async def list_active_prs(
+        self,
+        repo: str,
+        *,
+        limit: int = 1000,
+    ) -> list[RepoPullRequest]:
+        """List every active PR in a repo, failing if the read may truncate."""
+        url = f"{self._repo_base(repo)}/pullrequests"
+        payload = await self._request(
+            "GET",
+            url,
+            params={"searchCriteria.status": "active", "$top": str(limit)},
+        )
+        values = payload.get("value") if isinstance(payload, dict) else None
+        if not isinstance(values, list):
+            raise AdoUnknownError(
+                f"ADO PR list returned an invalid value list: {payload!r}",
+                url=url,
+            )
+        if len(values) >= limit:
+            raise AdoUnknownError(
+                f"ADO PR list reached limit={limit}; refusing an incomplete read",
+                url=url,
+            )
+        return [self._to_repo_pr(repo, item) for item in values]
+
+    async def abandon_pr(
+        self,
+        repo: str,
+        number: int,
+        *,
+        expected_head: str,
+    ) -> RepoPullRequest:
+        """Abandon one active PR after re-validating its source branch."""
+        live = await self.pr_view(repo, number)
+        if live.state != "open":
+            raise AdoUnknownError(
+                f"refusing to abandon PR {number}: live state is {live.state!r}"
+            )
+        if live.head != expected_head:
+            raise AdoUnknownError(
+                f"refusing to abandon PR {number}: live head {live.head!r} "
+                f"!= expected {expected_head!r}"
+            )
+        url = f"{self._repo_base(repo)}/pullrequests/{number}"
+        payload = await self._request(
+            "PATCH",
+            url,
+            body={"status": "abandoned"},
+        )
+        abandoned = self._to_repo_pr(repo, payload)
+        if abandoned.state != "closed" or abandoned.head != expected_head:
+            raise AdoUnknownError(
+                f"ADO did not confirm PR {number} abandoned on "
+                f"{expected_head!r}: {payload!r}",
+                url=url,
+            )
+        return abandoned
 
     async def pr_view(self, repo: str, number: int) -> RepoPullRequest:
         """Fetch one PR by id. Canonical read for *merged* state — the
@@ -744,6 +886,8 @@ class FakeAdoClient:
         self.created_prs: list[dict[str, Any]] = []
         self.completed_prs: list[dict[str, Any]] = []
         self.posted_statuses: list[dict[str, Any]] = []
+        self.abandoned_prs: list[dict[str, Any]] = []
+        self.deleted_refs: list[tuple[str, str, str]] = []
         # (repo, sha) -> list of ADO-shaped status rows, mirrors the real
         # commits/{sha}/statuses feed post_commit_status writes to.
         self._statuses_by_sha: dict[tuple[str, str], list[dict[str, Any]]] = {}
@@ -778,6 +922,42 @@ class FakeAdoClient:
         self.created_refs.append((repo, branch, source_sha))
         return True
 
+    async def list_branch_refs(
+        self,
+        repo: str,
+        *,
+        prefix: str,
+        limit: int = 1000,
+    ) -> list[AdoBranchRef]:
+        refs = [
+            AdoBranchRef(name=branch, sha=sha)
+            for (ref_repo, branch), sha in self._refs.items()
+            if ref_repo == repo and branch.startswith(prefix)
+        ]
+        refs.sort(key=lambda ref: ref.name)
+        if len(refs) >= limit:
+            raise AdoUnknownError(
+                f"fake ref read reached limit={limit}; refusing truncation"
+            )
+        return refs
+
+    async def delete_branch_ref(
+        self,
+        repo: str,
+        branch: str,
+        *,
+        expected_sha: str,
+    ) -> None:
+        key = (repo, branch)
+        live = self._refs.get(key)
+        if live != expected_sha:
+            raise AdoUnknownError(
+                f"refusing to delete {branch!r}: live sha {live!r} "
+                f"!= expected {expected_sha!r}"
+            )
+        del self._refs[key]
+        self.deleted_refs.append((repo, branch, expected_sha))
+
     async def find_open_pr_for_branch(
         self, repo: str, *, head: str, limit: int = 30
     ) -> list[RepoPullRequest]:
@@ -790,6 +970,58 @@ class FakeAdoClient:
             pr for pr in self._prs
             if pr.head == head and pr.state == "open"
         ][:limit]
+
+    async def list_active_prs(
+        self,
+        repo: str,
+        *,
+        limit: int = 1000,
+    ) -> list[RepoPullRequest]:
+        prs = [
+            pr for pr in self._prs
+            if pr.state == "open"
+            and (not self._infer_repo(pr) or self._infer_repo(pr) == repo)
+        ]
+        if len(prs) >= limit:
+            raise AdoUnknownError(
+                f"fake PR read reached limit={limit}; refusing truncation"
+            )
+        return prs
+
+    async def abandon_pr(
+        self,
+        repo: str,
+        number: int,
+        *,
+        expected_head: str,
+    ) -> RepoPullRequest:
+        pr = await self.pr_view(repo, number)
+        if pr.state != "open" or pr.head != expected_head:
+            raise AdoUnknownError(
+                f"refusing to abandon PR {number}: state={pr.state!r}, "
+                f"head={pr.head!r}, expected_head={expected_head!r}"
+            )
+        abandoned = RepoPullRequest(
+            number=pr.number,
+            title=pr.title,
+            state="closed",
+            merged_at=None,
+            head=pr.head,
+            base=pr.base,
+            url=pr.url,
+            raw={**pr.raw, "status": "abandoned"},
+        )
+        self._pr_by_number[(repo, number)] = abandoned
+        self._prs = [
+            abandoned if candidate.number == number else candidate
+            for candidate in self._prs
+        ]
+        self.abandoned_prs.append({
+            "repo": repo,
+            "number": number,
+            "expected_head": expected_head,
+        })
+        return abandoned
 
     async def pr_view(self, repo: str, number: int) -> RepoPullRequest:
         pr = self._pr_by_number.get((repo, number))
