@@ -295,7 +295,7 @@ class FencedRootLease:
         while not self._stop.wait(self.heartbeat_seconds):
             try:
                 with self._mutex:
-                    self.assert_current()
+                    self._assert_current_locked()
                     self._write_active_record()
             except BaseException as error:
                 self._heartbeat_error = error
@@ -303,6 +303,10 @@ class FencedRootLease:
                 return
 
     def assert_current(self) -> None:
+        with self._mutex:
+            self._assert_current_locked()
+
+    def _assert_current_locked(self) -> None:
         if self._handle is None:
             raise LeaseLostError("lease is not held")
         if self._heartbeat_error is not None:

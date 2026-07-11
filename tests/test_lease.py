@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -13,13 +15,18 @@ from requiem.lease import (
 )
 
 
-def _lease(tmp_path: Path, *, holder: str) -> FencedRootLease:
+def _lease(
+    tmp_path: Path,
+    *,
+    holder: str,
+    heartbeat_seconds: float = 1,
+) -> FencedRootLease:
     return FencedRootLease(
         lease_dir=tmp_path,
         repo="microsoft/CloudVault/cloudvault-service-api",
         root_item=42,
         ttl_seconds=5,
-        heartbeat_seconds=1,
+        heartbeat_seconds=heartbeat_seconds,
         holder=holder,
     )
 
@@ -53,6 +60,72 @@ def test_lease_detects_fencing_record_tampering(tmp_path: Path) -> None:
         with pytest.raises(LeaseLostError, match="no longer matches"):
             lease.assert_current()
     finally:
+        lease.release()
+
+
+def test_public_validation_is_serialized_with_heartbeat_renewal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    heartbeat_seconds = 0.05
+    lease = _lease(
+        tmp_path,
+        holder="owner",
+        heartbeat_seconds=heartbeat_seconds,
+    )
+    lease.acquire()
+    identity = lease.identity
+    original_read_text = Path.read_text
+    initial_record = json.loads(original_read_text(identity.record_path))
+    validation_open = threading.Event()
+    release_validation = threading.Event()
+    validation_errors: list[BaseException] = []
+
+    def blocking_read_text(
+        path: Path,
+        encoding: str | None = None,
+        errors: str | None = None,
+    ) -> str:
+        if threading.current_thread().name == "launcher-validation":
+            with path.open("r", encoding=encoding, errors=errors) as handle:
+                contents = handle.read()
+                validation_open.set()
+                assert release_validation.wait(timeout=2)
+                return contents
+        return original_read_text(path, encoding=encoding, errors=errors)
+
+    def validate_from_launcher() -> None:
+        try:
+            lease.assert_current()
+        except BaseException as error:
+            validation_errors.append(error)
+
+    monkeypatch.setattr(Path, "read_text", blocking_read_text)
+    validator = threading.Thread(
+        target=validate_from_launcher,
+        name="launcher-validation",
+    )
+    validator.start()
+    try:
+        assert validation_open.wait(timeout=1)
+        lease.start_heartbeat()
+        time.sleep(heartbeat_seconds * 3)
+
+        during_validation = json.loads(original_read_text(identity.record_path))
+        assert during_validation["renewed_at"] == initial_record["renewed_at"]
+
+        release_validation.set()
+        validator.join(timeout=1)
+        assert not validator.is_alive()
+        assert validation_errors == []
+
+        time.sleep(heartbeat_seconds * 2)
+        lease.assert_current()
+        renewed_record = json.loads(original_read_text(identity.record_path))
+        assert renewed_record["renewed_at"] != initial_record["renewed_at"]
+    finally:
+        release_validation.set()
+        validator.join(timeout=1)
         lease.release()
 
 
