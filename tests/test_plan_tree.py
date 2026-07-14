@@ -265,6 +265,19 @@ def test_depends_on_absent_defaults_to_empty(tmp_path):
     assert all(l.deps == () for l in leaves)
 
 
+def test_dependency_free_empty_subtree_does_not_block_other_leaves(tmp_path):
+    tree = _tree()
+    tree["children"][0]["proposals"] = []
+    tree["children"][0]["children"] = []
+
+    leaves = load_committed_leaves(
+        _write(tmp_path / "t.json", tree),
+        _write(tmp_path / "c.json", _committed()),
+    )
+
+    assert [leaf.real_id for leaf in leaves] == [8002]
+
+
 def test_depends_on_self_reference_rejected(tmp_path):
     tree = _tree()
     tree["children"][0]["proposals"][0]["depends_on"] = [0]
@@ -308,14 +321,66 @@ def test_depends_on_non_int_entries_rejected(tmp_path):
     assert ei.value.kind == "bad_depends_on"
 
 
-def test_depends_on_targeting_a_decomposable_sibling_rejected(tmp_path):
-    """Root proposals[0] (Child A) is decomposable; a dependency naming it
-    is rejected — dependency-gating only makes sense between two leaves."""
+def test_depends_on_decomposable_sibling_resolves_to_subtree_exit(tmp_path):
+    """Child B depends on decomposable Child A, so it waits for Child A's
+    terminal leaf rather than redundantly depending on every leaf."""
     tree = _tree()
+    tree["children"][0]["proposals"][1]["depends_on"] = [0]
     tree["proposals"][1]["depends_on"] = [0]
-    with pytest.raises(PlanArtifactError) as ei:
-        load_committed_leaves(
-            _write(tmp_path / "t.json", tree),
-            _write(tmp_path / "c.json", _committed()),
-        )
-    assert ei.value.kind == "bad_depends_on"
+    leaves = load_committed_leaves(
+        _write(tmp_path / "t.json", tree),
+        _write(tmp_path / "c.json", _committed()),
+    )
+    by_real = {leaf.real_id: leaf for leaf in leaves}
+    assert by_real[8102].deps == (8101,)
+    assert by_real[8002].deps == (8102,)
+
+
+def test_subtree_dependency_connects_exits_to_entries_only(tmp_path):
+    """Flatten a dependency between two decomposable siblings by connecting
+    prerequisite exits to dependent entries, preserving internal parallelism."""
+    tree = _tree()
+    tree["children"][0]["proposals"][1]["depends_on"] = [0]
+    tree["proposals"][1]["depends_on"] = [0]
+    tree["children"][1] = {
+        "item_id": 700002,
+        "decomposable": True,
+        "proposals": [
+            {"title": "Leaf B1", "description": "entry", "work_item_type": "Task"},
+            {
+                "title": "Leaf B2",
+                "description": "follows B1",
+                "work_item_type": "Task",
+                "depends_on": [0],
+            },
+            {
+                "title": "Leaf B3",
+                "description": "parallel entry",
+                "work_item_type": "Task",
+            },
+        ],
+        "children": [
+            {"item_id": 70000201, "decomposable": False, "proposals": [], "children": []},
+            {"item_id": 70000202, "decomposable": False, "proposals": [], "children": []},
+            {"item_id": 70000203, "decomposable": False, "proposals": [], "children": []},
+        ],
+    }
+    committed = _committed(id_map={
+        700001: 8001,
+        70000101: 8101,
+        70000102: 8102,
+        700002: 8002,
+        70000201: 8201,
+        70000202: 8202,
+        70000203: 8203,
+    })
+
+    leaves = load_committed_leaves(
+        _write(tmp_path / "t.json", tree),
+        _write(tmp_path / "c.json", committed),
+    )
+
+    by_real = {leaf.real_id: leaf for leaf in leaves}
+    assert by_real[8201].deps == (8102,)
+    assert by_real[8202].deps == (8201,)
+    assert by_real[8203].deps == (8102,)

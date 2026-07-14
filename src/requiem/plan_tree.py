@@ -28,7 +28,7 @@ point: a silent half-enumeration would dispatch the wrong work (or nothing).
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -175,26 +175,20 @@ def _map_real(prop: dict[str, Any], synth: int, id_map: dict[int, int]) -> int:
     return mapped
 
 
-def _resolve_deps(
+def _dependency_slots(
     prop: dict[str, Any],
     *,
     own_index: int,
     proposals: list[dict[str, Any]],
-    children: list[dict[str, Any]] | None,
     parent_synth: int,
-    id_map: dict[int, int],
 ) -> tuple[int, ...]:
-    """Resolve a proposal's ``depends_on`` slot indices to real ADO ids.
+    """Validate and return a proposal's sibling ``depends_on`` slots.
 
     ``depends_on`` (planner output, see ``planning.ChildPlan``) is a list of
-    0-based indices into the SAME ``proposals`` list ``prop`` belongs to —
-    never a cross-subtree reference in this v1 scope. Fails loud
-    (:class:`PlanArtifactError`, ``kind="bad_depends_on"``) on anything that
-    would make the dependency ungrounded: a non-list value, non-int entries,
-    a self-reference, an out-of-range index, or (when ``children`` is known,
-    i.e. the normal decomposable-branch path) a reference to a sibling that
-    is itself decomposed rather than a leaf — dependency-gating only makes
-    sense between two leaves the dispatcher actually schedules.
+    0-based indices into the SAME ``proposals`` list ``prop`` belongs to.
+    The referenced sibling may be a leaf or a decomposable subtree; ``_walk``
+    flattens the latter into executable boundary edges after recursively
+    resolving both subtrees.
     """
     raw = prop.get("depends_on")
     if raw is None:
@@ -214,18 +208,53 @@ def _resolve_deps(
                 "excluding self)",
                 kind="bad_depends_on",
             )
-        if children is not None and children[d].get("decomposable") is not False:
-            raise PlanArtifactError(
-                f"node synth {parent_synth}: proposal[{own_index}].depends_on "
-                f"references slot {d}, which is not a leaf (decomposable is "
-                f"{children[d].get('decomposable')!r}) — dependencies must "
-                "target a leaf sibling",
-                kind="bad_depends_on",
-            )
-        dep_prop = proposals[d]
-        dep_synth = _synth_of(dep_prop, parent_synth, d)
-        resolved.append(_map_real(dep_prop, dep_synth, id_map))
-    return tuple(resolved)
+        resolved.append(d)
+    return tuple(dict.fromkeys(resolved))
+
+
+def _subtree_boundaries(
+    leaves: list[ResolvedLeaf],
+    *,
+    parent_synth: int,
+    slot: int,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return entry positions and exit real ids for one flattened subtree.
+
+    Entries have no dependency inside this subtree. Exits are not prerequisites
+    of another leaf inside this subtree. Connecting prerequisite exits to
+    dependent entries preserves a compound sibling dependency with the minimum
+    boundary edges; internal dependency chains carry the ordering transitively.
+    """
+    if not leaves:
+        raise PlanArtifactError(
+            f"node synth {parent_synth}: proposal[{slot}] resolves to no "
+            "implementable leaves",
+            kind="bad_depends_on",
+        )
+    subtree_ids = {leaf.real_id for leaf in leaves}
+    entry_positions = tuple(
+        index
+        for index, leaf in enumerate(leaves)
+        if not any(dep in subtree_ids for dep in leaf.deps)
+    )
+    internal_prerequisites = {
+        dep
+        for leaf in leaves
+        for dep in leaf.deps
+        if dep in subtree_ids
+    }
+    exit_ids = tuple(
+        leaf.real_id
+        for leaf in leaves
+        if leaf.real_id not in internal_prerequisites
+    )
+    if not entry_positions or not exit_ids:
+        raise PlanArtifactError(
+            f"node synth {parent_synth}: proposal[{slot}] has no acyclic "
+            "dependency boundary",
+            kind="bad_depends_on",
+        )
+    return entry_positions, exit_ids
 
 
 def _walk(
@@ -234,8 +263,7 @@ def _walk(
     parent_synth: int,
     id_map: dict[int, int],
     depth: int,
-    out: list[ResolvedLeaf],
-) -> None:
+) -> list[ResolvedLeaf]:
     proposals = node.get("proposals") or []
     children = node.get("children") or []
     # Within _walk every node is decomposable (the header guarantees the
@@ -247,6 +275,7 @@ def _walk(
             f"{len(proposals)} proposals — artifact misaligned",
             kind="misaligned",
         )
+    child_leaf_groups: list[list[ResolvedLeaf]] = []
     for i, prop in enumerate(proposals):
         if "title" not in prop or "work_item_type" not in prop:
             raise PlanArtifactError(
@@ -272,9 +301,14 @@ def _walk(
         # be silently read as a leaf (which would truncate real grandchildren).
         decomposable = child.get("decomposable")
         if decomposable is True:
-            _walk(child, parent_synth=synth, id_map=id_map, depth=depth + 1, out=out)
+            child_leaves = _walk(
+                child,
+                parent_synth=synth,
+                id_map=id_map,
+                depth=depth + 1,
+            )
         elif decomposable is False:
-            out.append(
+            child_leaves = [
                 ResolvedLeaf(
                     synth_id=synth,
                     real_id=_map_real(prop, synth, id_map),
@@ -283,22 +317,59 @@ def _walk(
                     work_item_type=str(prop["work_item_type"]),
                     review_group=prop.get("review_group"),
                     depth=depth + 1,
-                    deps=_resolve_deps(
-                        prop,
-                        own_index=i,
-                        proposals=proposals,
-                        children=children,
-                        parent_synth=parent_synth,
-                        id_map=id_map,
-                    ),
                 )
-            )
+            ]
         else:
             raise PlanArtifactError(
                 f"node synth {synth}: decomposable is {decomposable!r}, "
                 "expected a boolean",
                 kind="bad_node",
             )
+        child_leaf_groups.append(child_leaves)
+
+    dep_slots_by_child = [
+        _dependency_slots(
+            prop,
+            own_index=i,
+            proposals=proposals,
+            parent_synth=parent_synth,
+        )
+        for i, prop in enumerate(proposals)
+    ]
+    boundary_slots = {
+        slot
+        for i, dep_slots in enumerate(dep_slots_by_child)
+        for slot in ((i,) + dep_slots if dep_slots else ())
+    }
+    boundaries = {
+        slot: _subtree_boundaries(
+            child_leaf_groups[slot],
+            parent_synth=parent_synth,
+            slot=slot,
+        )
+        for slot in boundary_slots
+    }
+    for i, dep_slots in enumerate(dep_slots_by_child):
+        if not dep_slots:
+            continue
+        entry_positions, _ = boundaries[i]
+        prerequisite_exits = tuple(dict.fromkeys(
+            exit_id
+            for dep_slot in dep_slots
+            for exit_id in boundaries[dep_slot][1]
+        ))
+        for entry_position in entry_positions:
+            leaf = child_leaf_groups[i][entry_position]
+            child_leaf_groups[i][entry_position] = replace(
+                leaf,
+                deps=tuple(dict.fromkeys((*leaf.deps, *prerequisite_exits))),
+            )
+
+    return [
+        leaf
+        for child_leaves in child_leaf_groups
+        for leaf in child_leaves
+    ]
 
 
 def load_committed_leaves(
@@ -327,8 +398,12 @@ def load_committed_leaves(
         )
     id_map = _load_id_map(committed, tree)
 
-    leaves: list[ResolvedLeaf] = []
-    _walk(tree, parent_synth=int(tree["item_id"]), id_map=id_map, depth=0, out=leaves)
+    leaves = _walk(
+        tree,
+        parent_synth=int(tree["item_id"]),
+        id_map=id_map,
+        depth=0,
+    )
 
     if not leaves:
         raise PlanArtifactError(

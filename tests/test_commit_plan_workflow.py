@@ -24,6 +24,7 @@ import pytest
 from requiem.clients.twig import TwigItem, TwigUnknownError
 from requiem.kernel import Completed
 from requiem.plan_lineage import format_commit_marker
+from requiem.plan_tree import load_committed_leaves
 from requiem.workflows import commit_plan as cp
 from requiem.workflows.commit_plan import FakeTwigClient, build_engine
 from requiem.workflows.planning import completed_from_log
@@ -737,7 +738,12 @@ async def test_seeds_a_real_planning_artifact(log_dir: Path):
         "summary": "two parts", "decomposable": True,
         "children": [
             {"title": "Part A", "description": "decomposable", "work_item_type": "Task"},
-            {"title": "Part B", "description": "leaf", "work_item_type": "Task"},
+            {
+                "title": "Part B",
+                "description": "leaf",
+                "work_item_type": "Task",
+                "depends_on": [0],
+            },
         ],
         "estimated_complexity": "medium", "rationale": "two distinct parts",
     }
@@ -745,7 +751,12 @@ async def test_seeds_a_real_planning_artifact(log_dir: Path):
         "summary": "split A", "decomposable": True,
         "children": [
             {"title": "A-one", "description": "g1", "work_item_type": "Task"},
-            {"title": "A-two", "description": "g2", "work_item_type": "Task"},
+            {
+                "title": "A-two",
+                "description": "g2",
+                "work_item_type": "Task",
+                "depends_on": [0],
+            },
         ],
         "estimated_complexity": "small", "rationale": "two sub-parts",
     }
@@ -792,3 +803,12 @@ async def test_seeds_a_real_planning_artifact(log_dir: Path):
     part_a_real = seed["id_map"][str(A)]
     gkids = [it for it in commit_twig.items.values() if it.parent_id == part_a_real]
     assert {g.title for g in gkids} == {"A-one", "A-two"}
+    manifest_path = Path(
+        completed_from_log(ce.log_path("commitrun"))["write_manifest"]["value"][
+            "manifest_path"
+        ]
+    )
+    leaves = load_committed_leaves(artifact, manifest_path)
+    by_real = {leaf.real_id: leaf for leaf in leaves}
+    assert by_real[seed["id_map"][str(A2)]].deps == (seed["id_map"][str(A1)],)
+    assert by_real[seed["id_map"][str(B)]].deps == (seed["id_map"][str(A2)],)

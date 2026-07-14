@@ -820,7 +820,7 @@ async def test_review_group_round_trips_into_plan_tree(log_dir: Path):
 def test_child_plan_depends_on_optional_and_unvalidated():
     """`depends_on` defaults to None, accepts a list of 0-based sibling
     slot indices with no closed-schema validation at this layer (real
-    validation — range/self-ref/leaf-only — happens in plan_tree at
+    validation — range/self-ref/subtree flattening — happens in plan_tree at
     resolution time, where the full sibling list is known), and legacy
     planner JSON omitting the field still validates."""
     from requiem.workflows.planning import ChildPlan, PlannerOutput
@@ -919,6 +919,7 @@ def test_planner_prompt_mentions_depends_on_guidance():
     prompt = verbs.get("planner_prompt_1")(_Ctx())
     assert "depends_on" in prompt
     assert "0-based" in prompt
+    assert "recursive subtrees" in prompt
 
 
 def test_reviewer_prompt_renders_declared_depends_on():

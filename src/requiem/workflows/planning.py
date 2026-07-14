@@ -265,14 +265,16 @@ class ChildPlan(BaseModel):
 
     depends_on: list[int] | None = None
     """Optional 0-based indices into THIS SAME children list, naming sibling
-    children whose implementation must exist first.
+    children or subtrees whose implementation must exist first.
 
     This is a real dispatch-ordering contract, not a narrative "logically
-    follows" hint: both fan-out backends will not dispatch a leaf until
-    every declared dependency has landed (and, on the in-process backend,
-    merged into the trunk) — see ``requiem.workflows.leaf_deps``. A leaf
-    whose dependency never lands is reported ``blocked``, not silently
-    attempted with stale/missing context.
+    follows" hint. During committed-plan flattening, each prerequisite
+    subtree's exit leaves are connected to each dependent subtree's entry
+    leaves; both fan-out backends then withhold those entries until every
+    declared prerequisite has landed (and, on the in-process backend, merged
+    into the trunk) — see ``requiem.plan_tree`` and
+    ``requiem.workflows.leaf_deps``. A leaf whose dependency never lands is
+    reported ``blocked``, not silently attempted with stale/missing context.
 
     Use this ONLY for a genuine build-time prerequisite: the dependent
     child's code would not compile, or would have nothing correct to
@@ -281,8 +283,7 @@ class ChildPlan(BaseModel):
     migrates existing overrides onto; child 0 authors a service-resource
     that child 3 wires output-chaining from). Do NOT use it to express a
     preferred review/read order — most children should leave it unset.
-    Self-references, out-of-range indices, and references to a sibling
-    that is itself decomposed (not a leaf) are rejected.
+    Self-references and out-of-range indices are rejected.
     """
 
 
@@ -1035,14 +1036,16 @@ def build_verb_registry(
             # so, instead of leaving it as narrative prose dispatch can't act
             # on.
             depends_on_line = (
-                "If a child you are proposing can only be correctly "
-                "implemented once ANOTHER child in this same list has "
-                "landed (e.g. it needs a shared schema/type/service-resource "
-                "that sibling defines), set that child's `depends_on` to the "
-                "0-based index/indices of the prerequisite sibling(s) in "
-                "THIS children list. Only use this for a real build-time "
-                "prerequisite — not a preferred read/review order. Most "
-                "children should leave it unset.\n"
+                "If a child or child subtree you are proposing can only be "
+                "correctly implemented once ANOTHER child or subtree in this "
+                "same list has landed (e.g. it needs a shared schema/type/"
+                "service-resource that sibling produces), set that child's "
+                "`depends_on` to the 0-based index/indices of the prerequisite "
+                "sibling(s) in THIS children list. Requiem preserves this "
+                "ordering when recursive subtrees flatten into executable "
+                "leaves. Only use this for a real build-time prerequisite — "
+                "not a preferred read/review order. Most children should leave "
+                "it unset.\n"
             )
             overlap_line = (
                 _render_existing_work(item)
@@ -1164,10 +1167,10 @@ def build_verb_registry(
                 "Also sanity-check any `depends_on` slot references: they "
                 "must point to a real sibling slot in THIS list (not "
                 "itself), and should only be set for a genuine build-time "
-                "prerequisite (the dependent child needs code/schema the "
-                "referenced sibling produces) — not merely a preferred "
-                "review order. Request revision if a dependency looks "
-                "wrong, missing, or spurious.\n"
+                "prerequisite (the dependent child or subtree needs code/"
+                "schema the referenced sibling or subtree produces) — not "
+                "merely a preferred review order. Request revision if a "
+                "dependency looks wrong, missing, or spurious.\n"
                 f"Iteration: {iteration} of {ITER_CAP}. "
                 "Approve, request revision, or escalate."
             )

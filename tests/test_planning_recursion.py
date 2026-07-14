@@ -201,6 +201,59 @@ async def test_two_level_decomposable_grandchildren(log_dir: Path):
     assert len(all_logs) == 4, all_logs
 
 
+async def test_recursive_plan_preserves_decomposable_sibling_dependency(
+    log_dir: Path,
+):
+    """A dependency between recursively decomposed siblings survives in the
+    root proposal list so committed-plan flattening can enforce it later."""
+    producer_id = ROOT_ID * 100 + 1
+    consumer_id = ROOT_ID * 100 + 2
+    producer_leaf_id = producer_id * 100 + 1
+    consumer_leaf_id = consumer_id * 100 + 1
+    root_plan = _decomp(
+        {
+            "title": "producer",
+            "description": "produces a contract",
+            "work_item_type": "Task",
+        },
+        {
+            "title": "consumer",
+            "description": "consumes the contract",
+            "work_item_type": "Task",
+            "depends_on": [0],
+        },
+    )
+    provider = FakeProvider(
+        scripts={
+            "planner": [
+                root_plan,
+                _decomp("producer leaf"),
+                _leaf("producer leaf"),
+                _decomp("consumer leaf"),
+                _leaf("consumer leaf"),
+            ],
+            "plan_reviewer": [_approve()] * 5,
+        }
+    )
+    twig = _twig_with(
+        ROOT_ID,
+        producer_id,
+        consumer_id,
+        producer_leaf_id,
+        consumer_leaf_id,
+    )
+    engine = build_engine(log_dir, item_id=ROOT_ID, twig=twig, provider=provider)
+
+    result = await engine.run("recursive-dependency")
+
+    assert isinstance(result, Completed), result
+    payload = json.loads(
+        (log_dir / "recursive-dependency.plan.tree.json").read_text(encoding="utf-8")
+    )
+    assert payload["proposals"][1]["depends_on"] == [0]
+    assert [child["decomposable"] for child in payload["children"]] == [True, True]
+
+
 async def test_max_depth_2_three_level_proposed_routes_to_human(log_dir: Path):
     """At depth 2 a decomposable proposal would push to depth 3.
 
@@ -630,4 +683,3 @@ async def test_build_engine_accepts_child_proposal_kwarg(log_dir: Path):
     plan = project_plan_result(completed_from_log(engine.log_path("direct-child")))
     assert plan is not None
     assert plan.summary == "direct"
-

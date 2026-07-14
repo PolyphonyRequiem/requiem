@@ -59,12 +59,13 @@ unvalidated at the planner layer, mirroring the existing `review_group`
 precedent. The planner/reviewer prompts gained guidance + rendering (0-based
 "slot N" + declared deps) so the reviewer can sanity-check declared order.
 `plan_tree.ResolvedLeaf` gains `deps: tuple[int, ...]`, resolved by a new
-`_resolve_deps` helper that validates self-reference, out-of-range, and
-(only on the normal/leaf branch) that the target is itself a leaf, not a
-decomposable subtree — fail-closed on a malformed declaration rather than
-silently dropping it. **v1 scope is same-parent-sibling deps only** —
-cross-subtree dependencies are not resolvable from a single parent's
-`proposals[]` index and are explicitly out of scope.
+dependency flattener that validates self-reference and out-of-range slots.
+A dependency may target either a leaf sibling or a decomposable sibling.
+For subtrees, flattening connects every prerequisite **exit leaf** to every
+dependent **entry leaf**. Internal edges then carry the ordering transitively,
+so unrelated leaves remain parallel and redundant all-to-all edges are avoided.
+Declarations remain same-parent sibling references: each `depends_on` index is
+interpreted only within its own node's `proposals[]` list.
 
 ### 3. Wave-gated dispatch + interleaved merge in `fanout.py`
 
@@ -126,16 +127,15 @@ for any plan/caller that doesn't declare dependencies or wire a merge hook
 (see `test_wave_gating_is_a_noop_without_declared_deps` /
 `test_wave_gating_is_a_noop_without_a_hook` in `tests/test_fanout_workflow.py`).
 
-**Negative / open:** v1 dependency scope is same-parent-sibling only — a
-dependency across subtrees (different parents) is not resolvable from the
-committed plan tree's `proposals[]` indexing and needs a follow-up if a real
-plan needs it. A merge-hook crash for one leaf is caught and reported as a
-synthetic `failed:<exception>` merge_state for that leaf (so the rest of the
-wave still proceeds and its dependents are correctly blocked) rather than
-aborting the whole fan-out. `_DemoGhClient` (the fanout module's demo/test
-double) was missing `find_open_pr_for_branch` — a pre-existing gap unrelated
-to dependencies that only surfaced once a fanout-level test drove
-`create_pr` for real; fixed alongside as a one-line parity addition.
+**Negative / open:** dependency declarations are still local to one sibling
+list; the planner cannot directly name an arbitrary cousin leaf in another
+subtree. A merge-hook crash for one leaf is caught and reported as a synthetic
+`failed:<exception>` merge_state for that leaf (so the rest of the wave still
+proceeds and its dependents are correctly blocked) rather than aborting the
+whole fan-out. `_DemoGhClient` (the fanout module's demo/test double) was
+missing `find_open_pr_for_branch` — a pre-existing gap unrelated to
+dependencies that only surfaced once a fanout-level test drove `create_pr` for
+real; fixed alongside as a one-line parity addition.
 
 **Why an ADR:** three separate, previously-undocumented facts converge here
 — an existing-but-inert dependency-graph implementation in one backend, a
@@ -210,3 +210,18 @@ SHA through to completion, and both ADO and GitHub enforce that SHA as the
 platform merge compare-and-swap. Review-fix tests also persist the staged Git
 tree identity, so a changed worktree cannot be committed or marked successful
 after a crash/resume boundary without another test run.
+
+## Addendum (2026-07-14): preserve dependencies across recursive flattening
+
+Runs 51, 56b, and 57 showed that same-parent dependency declarations at the
+Deliverable level vanished when both siblings recursively decomposed. The
+resolver either rejected a leaf depending on a decomposable sibling or silently
+ignored `depends_on` on a decomposable dependent, so descendant leaves reached
+review before prerequisite contracts existed.
+
+Committed-plan flattening now composes sibling subgraphs at their boundaries:
+each exit leaf of the prerequisite subtree gates each entry leaf of the
+dependent subtree. This is the minimal edge set that preserves the compound
+dependency. It keeps internal parallelism, leaves unrelated subtrees untouched,
+and survives the plan-artifact, commit real-id mapping, fanout event-log, and
+resume boundaries.

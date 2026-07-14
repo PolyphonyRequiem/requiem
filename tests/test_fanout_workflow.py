@@ -560,6 +560,225 @@ def _two_leaf_provider() -> FakeProvider:
     })
 
 
+def _three_leaf_provider() -> FakeProvider:
+    return FakeProvider(scripts={
+        "coder": [
+            {
+                "intent_summary": f"change {index}",
+                "file_changes": [
+                    {
+                        "path": f"CHANGE-{index}.md",
+                        "operation": "create",
+                        "content": f"{index}\n",
+                    },
+                ],
+                "notes": "",
+            }
+            for index in range(1, 4)
+        ],
+    })
+
+
+def _recursive_dependency_artifacts(tmp_path: Path) -> tuple[Path, Path]:
+    producer = ROOT * 100 + 1
+    consumer = ROOT * 100 + 2
+    producer_first = producer * 100 + 1
+    producer_exit = producer * 100 + 2
+    tree_path = tmp_path / "recursive.plan.tree.json"
+    committed_path = tmp_path / "recursive.plan.committed.json"
+    tree_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "plan_id": f"plan-{ROOT}-recursive",
+                "item_id": ROOT,
+                "decomposable": True,
+                "verdict": "approved",
+                "proposals": [
+                    {
+                        "title": "Producer subtree",
+                        "description": "produces a contract",
+                        "work_item_type": "Task",
+                    },
+                    {
+                        "title": "Consumer",
+                        "description": "consumes the contract",
+                        "work_item_type": "Task",
+                        "depends_on": [0],
+                    },
+                ],
+                "children": [
+                    {
+                        "item_id": producer,
+                        "decomposable": True,
+                        "proposals": [
+                            {
+                                "title": "Producer first",
+                                "description": "first",
+                                "work_item_type": "Task",
+                            },
+                            {
+                                "title": "Producer exit",
+                                "description": "exit",
+                                "work_item_type": "Task",
+                                "depends_on": [0],
+                            },
+                        ],
+                        "children": [
+                            {
+                                "item_id": producer_first,
+                                "decomposable": False,
+                                "proposals": [],
+                                "children": [],
+                            },
+                            {
+                                "item_id": producer_exit,
+                                "decomposable": False,
+                                "proposals": [],
+                                "children": [],
+                            },
+                        ],
+                    },
+                    {
+                        "item_id": consumer,
+                        "decomposable": False,
+                        "proposals": [],
+                        "children": [],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    committed_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "plan_id": f"plan-{ROOT}-recursive",
+                "root_item_id": ROOT,
+                "dry_run": False,
+                "id_map": {
+                    str(producer): 10,
+                    str(producer_first): 1,
+                    str(producer_exit): 2,
+                    str(consumer): 3,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return tree_path, committed_path
+
+
+def _artifact_engine(
+    repo: Path,
+    log_dir: Path,
+    *,
+    tree_path: Path,
+    committed_path: Path,
+    provider: FakeProvider,
+    leaf_merge,
+):
+    inputs = fanout.FanoutInputs(
+        root_item_id=ROOT,
+        repo=REPO,
+        repo_path=repo,
+        log_dir=log_dir,
+        dry_run=False,
+        plan_tree_path=tree_path,
+        committed_path=committed_path,
+        leaf_merge=leaf_merge,
+    )
+    return fanout.build_engine(
+        log_dir,
+        inputs=inputs,
+        toolbelt=_toolbelt(repo),
+        provider=provider,
+    )
+
+
+async def test_recursive_subtree_dependency_gates_fanout_by_exit_leaf(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    _make_pushable(repo)
+    _stub_test_detection(monkeypatch)
+    tree_path, committed_path = _recursive_dependency_artifacts(tmp_path)
+    calls: list[int] = []
+
+    async def fake_merge(real_id: int, pr_number: int) -> str:
+        calls.append(real_id)
+        return "merged"
+
+    engine = _artifact_engine(
+        repo,
+        tmp_path,
+        tree_path=tree_path,
+        committed_path=committed_path,
+        provider=_three_leaf_provider(),
+        leaf_merge=fake_merge,
+    )
+
+    result = await engine.run("recursive-waves")
+
+    assert isinstance(result, Completed)
+    assert calls == [1, 2, 3]
+    resolved = completed_from_log(engine.log_path("recursive-waves"))[
+        "resolve_leaves"
+    ]["value"]["leaves"]
+    deps_by_id = {leaf["real_id"]: leaf["deps"] for leaf in resolved}
+    assert deps_by_id == {1: [], 2: [1], 3: [2]}
+
+
+async def test_recursive_dependency_graph_survives_resume_after_resolution(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    _make_pushable(repo)
+    _stub_test_detection(monkeypatch)
+    tree_path, committed_path = _recursive_dependency_artifacts(tmp_path)
+
+    async def unused_merge(real_id: int, pr_number: int) -> str:
+        raise AssertionError("dispatch must not start before the injected crash")
+
+    engine = _artifact_engine(
+        repo,
+        tmp_path,
+        tree_path=tree_path,
+        committed_path=committed_path,
+        provider=_three_leaf_provider(),
+        leaf_merge=unused_merge,
+    )
+
+    def crash_after_resolution(event: dict) -> None:
+        if event.get("kind") == "route_taken" and event.get("node_id") == "resolve_leaves":
+            raise RuntimeError("injected crash after dependency resolution")
+
+    engine.on_event = crash_after_resolution
+    with pytest.raises(RuntimeError, match="injected crash"):
+        await engine.run("recursive-resume")
+
+    tree_path.unlink()
+    committed_path.unlink()
+    calls: list[int] = []
+
+    async def fake_merge(real_id: int, pr_number: int) -> str:
+        calls.append(real_id)
+        return "merged"
+
+    resumed = _artifact_engine(
+        repo,
+        tmp_path,
+        tree_path=tree_path,
+        committed_path=committed_path,
+        provider=_three_leaf_provider(),
+        leaf_merge=fake_merge,
+    )
+
+    result = await resumed.run("recursive-resume")
+
+    assert isinstance(result, Completed)
+    assert calls == [1, 2, 3]
+
+
 async def test_dependent_leaf_is_released_only_after_producer_merges(
     repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
