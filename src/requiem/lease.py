@@ -10,7 +10,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Callable
 
 
 class LeaseError(RuntimeError):
@@ -53,7 +53,12 @@ def _read_record(path: Path) -> dict[str, object]:
     return payload
 
 
-def _write_record(path: Path, payload: dict[str, object]) -> None:
+def _write_record(
+    path: Path,
+    payload: dict[str, object],
+    *,
+    before_replace: Callable[[], None] | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
@@ -61,6 +66,8 @@ def _write_record(path: Path, payload: dict[str, object]) -> None:
             json.dumps(payload, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        if before_replace is not None:
+            before_replace()
         os.replace(temp, path)
     finally:
         try:
@@ -79,7 +86,24 @@ def validate_lease_record(
 ) -> None:
     """Fail unless ``path`` proves the supplied active fencing identity."""
     payload = _read_record(Path(path))
-    if payload.get("status") != "active":
+    _validate_record_payload(
+        payload,
+        token=token,
+        holder=holder,
+        repo=repo,
+        root_item=root_item,
+    )
+
+
+def _validate_record_payload(
+    payload: dict[str, object],
+    *,
+    token: int,
+    holder: str,
+    repo: str | None = None,
+    root_item: int | None = None,
+) -> None:
+    if payload.get("status") not in {"active", "renewing"}:
         raise LeaseLostError(
             f"lease is not active (status={payload.get('status')!r})"
         )
@@ -159,7 +183,9 @@ class FencedRootLease:
     ``lease_dir`` must be on storage shared by every launcher that can target
     the same repository. The OS byte-range lock provides exclusivity; the
     durable JSON record supplies the monotonically increasing fencing token
-    consumed by cleanup subprocesses.
+    consumed by cleanup subprocesses. The heartbeat exclusively validates and
+    renews that record; callers inspect its durable result through
+    ``assert_current`` without contending on record I/O.
     """
 
     def __init__(
@@ -199,9 +225,12 @@ class FencedRootLease:
         self._handle: BinaryIO | None = None
         self._identity: LeaseIdentity | None = None
         self._mutex = threading.Lock()
+        self._state_mutex = threading.Lock()
         self._stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
         self._heartbeat_error: BaseException | None = None
+        self._renewal_deadline: float | None = None
+        self._record_expires_at: datetime | None = None
 
     @property
     def identity(self) -> LeaseIdentity:
@@ -249,16 +278,33 @@ class FencedRootLease:
             )
             self._handle = handle
             self._identity = identity
-            self._write_active_record(acquired_at=_now())
+            with self._state_mutex:
+                self._heartbeat_error = None
+                self._renewal_deadline = None
+                self._record_expires_at = None
+            acquired_at = _now()
+            expires_at = self._write_active_record(acquired_at=acquired_at)
+            self._record_successful_renewal(expires_at)
             return identity
         except BaseException:
+            self._handle = None
+            self._identity = None
+            with self._state_mutex:
+                self._renewal_deadline = None
+                self._record_expires_at = None
             _unlock(handle)
             handle.close()
             raise
 
-    def _write_active_record(self, *, acquired_at: datetime | None = None) -> None:
+    def _write_active_record(
+        self,
+        *,
+        acquired_at: datetime,
+        renewed_at: datetime | None = None,
+    ) -> datetime:
         identity = self.identity
-        renewed_at = _now()
+        renewed_at = renewed_at or _now()
+        expires_at = renewed_at + timedelta(seconds=self.ttl_seconds)
         payload: dict[str, object] = {
             "schema_version": 1,
             "status": "active",
@@ -267,16 +313,89 @@ class FencedRootLease:
             "token": identity.token,
             "holder": identity.holder,
             "renewed_at": renewed_at.isoformat(),
-            "expires_at": (
-                renewed_at + timedelta(seconds=self.ttl_seconds)
-            ).isoformat(),
+            "expires_at": expires_at.isoformat(),
+            "acquired_at": acquired_at.isoformat(),
         }
-        if acquired_at is not None:
-            payload["acquired_at"] = acquired_at.isoformat()
-        else:
-            previous = _read_record(identity.record_path)
-            payload["acquired_at"] = previous.get("acquired_at")
+        _write_record(
+            identity.record_path,
+            payload,
+            before_replace=lambda: self._assert_renewal_window_open(expires_at),
+        )
+        return expires_at
+
+    def _write_renewing_record(
+        self,
+        payload: dict[str, object],
+        *,
+        expires_at: datetime,
+    ) -> None:
+        renewing = dict(payload)
+        renewing["status"] = "renewing"
+        renewing["renewal_started_at"] = _now().isoformat()
+        _write_record(
+            self.identity.record_path,
+            renewing,
+            before_replace=lambda: self._assert_renewal_window_open(expires_at),
+        )
+
+    def _assert_renewal_window_open(self, expires_at: datetime) -> None:
+        now = _now()
+        monotonic_now = time.monotonic()
+        with self._state_mutex:
+            self._assert_renewal_window_open_locked(
+                expires_at,
+                now=now,
+                monotonic_now=monotonic_now,
+            )
+
+    def _record_successful_renewal(self, expires_at: datetime) -> None:
+        now = _now()
+        monotonic_now = time.monotonic()
+        with self._state_mutex:
+            self._assert_renewal_window_open_locked(
+                expires_at,
+                now=now,
+                monotonic_now=monotonic_now,
+            )
+            remaining_seconds = (expires_at - now).total_seconds()
+            self._renewal_deadline = monotonic_now + remaining_seconds
+            self._record_expires_at = expires_at
+
+    def _expire_late_renewal(self, expires_at: datetime) -> None:
+        identity = self.identity
+        payload = _read_record(identity.record_path)
+        if (
+            payload.get("status") != "active"
+            or payload.get("token") != identity.token
+            or payload.get("holder") != identity.holder
+            or payload.get("expires_at") != expires_at.isoformat()
+        ):
+            raise LeaseLostError(
+                "late lease renewal no longer matches the current record"
+            )
+        payload["status"] = "expired"
+        payload["expired_at"] = _now().isoformat()
         _write_record(identity.record_path, payload)
+
+    def _assert_renewal_window_open_locked(
+        self,
+        expires_at: datetime,
+        *,
+        now: datetime,
+        monotonic_now: float,
+    ) -> None:
+        if (
+            self._renewal_deadline is not None
+            and monotonic_now >= self._renewal_deadline
+        ) or (
+            self._record_expires_at is not None
+            and now >= self._record_expires_at
+        ):
+            raise LeaseLostError(
+                "lease renewal completed after the previous lease expired"
+            )
+        if expires_at <= now:
+            raise LeaseLostError("lease record has expired")
 
     def start_heartbeat(self) -> None:
         if self._handle is None:
@@ -295,32 +414,58 @@ class FencedRootLease:
         while not self._stop.wait(self.heartbeat_seconds):
             try:
                 with self._mutex:
-                    self._assert_current_locked()
-                    self._write_active_record()
+                    payload = self._assert_record_current_locked()
+                    previous_expires_at = _parse_time(payload.get("expires_at"))
+                    self._write_renewing_record(
+                        payload,
+                        expires_at=previous_expires_at,
+                    )
+                    renewed_at = _now()
+                    expires_at = renewed_at + timedelta(seconds=self.ttl_seconds)
+                    self._write_active_record(
+                        acquired_at=_parse_time(payload.get("acquired_at")),
+                        renewed_at=renewed_at,
+                    )
+                    try:
+                        self._record_successful_renewal(expires_at)
+                    except LeaseLostError:
+                        self._expire_late_renewal(expires_at)
+                        raise
             except BaseException as error:
-                self._heartbeat_error = error
+                with self._state_mutex:
+                    self._heartbeat_error = error
                 self._stop.set()
                 return
 
     def assert_current(self) -> None:
-        with self._mutex:
-            self._assert_current_locked()
+        now = _now()
+        monotonic_now = time.monotonic()
+        with self._state_mutex:
+            deadline = self._renewal_deadline
+            expires_at = self._record_expires_at
+            heartbeat_error = self._heartbeat_error
+        if deadline is None or expires_at is None:
+            raise LeaseLostError("lease is not held")
+        if heartbeat_error is not None:
+            raise LeaseLostError(
+                f"lease renewal failed: {heartbeat_error}"
+            ) from heartbeat_error
+        if monotonic_now >= deadline or now >= expires_at:
+            raise LeaseLostError("lease record has expired")
 
-    def _assert_current_locked(self) -> None:
+    def _assert_record_current_locked(self) -> dict[str, object]:
         if self._handle is None:
             raise LeaseLostError("lease is not held")
-        if self._heartbeat_error is not None:
-            raise LeaseLostError(
-                f"lease renewal failed: {self._heartbeat_error}"
-            ) from self._heartbeat_error
         identity = self.identity
-        validate_lease_record(
-            identity.record_path,
+        payload = _read_record(identity.record_path)
+        _validate_record_payload(
+            payload,
             token=identity.token,
             holder=identity.holder,
             repo=identity.repo,
             root_item=identity.root_item,
         )
+        return payload
 
     def release(self) -> None:
         handle = self._handle
@@ -346,6 +491,9 @@ class FencedRootLease:
                 handle.close()
                 self._handle = None
                 self._heartbeat_thread = None
+                with self._state_mutex:
+                    self._renewal_deadline = None
+                    self._record_expires_at = None
 
     def __enter__(self) -> FencedRootLease:
         self.acquire()
