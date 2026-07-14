@@ -24,11 +24,13 @@ The workflow author wires a ``bad_output`` remediation edge if they
 want to re-prompt; that is the same contract as the other two
 providers.
 
-We send a one-shot, no-tool, no-MCP session per ``invoke()``: the
+We send a one-shot, read-only inspection session per ``invoke()``: the
 agent's user_message is the only message and the charter is prefixed
 as a leading system-style instruction. We use ``streaming=True`` (the
-CLI default) and ``allow-all`` permissions because no tools are
-enabled — there is nothing to permission.
+CLI default) and ``allow-all`` permissions for the small safe tool
+surface we expose — the implementation workflow still writes files via
+its own ``apply_changes`` verb, and the provider never enables shell or
+write-capable builtins.
 
 ----------------------------------------------------------------------
 SDK-error → outcome mapping (ADR 0002 Mahler row × ADR 0004 §4.2)
@@ -53,7 +55,26 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Final
+from typing import Any, Final, Mapping
+
+_READONLY_BUILTIN_TOOLS: Final[tuple[str, ...]] = ("view", "glob", "grep")
+"""Safe read-only inspection tools the coder agent may use to inspect the
+worktree. The implementation workflow still writes files via its own
+``apply_changes`` verb, so we keep the SDK tool surface narrow and deny
+write/shell tools."""
+
+_BLOCKED_BUILTIN_TOOLS: Final[tuple[str, ...]] = (
+    "bash",
+    "powershell",
+    "apply_patch",
+    "write_file",
+    "edit_file",
+    "create_file",
+    "replace_string",
+    "run_in_terminal",
+)
+"""Builtin tools that would let the session mutate the host filesystem or
+execute shell commands; keep them excluded for the requiem coder contract."""
 
 from pydantic import BaseModel
 
@@ -69,8 +90,8 @@ from requiem.providers._common import (
 )
 
 
-DEFAULT_COPILOT_MODEL: Final[str] = "claude-sonnet-4.6"
-"""Default model for the Copilot-backed provider. Was ``claude-sonnet-4.5``
+DEFAULT_COPILOT_MODEL: Final[str] = "claude-sonnet-5"
+"""Default model for the Copilot-backed provider. Was ``claude-sonnet-5.5``
 until 2026-06-24; bumped to ``4.6`` after run #27 showed Claude 4.5
 hitting the 600s session timeout while emitting only ~365 output tokens
 in 10 minutes (~0.6 tok/s) on context-pack-dense prompts.
@@ -141,33 +162,26 @@ stuck and returning ``retryable_failure``. Set to 0 to disable
 recovery (fail on first idle)."""
 
 _DEFAULT_MAX_CUMULATIVE_INPUT_TOKENS: Final[int] = 80_000
-"""Cap on peak ``assistant.usage.input_tokens`` observed across a
-single ``invoke`` call. When exceeded, the dual-clock loop fails
-fast as ``RetryableFailure`` rather than letting the session run
-to wall-clock or idle-recovery exhaustion.
+"""Default cap on peak ``assistant.usage.input_tokens`` for a single
+``invoke`` call. The provider uses this for non-implementer roles and
+for callers that do not provide a per-role override.
 
-Run #30 leaf 9 wedged for 44 minutes producing hallucinated
-``CoderOutput`` after accumulating 120K input tokens across three
-recovery prompts; the model blew past Copilot's own context window
-and started fabricating prose. A cap catches this class of runaway
-*before* it produces bad output, turning a 2648s timeout into a
-fail-fast retryable.
+For implementer-role calls, the provider now raises the lower-bound
+budget to 40% of the selected model's advertised max prompt window
+when that information is known; the fallback stays at this default.
+Set to ``None`` to disable the cap entirely (operator opt-out for
+runs that legitimately need large contexts)."""
 
-The Copilot SDK emits ``assistant.usage`` events with cumulative-per-
-turn input_tokens (a turn's count includes prior history). We track
-the peak observed value, so the cap reflects the largest single-turn
-context the model was asked to process — the right proxy for
-\"how close are we to the context window?\"
-
-Calibration (CVAPI dogfood, June 2026):
-  * successful leaves:        10K-30K input_tokens
-  * run-#30 successful peak:   18K-22K
-  * run-#30 leaf-9 wedge:     120K
-  * 80K = 3-4× headroom over typical success; 50K under the
-    leaf-9 fail point; under sonnet-4.6's 936K context window.
-
-Set to ``None`` to disable the cap entirely (operator opt-out
-for tuning runs that legitimately need large contexts)."""
+_MODEL_MAX_PROMPT_TOKENS: Final[dict[str, int]] = {
+    "claude-sonnet-5": 936_000,
+    "claude-sonnet-5.5": 936_000,
+    "claude-sonnet-4.6": 936_000,
+    "claude-sonnet-4.5": 168_000,
+}
+"""Known Copilot model max prompt windows. We use these only to derive
+an implementer-side lower bound: 40% of the model's advertised max
+prompt tokens, with a floor of 80K to preserve the current safety
+buffer for older models."""
 
 _DEFAULT_RECOVERY_PROMPT: Final[str] = (
     "It appears your previous response stalled or did not complete. "
@@ -210,7 +224,7 @@ class CopilotProvider:
     Constructor knobs:
 
     * ``model``    — default model (per-call override via ``AgentSpec.model``).
-      Copilot exposes its own set of models (``claude-sonnet-4.6``,
+      Copilot exposes its own set of models (``claude-sonnet-5``,
       ``gpt-5.x``, etc.); see ``copilot --help model`` on the host CLI.
     * ``client``   — pre-built ``copilot.CopilotClient`` for tests.
     * ``working_directory`` — passed to ``create_session``; defaults to
@@ -249,9 +263,11 @@ class CopilotProvider:
       hallucinated output across recovery prompts (run #30 leaf 9
       shape — 120K tokens, 44 minutes, ``bad_output``). Set to
       ``None`` to disable the cap entirely.
+    * ``disable_repo_tools`` — per-call option that removes view/glob/grep
+      from the session. The isolated session helpers remain available.
     * ``reasoning_effort`` — passed through to ``create_session``
       verbatim. Honored only by reasoning-capable models (e.g.
-      ``claude-sonnet-4.6`` accepts ``"low"`` / ``"medium"`` / ``"high"``
+      ``claude-sonnet-5`` accepts ``"low"`` / ``"medium"`` / ``"high"``
       / ``"max"``; query supported values via
       ``CopilotClient.list_models()`` → ``ModelInfo.supported_reasoning_efforts``).
       Ignored by older models that don't support a separate reasoning
@@ -323,6 +339,32 @@ class CopilotProvider:
                 )
             self.client = CopilotClient()
 
+    def _resolve_max_cumulative_input_tokens(
+        self,
+        call: AgentCall,
+        model: str,
+        call_options: Mapping[str, Any] | None = None,
+    ) -> int | None:
+        """Resolve the per-call input-token cap.
+
+        Call-scoped overrides win. Implementer-role calls get a model-
+        aware floor so the provider doesn't fail too aggressively on
+        larger work items.
+        """
+        options = dict(call_options or {})
+        if "max_cumulative_input_tokens" in options:
+            return options["max_cumulative_input_tokens"]
+        if self.max_cumulative_input_tokens is None:
+            return None
+        if getattr(call.spec, "role", None) == "implementer":
+            max_prompt_tokens = _MODEL_MAX_PROMPT_TOKENS.get(model)
+            if max_prompt_tokens is not None:
+                return max(
+                    int(self.max_cumulative_input_tokens),
+                    int(max_prompt_tokens * 0.4),
+                )
+        return self.max_cumulative_input_tokens
+
     async def _ensure_started(self) -> None:
         """Enter the CopilotClient context manager once per provider lifetime."""
         if self._started:
@@ -375,6 +417,10 @@ class CopilotProvider:
             return _on_unknown(call, e, model)
 
         schema = getattr(spec, "response_model", None)
+        call_options = getattr(call, "model_options", None) or {}
+        repo_tools_available = not bool(
+            call_options.get("disable_repo_tools", False)
+        )
         # Build a single-message prompt that prefixes the charter as a
         # system-style preamble. The Copilot SDK doesn't expose a
         # role-aware message API; this is the cleanest way to inject
@@ -383,6 +429,7 @@ class CopilotProvider:
             charter=spec.charter,
             user_message=call.user_message,
             schema=schema,
+            repo_tools_available=repo_tools_available,
         )
 
         t0 = time.perf_counter()
@@ -390,76 +437,27 @@ class CopilotProvider:
         # Anthropic-only / OpenAI-only users aren't forced to install the
         # Copilot SDK. The constant is part of the SDK's public API
         # (re-exported from copilot/__init__.py).
-        from copilot import BUILTIN_TOOLS_ISOLATED
-        # ADR-0030-followup (run-#26): restrict the session's tool
-        # surface to the SDK's BUILTIN_TOOLS_ISOLATED preset
-        # (ask_user, task_complete, exit_plan_mode, task, read_agent,
-        # write_agent, list_agents, send_inbox, context_board, skill).
-        # NONE of these tools can read or write the host filesystem
-        # or open network connections (the SDK's own contract — see
-        # copilot._mode docstring "no access outside the session,
-        # no cross-session state, no host environment access, no
-        # network").
+        from copilot import BUILTIN_TOOLS_ISOLATED, ToolSet
+        # ADR-0030-followup (run-#26): keep the session's tool surface
+        # narrow and read-only. The implementation workflow still writes
+        # files via its own ``apply_changes`` verb, so we allow the model
+        # to inspect the worktree with a small set of safe tools but deny
+        # shell/write-capable builtins that could mutate the repo.
         #
-        # Without this argument the SDK defaults to its FULL tool
-        # surface (write_file, edit_file, bash, web_fetch, …) and
-        # the model can — and did, in run #26 — write files to
-        # the working_directory mid-session. Those writes survive
-        # the session even when we return `bad_output` or
-        # `network_timeout`, contaminating the worktree for every
-        # subsequent leaf in a sequential fanout (each leaf's
-        # `assert_clean_workspace` then bails with `workspace.dirty`,
-        # turning one stray Copilot tool call into a fanout-wide
-        # cascade).
-        #
-        # Our requiem coder contract is "parse the assistant
-        # message as CoderOutput JSON and apply file_changes via
-        # the implementation workflow's apply_changes verb"; we
-        # never want the SDK to do filesystem IO on our behalf.
-        # The isolated set is exactly the right level of
-        # capability for that contract.
-        #
-        # Build the create_session kwargs. The reasoning_* knobs are
-        # only included when set so the SDK sees its own ``=None``
-        # defaults — keeps the wire shape clean and makes the test
-        # stub's recorded-kwargs intent unambiguous (only what the
-        # caller actually requested shows up).
-        # Run #30 leaf 9 revealed that BUILTIN_TOOLS_ISOLATED alone is
-        # INSUFFICIENT. Even with available_tools set to the "isolated"
-        # builtin preset, the SDK's `toolFilterPrecedence: "excluded"`
-        # (always set by the SDK — see client.py around lines 1802/2369)
-        # means available_tools acts as a weak hint, not an authoritative
-        # whitelist. The model can still call dangerous builtins like
-        # `powershell`/`bash`/`apply_patch`/`task` if they aren't in the
-        # excluded list.
-        #
-        # Repro (June 26): a thin prompt asking the model to write a file
-        # caused these tool calls under all four tested configurations:
-        #   available_tools=[ask_user,…,skill]            → calls powershell,task,create
-        #   available_tools=ToolSet().add_builtin(…)      → calls powershell,apply_patch,view
-        #   available_tools=[…] + excluded=[bash,…,task]  → blocked (skill only)
-        #   excluded_tools=ToolSet().add_builtin("*")     → blocked all
-        #
-        # Production proof: run #30 leaf 9 wrote 30 .cs files to the
-        # worktree during a 44-min recovery-prompt loop despite our
-        # `available_tools=BUILTIN_TOOLS_ISOLATED` setting — the model
-        # used `powershell` and `task` tools that aren't in that list.
-        #
-        # Fix: pass excluded_tools with a wildcard against ALL builtins
-        # (`ToolSet().add_builtin("*")`). The requiem coder agent doesn't
-        # need any builtin tools — the JSON CoderOutput it returns IS the
-        # work product; apply_changes (a requiem verb, not an SDK tool)
-        # handles the file writes. Keeping available_tools=
-        # BUILTIN_TOOLS_ISOLATED as belt-and-braces in case the SDK ever
-        # changes precedence semantics.
-        from copilot import ToolSet
-        excluded = ToolSet().add_builtin("*")
+        # The SDK's tool filtering is advisory for some builtins and
+        # authoritative for others. We therefore expose only a tiny allow-
+        # list of read-only inspection tools and explicitly exclude the
+        # write/shell builtins that historically caused runaway mutations.
+        available_tools = list(BUILTIN_TOOLS_ISOLATED)
+        if repo_tools_available:
+            available_tools.extend(_READONLY_BUILTIN_TOOLS)
+        excluded = ToolSet().add_builtin(_BLOCKED_BUILTIN_TOOLS)
         session_kwargs: dict[str, Any] = {
             "on_permission_request": _allow_all_permissions,
             "working_directory": self.working_directory or os.getcwd(),
             "streaming": True,
             "model": model,
-            "available_tools": list(BUILTIN_TOOLS_ISOLATED),
+            "available_tools": available_tools,
             "excluded_tools": excluded,
         }
         # Per-call provider-specific knobs from AgentCall.model_options
@@ -469,10 +467,12 @@ class CopilotProvider:
         # tune any specific call without changing the global default.
         # The constructor defaults still apply when a key is absent
         # from model_options.
-        call_options = getattr(call, "model_options", None) or {}
         effort = call_options.get("reasoning_effort", self.reasoning_effort)
         summary = call_options.get("reasoning_summary", self.reasoning_summary)
         tier = call_options.get("context_tier", self.context_tier)
+        max_cumulative_input_tokens = self._resolve_max_cumulative_input_tokens(
+            call, model, call_options
+        )
         if effort is not None:
             session_kwargs["reasoning_effort"] = effort
         if summary is not None:
@@ -582,7 +582,7 @@ class CopilotProvider:
                 # builder picks it up with the partial token counts
                 # intact (the operator needs to SEE how big the
                 # session got, not have it masked as zero).
-                cap = self.max_cumulative_input_tokens
+                cap = max_cumulative_input_tokens
                 if cap is not None and usage_in > cap:
                     raise asyncio.TimeoutError(
                         f"session input tokens "
@@ -678,20 +678,116 @@ class CopilotProvider:
             return success_with({"text": response_text}, receipt, agent=spec.name)
 
         # Extract JSON from the response — Copilot models (especially
-        # claude-sonnet-4.5) routinely add prose preamble + wrap JSON in
+        # claude-sonnet-5.5) routinely add prose preamble + wrap JSON in
         # ```json ... ``` fences even when the prompt forbids it. They
         # also sometimes emit prose AFTER the JSON. OpenAI's strict
         # json_schema mode and Anthropic's tool-use API both sidestep
         # this at the API layer; with Copilot we have to post-process
-        # defensively. See _extract_json_block for the strategy.
-        clean = _extract_json_block(response_text)
-
-        parsed, errors = validate_schema(clean, schema)
+        # defensively. The parser now tries multiple candidate slices so
+        # a prose preamble containing braces doesn't poison the parse.
+        candidates = _extract_json_candidates(response_text)
+        parsed = None
+        errors: tuple[str, ...] | None = None
+        for candidate in candidates:
+            repaired = _repair_json_literal_newlines(candidate)
+            parsed, errors = validate_schema(repaired, schema)
+            if parsed is not None:
+                return success_with(parsed, receipt, agent=spec.name)
+        if errors is None:
+            repaired = _repair_json_literal_newlines(response_text)
+            parsed, errors = validate_schema(repaired, schema)
         if parsed is None:
             return bad_output_with(
-                raw=response_text, errors=errors, receipt=receipt,
+                raw=response_text, errors=errors or ("json decode: no viable JSON candidate",), receipt=receipt,
             )
         return success_with(parsed, receipt, agent=spec.name)
+
+
+def _repair_json_literal_newlines(text: str) -> str:
+    """Best-effort repair for JSON emitted with literal line breaks inside
+    string values.
+
+    The Copilot model can produce otherwise-well-formed JSON-like output
+    where string contents include raw newlines (common when the model is
+    embedding file contents or code snippets). Standard JSON requires such
+    line breaks to be escaped as ``\\n``. We repair that specific shape in a
+    conservative state-machine pass so the downstream validator can parse
+    the candidate instead of failing with a generic JSON decode error.
+    """
+    if not text:
+        return text
+
+    repaired: list[str] = []
+    in_string = False
+    escape_next = False
+    for ch in text:
+        if escape_next:
+            repaired.append(ch)
+            escape_next = False
+            continue
+        if ch == "\\":
+            repaired.append(ch)
+            escape_next = True
+            continue
+        if ch == '"':
+            repaired.append(ch)
+            in_string = not in_string
+            continue
+        if in_string and ch in "\r\n":
+            repaired.append("\\n")
+            continue
+        if in_string and ch == "\t":
+            repaired.append("\\t")
+            continue
+        repaired.append(ch)
+    return "".join(repaired)
+
+
+def _extract_json_candidates(text: str) -> list[str]:
+    """Return plausible JSON candidates from a possibly-prosey LLM response.
+
+    The provider tries each candidate in order and uses the first one that
+    both parses and validates against the target schema. This avoids a
+    single early brace in prose poisoning the extraction (e.g. "The policy
+    says {this is ignored} and then the payload is {...}").
+    """
+    s = text.strip()
+    if not s:
+        return []
+
+    candidates: list[str] = []
+
+    # (1) Whole-text already-JSON.
+    if s.startswith("{") or s.startswith("["):
+        try:
+            json.loads(s)
+            candidates.append(s)
+        except json.JSONDecodeError:
+            pass
+
+    # (2) Fenced JSON blocks anywhere in the response.
+    fenced = _extract_fenced_json(s)
+    if fenced is not None and fenced not in candidates:
+        candidates.append(fenced)
+
+    # (3) Candidate extraction from every possible opener. This handles
+    # un-fenced responses where prose contains braces before the real JSON.
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(s):
+        if ch not in "{[":
+            continue
+        try:
+            candidate, end = decoder.raw_decode(s[i:])
+        except json.JSONDecodeError:
+            continue
+        raw = s[i : i + end]
+        if raw and raw not in candidates:
+            candidates.append(raw)
+
+    # (4) Last resort — let validate_schema report the error directly.
+    if not candidates:
+        return [s]
+    return candidates
 
 
 def _extract_json_block(text: str) -> str:
@@ -706,7 +802,7 @@ def _extract_json_block(text: str) -> str:
        fence (with or without a ``json``/``JSON`` language hint); return
        the content up to the next ``\\u0060\\u0060\\u0060``. This handles the common
        "prose preamble + ```json {...} ``` + optional trailing prose"
-       shape claude-sonnet-4.5 produces under codebase-grounding tasks.
+       shape claude-sonnet-5.5 produces under codebase-grounding tasks.
     3. **Brace-balanced extraction**: find the first ``{`` or ``[`` in
        the text, then walk forward maintaining brace depth (respecting
        JSON string escaping) until the matching close. Return that
@@ -858,7 +954,11 @@ def _strip_code_fence(text: str) -> str:
 
 
 def _build_prompt(
-    *, charter: str, user_message: str, schema: type[BaseModel] | None,
+    *,
+    charter: str,
+    user_message: str,
+    schema: type[BaseModel] | None,
+    repo_tools_available: bool = True,
 ) -> str:
     """Combine charter + user message + (optional) JSON-only instruction.
 
@@ -880,28 +980,26 @@ def _build_prompt(
                 "",
                 "Schema:",
                 _stringify_schema(schema_json),
-                # Run-#31 follow-up. With `excluded_tools=builtin:*`
-                # sealing the SDK tool surface (commit 4e5ccf7),
-                # sonnet-4.6 has NO tools to call but sometimes still
-                # tries — emitting Anthropic-native `<function_calls>`
-                # XML AFTER the JSON, which contaminates the response
-                # and breaks `json.loads` with "Extra data". This
-                # directive tells the model the tools don't exist so
-                # it doesn't waste output tokens (or contaminate the
-                # response) attempting calls. Placed at the TAIL so
-                # it's the model's most-recent constraint (same
-                # rationale as the schema instruction tail-placement
-                # from run #25, commit 551b414).
                 "",
-                "IMPORTANT: You have NO tools available in this session — no "
-                "function_calls, no tool_call blocks, no apply_patch, no "
-                "shell, no file I/O. Any work must be encoded as `file_changes` "
-                "in the CoderOutput JSON itself. Do NOT emit `<function_calls>`, "
-                "`<invoke>`, or any other tool-call syntax — there is nothing "
-                "to receive it, and any text after the JSON object will fail "
-                "to parse.",
             ]
         )
+        if repo_tools_available:
+            parts.append(
+                "IMPORTANT: You have read-only inspection tools available in "
+                "this session (view/glob/grep) plus the session helper tools. "
+                "Use them to inspect the repository when needed. You may NOT "
+                "write files or run shell commands. Any file mutations must be "
+                "encoded as `file_changes` in the CoderOutput JSON itself. "
+                "Do NOT emit `<function_calls>`, `<invoke>`, or any other "
+                "tool-call syntax for writes — only the JSON output is used, "
+                "and any text after the JSON object will fail to parse."
+            )
+        else:
+            parts.append(
+                "IMPORTANT: Repository inspection tools are disabled for this "
+                "bounded call. Use only the evidence supplied in the prompt. "
+                "Do NOT emit tool-call syntax; only the JSON output is used."
+            )
     return "\n".join(parts)
 
 

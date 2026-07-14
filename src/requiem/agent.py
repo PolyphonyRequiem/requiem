@@ -44,6 +44,12 @@ class AgentSpec:
     against the loaded :class:`~requiem.process_config.ProcessConfig`.
     When ``None`` (default), the kernel uses ``model`` as-is — backward-
     compatible with every existing workflow (ADR-0030 §2)."""
+    model_options: Mapping[str, Any] = field(default_factory=dict)
+    """Provider-specific defaults for this agent.
+
+    The kernel copies these into :class:`AgentCall.model_options`; resolved
+    process configuration may override individual keys for the call.
+    """
 
 
 @dataclass(frozen=True)
@@ -128,6 +134,7 @@ class FakeProvider:
             "agent": call.spec.name,
             "retry_key": call.retry_key,
             "user_message": call.user_message,
+            "model_options": dict(call.model_options),
         })
 
         entry = entries[idx]

@@ -293,7 +293,7 @@ def _render_cost_block(events: list[dict[str, Any]]) -> None:
         ─── Cost ──────────────────────────────────────────────
           42 agent calls · 19,134 tokens · 87.1s aggregate latency
            planner:    8 calls · claude-opus-4.7    · 6,600 tok · 32.0s
-           reviewer:   9 calls · claude-sonnet-4    · 7,000 tok · 28.0s
+           reviewer:   9 calls · claude-sonnet-5    · 7,000 tok · 28.0s
            ...
         ───────────────────────────────────────────────────────
     """
@@ -849,13 +849,10 @@ def cmd_clean(args: argparse.Namespace) -> int:
     #      plan sidecars (.plan.md, .plan.tree.json) at any recursion
     #      depth.
     #
-    #   2) IDEMPOTENCY state (commit manifest, leaf-pr-map): names ADO /
-    #      git side-effects from a prior run. PRESERVE BY DEFAULT so
-    #      retries can adopt prior children / leaf PRs (ADR-0026
-    #      follow-up: ADO doesn't preserve our HTML-comment markers, so
-    #      the manifest is the ONLY surviving cross-run idempotency
-    #      hook). Pass --include-manifest to nuke them too — that's the
-    #      explicit "I really want a fresh seed" path.
+    #   2) SIDE-EFFECT RECEIPTS (commit manifest, leaf-pr-map): names ADO /
+    #      git side-effects from a prior run. PRESERVE BY DEFAULT so local
+    #      resume and dispatch can reuse their exact synth→real / leaf→PR maps.
+    #      Durable ADO lineage no longer depends on this directory.
     patterns = _clean_patterns(
         item_id,
         include_manifest=getattr(args, "include_manifest", False),
@@ -981,6 +978,42 @@ def _clean_patterns(item_id: int, *, include_manifest: bool) -> list[str]:
     if include_manifest:
         patterns.extend(manifest_patterns)
     return patterns
+
+
+def cmd_migrate_plan_lineage(args: argparse.Namespace) -> int:
+    """Verify and optionally stamp durable ADO lineage from a commit manifest."""
+    from requiem.clients.twig import TwigClient, TwigClientError
+    from requiem.plan_lineage import (
+        LineageMigrationError,
+        migrate_commit_manifest,
+    )
+
+    manifest = Path(args.manifest).resolve()
+    twig_cwd = Path(args.twig_cwd).resolve()
+    try:
+        result = asyncio.run(
+            migrate_commit_manifest(
+                TwigClient(cwd=twig_cwd),
+                manifest,
+                scenario_id=args.item,
+                apply=args.apply,
+            )
+        )
+    except (LineageMigrationError, TwigClientError) as exc:
+        _say(f"lineage migration failed: {exc}", style="red")
+        return EXIT_CODE_FAILED
+
+    action = "applied" if result.applied else "verified"
+    _say(
+        f"lineage migration {action}: Scenario AB#{result.scenario_id}, "
+        f"plan={result.plan_id}, verified={result.verified_count}, "
+        f"already_durable={result.already_durable_count}, "
+        f"pending={result.pending_count}, migrated={result.migrated_count}",
+        style="green" if result.applied else None,
+    )
+    if not result.applied and result.pending_count:
+        _say("Re-run with --apply to append the verified durable markers.")
+    return EXIT_CODE_OK
 
 
 def cmd_pre_run_cleanup(args: argparse.Namespace) -> int:
@@ -1178,18 +1211,41 @@ def _build_parser() -> argparse.ArgumentParser:
     cl.add_argument(
         "--include-manifest", action="store_true",
         help=(
-            "ALSO delete the commit_plan idempotency manifest "
+            "ALSO delete the commit_plan side-effect manifest "
             "(commit-{N}.plan.committed.json) and the leaf-pr-map. "
-            "Default behaviour preserves them so retries can adopt "
-            "prior ADO children / leaf PRs (ADR-0026: ADO doesn't "
-            "preserve our HTML-comment markers, so the manifest is "
-            "the only surviving cross-run idempotency hook). Set "
-            "this flag for the explicit \"I want a truly fresh seed\" "
-            "case — next run will create NEW ADO children instead of "
-            "adopting the prior ones."
+            "Default behaviour preserves them for local resume and "
+            "dispatch. Durable ADO lineage survives independently, so "
+            "this flag does not erase ownership or force new children."
         ),
     )
     cl.set_defaults(func=cmd_clean)
+
+    lineage = sub.add_parser(
+        "migrate-plan-lineage",
+        help="verify and stamp durable ADO lineage from a commit manifest",
+    )
+    lineage.add_argument(
+        "--item",
+        type=int,
+        required=True,
+        help="Exact root ADO Scenario id recorded by the manifest.",
+    )
+    lineage.add_argument(
+        "--manifest",
+        required=True,
+        help="Path to commit-<item>.plan.committed.json.",
+    )
+    lineage.add_argument(
+        "--twig-cwd",
+        default=".",
+        help="Twig-initialized workspace used for authoritative ADO reads/writes.",
+    )
+    lineage.add_argument(
+        "--apply",
+        action="store_true",
+        help="Append durable markers after full validation; default is preview.",
+    )
+    lineage.set_defaults(func=cmd_migrate_plan_lineage)
 
     pre = sub.add_parser(
         "pre-run-cleanup",
@@ -1209,7 +1265,10 @@ def _build_parser() -> argparse.ArgumentParser:
     pre.add_argument(
         "--repo-path",
         required=True,
-        help="Local checkout whose canonical local refs should be removed.",
+        help=(
+            "Local checkout whose canonical refs may be removed and whose "
+            "clean HEAD is rebaselined to the verified default branch."
+        ),
     )
     pre.add_argument("--remote", default="origin")
     pre.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR))

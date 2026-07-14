@@ -178,11 +178,35 @@ honest evidence, not a shortcut). `check_tests_passed` itself is unchanged
 — it still requires a genuine `"success"` signal, it just now has one to
 find.
 
-`leaf_lifecycle.push_addressal` (the post-review-fix push path) is
-deliberately left unchanged: it pushes revision commits with no fresh
-`run_tests` re-run before them, so posting a status there would be the
-optimistic-merge shortcut the gate exists to prevent. Revision commits
-correctly stay at `checks_state="unknown"` and route to
-`needs_human.tests_status_unknown` until re-verified — a pre-existing,
-intentionally conservative gap, not a regression from this fix.
+`leaf_lifecycle.push_addressal` (the post-review-fix push path) was
+deliberately left unchanged at the time: it pushed revision commits with no
+fresh `run_tests` re-run before them, so posting a status there would have been
+the optimistic-merge shortcut the gate exists to prevent. Revision commits
+therefore stayed at `checks_state="unknown"` and routed to
+`needs_human.tests_status_unknown` until re-verified.
 
+## Addendum (2026-07-13): close the post-review verification gap
+
+Live runs 51 and 53 confirmed that the conservative gap above was permanent,
+not transient: reviewer fixes created a new leaf SHA, but no actor reran the
+configured tests or published required-status evidence for that SHA. The
+workflow now runs the same configured or auto-detected test command after
+applying review fixes and before committing or pushing them. A passing result
+is published as `requiem/local-tests` on the exact pushed SHA; a failed,
+undetected, or crashed test run stops before push.
+
+`tests_status_unknown` also has a bounded evidence-first recovery branch.
+Requiem rereads the authoritative commit-status feed only when ADO reports an
+actual pending status or when Requiem has just published the required status
+for that exact SHA. A terminal success continues, a failure remains fail-closed,
+and three unresolved reads produce a resumable escalation brief. An unknown
+status with neither pending evidence nor an exact-SHA publication is treated as
+genuinely missing validation and escalates immediately.
+
+The required proof is specifically the latest
+`requiem/local-tests` status in the `requiem` genre; unrelated successful commit
+statuses cannot satisfy the gate. Mergeability carries the exact inspected head
+SHA through to completion, and both ADO and GitHub enforce that SHA as the
+platform merge compare-and-swap. Review-fix tests also persist the staged Git
+tree identity, so a changed worktree cannot be committed or marked successful
+after a crash/resume boundary without another test run.

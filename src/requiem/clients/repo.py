@@ -38,6 +38,8 @@ from typing import Any, Literal, Protocol, runtime_checkable
 #   ADO:    active → "open", abandoned → "closed", completed → "merged"
 RepoPrState = Literal["open", "closed", "merged"]
 RepoMergeStrategy = Literal["merge", "squash", "rebase"]
+REQUIRED_TEST_STATUS_CONTEXT = "requiem/local-tests"
+REQUIRED_TEST_STATUS_GENRE = "requiem"
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +124,7 @@ class RepoMergeabilityReport:
     checks_state: str
     conflicts: bool
     policies_satisfied: bool
+    head_sha: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,12 +266,13 @@ class MergeCapableRepoPlatform(RepoPlatform, Protocol):
         strategy: RepoMergeStrategy,
         expected_head: str | None = None,
         expected_base: str | None = None,
+        expected_head_sha: str | None = None,
     ) -> RepoCompleteResult:
-        """Complete/merge a PR after re-fetching the live head/base.
+        """Complete/merge a PR after re-fetching the live head/base/SHA.
 
-        When ``expected_head`` and/or ``expected_base`` are supplied, the impl
-        MUST re-read the live PR immediately before mutating it and refuse to
-        merge if the live source/target branches no longer match.
+        Supplied preconditions MUST be checked immediately before mutation.
+        ``expected_head_sha`` must be enforced by the platform's atomic merge
+        compare-and-swap when supported.
         """
         ...
 
@@ -286,4 +290,3 @@ class MergeCapableRepoPlatform(RepoPlatform, Protocol):
 # None)` and treat it as fully best-effort — adding it to the narrow Protocol
 # would force every fake/double in the codebase to grow a matching method for
 # a capability most call sites never need.
-

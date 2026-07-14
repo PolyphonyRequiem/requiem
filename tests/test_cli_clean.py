@@ -27,10 +27,10 @@ def _seed_full_run(
     one item. Returns the list of paths created so tests can check each.
 
     Per ADR-0026, the commit_plan manifest and leaf-pr-map are
-    *preserved by default* (they encode cross-run idempotency state
-    that ADO doesn't preserve via HTML-comment markers). To check
-    both groups together, use ``_seed_ephemeral`` + ``_seed_manifest``
-    helpers separately, or inspect the returned list element-by-element.
+    *preserved by default* as exact local side-effect receipts. Durable
+    ADO lineage no longer depends on this directory. To check both groups
+    together, use ``_seed_ephemeral`` + ``_seed_manifest`` helpers
+    separately, or inspect the returned list element-by-element.
     """
     ephemeral, manifest = _seed_ephemeral(
         log_dir,
@@ -163,8 +163,7 @@ def test_clean_removes_ephemeral_artifacts_for_one_item(
 
 
 def test_clean_include_manifest_removes_everything(log_dir: Path):
-    """--include-manifest opts into nuking the manifest + leaf-pr-map too,
-    for the explicit "I want a truly fresh seed" path."""
+    """--include-manifest opts into removing local receipts too."""
     ephemeral = _seed_ephemeral(log_dir, item_id=42)
     manifest = _seed_manifest(log_dir, item_id=42)
     rc = cli_main.main([

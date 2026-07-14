@@ -1,6 +1,6 @@
 # ADR 0027 — Reviewer escalation handling: failure modes, policies, and sidecar
 
-**Status:** Proposed (2026-06-17)
+**Status:** Amended (2026-07-11)
 **Date:** 2026-06-17
 **Relates to:**
 ADR-0010 (planning tier model — defines decomposable/implementable
@@ -63,9 +63,7 @@ tolerance decide whether to ship.
 
    This is **always written** — even when policy=escalate (default,
    today's behavior). The sidecar IS the answer to M2: an operator
-   can read it, file follow-up work items, then re-run with
-   `--on-escalate=accept-last` once the open questions are resolved
-   in the work item description.
+   can read it, resolve the open questions, and rerun planning.
 
 2. **`--on-escalate=escalate|accept-last|abort` CLI flag** on
    `requiem-end-to-end`. Default `escalate` preserves today's
@@ -73,9 +71,9 @@ tolerance decide whether to ship.
    for `escalation_gate` specifically:
    - `escalate` (default): interactive prompt as today; sidecar
      always written
-   - `accept-last`: auto-answer `proceed` (the existing gate option
-     that records the last planner output as needs-human and
-     continues); sidecar always written
+   - `accept-last`: auto-answer `proceed` to record the last planner
+     output as `needs_human` for audit; the end-to-end driver then
+     pauses before plan commit or fanout
    - `abort`: auto-answer `abort` (terminate the run); sidecar still
      written so the operator knows what was lost
 
@@ -99,12 +97,17 @@ tolerance decide whether to ship.
    hypothetical in practice — Shape A is significant reviewer-
    prompt churn and we shouldn't ship it speculatively.
 
-### Backward compatibility
+### Mutation safety amendment (2026-07-11)
 
-- Default behavior (`--on-escalate=escalate` implicit) is
-  byte-identical to today's run output up to the additional
-  `escalation-feedback-{run_id}.md` sidecar file. No test should
-  break; no operator workflow changes.
+- A plan whose final verdict is `needs_human` is never an execution input,
+  regardless of `--on-escalate`. `commit_plan` accepts only `approved`, and
+  committed-leaf resolution/fanout enforce the same boundary.
+- `accept-last` is retained as an audit convenience, not an authorization to
+  mutate ADO or dispatch implementation. Operators resolve the recorded
+  questions and rerun until planning produces an approved, aligned artifact.
+- Planner overlap pins are validated from authoritative ADO parentage plus
+  Requiem lineage markers. Fixable invalid pins receive bounded revision;
+  ambiguous ownership or conflicting lineage remains genuinely HITL.
 - Tests that exercise `gate_handler=_proceed_handler` continue to
   work (the new flag doesn't affect tests that supply their own
   handler; the handler chain composes — flag wraps default, tests
@@ -132,9 +135,8 @@ sees a `needs_human` outcome that bubbles per existing semantics
   responder for `escalation_gate` and proxies other gates to the
   inherited handler
 - Tests pinning all three policies + sidecar content
-- Re-run dogfood `#62759077` with `--on-escalate=accept-last`;
-  expect plan to ship as needs-human with sidecar capturing the
-  PM-input questions
+- Re-run dogfood `#62759077`; any needs-human result must pause with a
+  sidecar, and only a subsequent approved plan may seed or fan out
 
 **Out of scope (Shape A / ADR-0028):**
 
@@ -154,3 +156,9 @@ sees a `needs_human` outcome that bubbles per existing semantics
   2. CLI flag on `end_to_end.py` + gate-handler factory
   3. Tests: 3 policies × sidecar content × child-inheritance
   4. Re-run dogfood and confirm shipped Deliverables + sidecar
+- **2026-07-11 AMENDED.** Generic `accept-last` continuation is no longer
+  allowed to cross the mutation boundary. It records the unresolved plan and
+  sidecar for audit, while `commit_plan`, leaf resolution, and fanout require an
+  approved, proposal/children-aligned artifact. Overlap reuse is evidence-first:
+  exact direct-child title/type, same-Scenario Requiem lineage, and unique
+  ownership are required before a planner pin can survive review.

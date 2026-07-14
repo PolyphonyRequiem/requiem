@@ -34,6 +34,7 @@ from typing import Any, Callable
 from requiem import branch_model
 from requiem.clients.fs import FilesystemClient, FsGitError
 from requiem.kernel import Completed, Engine
+from requiem.plan_tree import PlanArtifactError, load_committed_leaves
 from requiem.persistence import replay
 from requiem.toolbelt import Toolbelt
 from requiem.workflows import commit_plan as commit_plan_mod
@@ -752,30 +753,19 @@ async def run_pipeline(
     plan_outcome = await plan_engine.run(plan_run)
     plan_record = _plan_record(_completed_map(log_dir, plan_run))
 
-    # ADR-0027: which final verdicts are allowed past the planning
-    # phase. Default `escalate` allows only `approved` (today's
-    # behavior). `accept-last` ALSO allows `needs_human` — the
-    # workflow's record_needs_human path captures the last planner
-    # output AND writes the escalation-feedback sidecar, so the
-    # operator has both the plan and the reviewer's open questions
-    # in a durable form.
-    allowed_verdicts: set[str] = {"approved"}
-    if escalation_policy == "accept-last":
-        allowed_verdicts.add("needs_human")
-
+    # An unresolved plan is an audit artifact, never an execution input.
+    # `accept-last` may still record the planner's last output and reviewer
+    # feedback, but no generic escalation policy can authorize ADO seeding or
+    # fanout. The plan must be regenerated with a final approved verdict.
     verdict = (plan_record or {}).get("final_verdict")
-    if plan_record is None or verdict not in allowed_verdicts:
+    if plan_record is None or verdict != "approved":
         verdict_repr = verdict or "unknown"
         return PipelineResult(
             item_id=item_id, stage="planning", status="paused",
             detail=(
                 f"planning did not approve a plan (verdict={verdict_repr!r}); "
-                "resolve the plan before dispatching."
-                + (
-                    " (run with --on-escalate=accept-last to ship as needs-human)"
-                    if verdict == "needs_human" and escalation_policy == "escalate"
-                    else ""
-                )
+                "resolve the recorded questions and regenerate an approved plan "
+                "before committing or dispatching."
             ),
             decomposable=(plan_record or {}).get("decomposable"),
             plan_artifact=(plan_record or {}).get("plan_artifact"),
@@ -832,6 +822,33 @@ async def run_pipeline(
             plan_tree_path=Path(plan_artifact), committed_path=committed_path,
             poll_interval_s=poll_interval_s, max_polls=max_polls, skills=skills,
         )
+
+    # The committed artifact pair must be proven faithful before trunk bootstrap
+    # or any other downstream mutation. Each dispatch backend repeats its own
+    # artifact resolution later to close the remaining TOCTOU window.
+    if decomposable:
+        assert plan_artifact is not None
+        assert committed_path is not None
+        try:
+            load_committed_leaves(Path(plan_artifact), committed_path)
+        except PlanArtifactError as e:
+            preflight_stage = (
+                "fanout" if dispatch_backend == "fanout" else "executor"
+            )
+            return PipelineResult(
+                item_id=item_id,
+                stage=preflight_stage,
+                status="paused",
+                detail=(
+                    f"committed plan failed preflight ({e.kind}): {e}; "
+                    "no trunk or leaf mutation was attempted."
+                ),
+                decomposable=True,
+                plan_artifact=plan_artifact,
+                committed_path=str(committed_path),
+                github_repo=_github_repo_arg,
+                ado_repo=_ado_repo_arg,
+            )
 
     # -- Phase 2.5: trunk bootstrap (ADR-0018 step 4 — BEFORE dispatch) -
     #
@@ -1436,12 +1453,9 @@ def _build_arg_parser():
             "Ignored when --backend != fanout."
         ),
     )
-    # ADR-0027: reviewer escalation handling. Default `escalate`
-    # preserves today's behavior (interactive prompt at escalation_gate);
-    # `accept-last` auto-answers `proceed` so a good-enough plan ships
-    # as needs_human and the run continues; `abort` auto-terminates.
-    # The escalation-feedback sidecar is written on every escalation
-    # regardless of this flag (when record_needs_human fires).
+    # ADR-0027: reviewer escalation handling. `accept-last` records the last
+    # planner output and reviewer feedback without authorizing plan commit or
+    # fanout; only an approved rerun can cross that mutation boundary.
     p.add_argument(
         "--on-escalate",
         choices=["escalate", "accept-last", "abort"],
@@ -1449,8 +1463,8 @@ def _build_arg_parser():
         help=(
             "What to do when the planner/reviewer loop hits escalation_gate. "
             "escalate (default): operator must answer interactively. "
-            "accept-last: ship the last planner output as needs_human and "
-            "continue past the planning phase. "
+            "accept-last: record the last planner output as needs_human for "
+            "audit, then pause before plan commit or fanout. "
             "abort: terminate the run. "
             "See ADR-0027 for the failure-mode taxonomy this policy maps to."
         ),

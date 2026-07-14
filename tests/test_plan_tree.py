@@ -215,124 +215,28 @@ def test_pinned_leaf_disagreeing_with_id_map_is_misaligned(tmp_path):
 
 
 
-# ---- ADR-0030 §1 follow-up (run #28): needs_human nodes emit leaves ---
+# ---- unresolved verdict safety -----------------------------------------
 
 
-def test_needs_human_node_emits_one_leaf_per_proposal(tmp_path):
-    """When a decomposable node has final_verdict='needs_human' and
-    children=[] (the planner escalated before recursing), _walk emits
-    one ResolvedLeaf per proposal instead of raising 'misaligned'.
-
-    Reproduces the run #28 failure mode: the operator accept-last'd
-    a planner that escalated at depth 1; the resulting tree had
-    proposals=6, children=0 at synth 6275907701; without this fix,
-    `resolve_leaves` raised PlanArtifactError(misaligned) and the
-    whole fanout aborted with 'no_leaves'."""
-    import json
-    tree = {
-        "schema_version": 2,
-        "verdict": "needs_human",
-        "plan_id": "plan-test",
-        "item_id": 100,
-        "item_title": "root",
-        "decomposable": True,
-        "current_depth": 0,
-        "approved_iteration": 1,
-        "proposals": [{"title": "A", "description": "...", "work_item_type": "Deliverable", "item_id": None}],
-        "children": [{
-            # root.item_id=100, index=0 → 100*100+0+1 = 10001
-            "item_id": 10001,
-            "plan_id": "child-10001",
-            "decomposable": True,
-            "summary": "decomp",
-            "review_iterations": 1,
-            "final_verdict": "needs_human",
-            "proposals": [
-                {"title": "A.1", "description": "d1", "work_item_type": "Task", "item_id": None},
-                {"title": "A.2", "description": "d2", "work_item_type": "Task", "item_id": None},
-                {"title": "A.3", "description": "d3", "work_item_type": "Task", "item_id": None},
-            ],
-            "children": [],
-        }],
-    }
-    committed = {
-        "schema_version": 1,
-        "plan_id": "plan-test",
-        "root_item_id": 100,
-        "id_map": {
-            # The deliverable's synth=10001 maps to real ADO id 5001.
-            "10001": 5001,
-            # Each task synth = 10001*100+i+1.
-            "1000101": 5002,
-            "1000102": 5003,
-            "1000103": 5004,
-        },
-        "ledger": [],
-    }
-    tree_path = tmp_path / "tree.json"
-    committed_path = tmp_path / "committed.json"
-    tree_path.write_text(json.dumps(tree))
-    committed_path.write_text(json.dumps(committed))
-
-    leaves = load_committed_leaves(tree_path, committed_path)
-    # Three leaves emitted, one per needs-human proposal.
-    assert len(leaves) == 3
-    titles = [l.title for l in leaves]
-    assert titles == ["A.1", "A.2", "A.3"]
-    # Real ids resolved through id_map.
-    assert [l.real_id for l in leaves] == [5002, 5003, 5004]
-    # Synth ids are derived deterministically — parent (10001) * 100 + i + 1.
-    assert [l.synth_id for l in leaves] == [1000101, 1000102, 1000103]
-
-
-def test_needs_human_node_without_proposals_still_misaligned(tmp_path):
-    """Defensive: needs_human is NOT a free pass past every alignment
-    check. If proposals AND children are both empty, the node has
-    nothing to dispatch and the tree is still broken (the planner
-    should never produce a decomposable node with zero proposals).
-    Reject loudly."""
-    import json
-    import pytest
-    tree = {
-        "schema_version": 2,
-        "verdict": "needs_human",
-        "plan_id": "plan-test",
-        "item_id": 100,
-        "item_title": "root",
-        "decomposable": True,
-        "current_depth": 0,
-        "approved_iteration": 1,
-        "proposals": [{"title": "A", "description": "...", "work_item_type": "Deliverable", "item_id": None}],
-        "children": [{
-            "item_id": 10001,
-            "plan_id": "child-10001",
-            "decomposable": True,
-            "final_verdict": "needs_human",
-            # NEITHER proposals nor children — nothing to dispatch.
-            "proposals": [],
-            "children": [],
-        }],
-    }
-    committed = {
-        "schema_version": 1,
-        "plan_id": "plan-test",
-        "root_item_id": 100,
-        "id_map": {"10001": 5001},
-        "ledger": [],
-    }
-    tree_path = tmp_path / "tree.json"
-    committed_path = tmp_path / "committed.json"
-    tree_path.write_text(json.dumps(tree))
-    committed_path.write_text(json.dumps(committed))
-
-    # The proposals-empty AND children-empty node is itself
-    # un-dispatchable; the recursive walk produces zero leaves; the
-    # outer load_committed_leaves then raises "no_leaves" (a separate
-    # error mode that fanout/end_to_end already handle — better than
-    # silently dispatching nothing).
+def test_needs_human_root_is_not_dispatchable(tmp_path):
+    tree = _tree(verdict="needs_human")
     with pytest.raises(PlanArtifactError) as ei:
-        load_committed_leaves(tree_path, committed_path)
-    assert ei.value.kind == "no_leaves"
+        load_committed_leaves(
+            _write(tmp_path / "t.json", tree),
+            _write(tmp_path / "c.json", _committed()),
+        )
+    assert ei.value.kind == "not_approved"
+
+
+def test_needs_human_child_is_not_dispatchable(tmp_path):
+    tree = _tree()
+    tree["children"][0]["final_verdict"] = "needs_human"
+    with pytest.raises(PlanArtifactError) as ei:
+        load_committed_leaves(
+            _write(tmp_path / "t.json", tree),
+            _write(tmp_path / "c.json", _committed()),
+        )
+    assert ei.value.kind == "not_approved"
 
 
 # ---- inter-leaf `depends_on` resolution (run #36 fanout follow-up) ----
@@ -370,7 +274,6 @@ def test_depends_on_self_reference_rejected(tmp_path):
             _write(tmp_path / "c.json", _committed()),
         )
     assert ei.value.kind == "bad_depends_on"
-
 
 def test_depends_on_out_of_range_rejected(tmp_path):
     tree = _tree()
@@ -416,46 +319,3 @@ def test_depends_on_targeting_a_decomposable_sibling_rejected(tmp_path):
             _write(tmp_path / "c.json", _committed()),
         )
     assert ei.value.kind == "bad_depends_on"
-
-
-def test_depends_on_in_needs_human_branch_skips_leaf_check(tmp_path):
-    """In the needs_human branch every proposal is inherently a leaf (no
-    `children` list exists to check `decomposable` against), so depends_on
-    is resolved without the leaf-sibling check."""
-    tree = {
-        "schema_version": 2,
-        "verdict": "needs_human",
-        "plan_id": "plan-test",
-        "item_id": 100,
-        "item_title": "root",
-        "decomposable": True,
-        "current_depth": 0,
-        "approved_iteration": 1,
-        "proposals": [{"title": "A", "description": "...", "work_item_type": "Deliverable", "item_id": None}],
-        "children": [{
-            "item_id": 10001,
-            "plan_id": "child-10001",
-            "decomposable": True,
-            "final_verdict": "needs_human",
-            "proposals": [
-                {"title": "A.1", "description": "d1", "work_item_type": "Task", "item_id": None},
-                {"title": "A.2", "description": "d2", "work_item_type": "Task", "item_id": None,
-                 "depends_on": [0]},
-            ],
-            "children": [],
-        }],
-    }
-    committed = {
-        "schema_version": 1,
-        "plan_id": "plan-test",
-        "root_item_id": 100,
-        "id_map": {"10001": 5001, "1000101": 5002, "1000102": 5003},
-        "ledger": [],
-    }
-    leaves = load_committed_leaves(
-        _write(tmp_path / "t.json", tree),
-        _write(tmp_path / "c.json", committed),
-    )
-    by_title = {l.title: l for l in leaves}
-    assert by_title["A.1"].deps == ()
-    assert by_title["A.2"].deps == (5002,)

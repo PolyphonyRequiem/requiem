@@ -23,6 +23,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
+import copilot
 import pytest
 from pydantic import BaseModel
 
@@ -129,6 +130,7 @@ class _FakeCopilotClient:
         self._raise_on_create = raise_on_create
         self.created_sessions: list[str] = []
         self.deleted_sessions: list[str] = []
+        self.last_create_kwargs: dict[str, Any] = {}
 
     async def __aenter__(self):
         return self
@@ -142,6 +144,7 @@ class _FakeCopilotClient:
         )
 
     async def create_session(self, **kw: Any) -> _FakeSession:
+        self.last_create_kwargs = dict(kw)
         if self._raise_on_create is not None:
             raise self._raise_on_create
         sid = f"sess-{len(self.created_sessions)}"
@@ -237,6 +240,26 @@ async def test_success_passes_through_per_call_model_override():
     assert outcome.receipts[0]["model"] == "gpt-5.2"
 
 
+def test_implementer_budget_uses_model_window_floor():
+    provider = CopilotProvider(client=_FakeCopilotClient())
+    spec = _make_spec(role="implementer", model="claude-sonnet-5")
+    call = _make_call(spec)
+
+    assert provider._resolve_max_cumulative_input_tokens(call, "claude-sonnet-5", {}) == 374_400
+
+
+def test_call_level_budget_override_wins_over_role_default():
+    provider = CopilotProvider(client=_FakeCopilotClient())
+    spec = _make_spec(role="implementer", model="claude-sonnet-5")
+    call = AgentCall(
+        spec=spec,
+        user_message="hello",
+        model_options={"max_cumulative_input_tokens": 12_000},
+    )
+
+    assert provider._resolve_max_cumulative_input_tokens(call, "claude-sonnet-5", call.model_options) == 12_000
+
+
 async def test_no_schema_path_returns_text_only():
     """When AgentSpec.response_model is None, we should pass the raw text
     through without trying to parse it as JSON."""
@@ -295,7 +318,7 @@ async def test_schema_violation_returns_bad_output():
 
 
 async def test_json_wrapped_in_markdown_fences_parses_via_strip():
-    """REGRESSION pin (2026-06-17 live dryrun): claude-sonnet-4.5 ignores
+    """REGRESSION pin (2026-06-17 live dryrun): claude-sonnet-5.5 ignores
     the prompt instruction to omit fences and wraps its JSON in
     ```json ... ```. Provider must strip the fence before parsing —
     otherwise Mahler-A turns this into a permanent abort."""
@@ -319,6 +342,30 @@ async def test_json_wrapped_in_bare_fences_also_parses():
 
     assert isinstance(outcome, Success)
     assert outcome.value["parsed"] == {"answer": "bare"}
+
+
+async def test_json_after_prose_with_braces_parses():
+    """A prose preamble containing braces should not poison the JSON scan."""
+    wrapped = 'The policy says {this is ignored} and then the payload is {"answer": "wrapped"}'
+    fake = _FakeCopilotClient(script=_success_script(wrapped))
+    provider = CopilotProvider(client=fake)
+    outcome = await provider.invoke(_make_call(_make_spec()))
+    await provider.aclose()
+
+    assert isinstance(outcome, Success)
+    assert outcome.value["parsed"] == {"answer": "wrapped"}
+
+
+async def test_json_with_literal_newlines_in_strings_parses():
+    """The provider should repair newline characters inside string values."""
+    wrapped = '{"answer": "hello\nworld"}'
+    fake = _FakeCopilotClient(script=_success_script(wrapped))
+    provider = CopilotProvider(client=fake)
+    outcome = await provider.invoke(_make_call(_make_spec()))
+    await provider.aclose()
+
+    assert isinstance(outcome, Success)
+    assert outcome.value["parsed"] == {"answer": "hello\nworld"}
 
 
 async def test_empty_response_returns_bad_output():
@@ -395,6 +442,56 @@ def test_copilot_provider_rejects_missing_token(monkeypatch):
 # ---- prompt-shaping unit tests ------------------------------------------
 
 
+async def test_session_uses_read_only_tool_surface():
+    fake = _FakeCopilotClient(script=_success_script('{"answer": "ok"}'))
+    provider = CopilotProvider(client=fake)
+    outcome = await provider.invoke(_make_call(_make_spec()))
+    await provider.aclose()
+
+    assert isinstance(outcome, Success)
+    kwargs = fake.last_create_kwargs
+    assert "available_tools" in kwargs
+    available = list(kwargs["available_tools"])
+    assert available[: len(copilot.BUILTIN_TOOLS_ISOLATED)] == list(copilot.BUILTIN_TOOLS_ISOLATED)
+    assert "view" in available
+    assert "glob" in available
+    assert "grep" in available
+    assert "bash" not in available
+    assert "apply_patch" not in available
+    assert "excluded_tools" in kwargs
+    excluded = list(kwargs["excluded_tools"])
+    assert "builtin:bash" in excluded
+    assert "builtin:apply_patch" in excluded
+
+
+async def test_call_can_disable_repository_inspection_tools():
+    fake = _FakeCopilotClient(script=_success_script('{"answer": "ok"}'))
+    provider = CopilotProvider(client=fake)
+    call = AgentCall(
+        spec=_make_spec(),
+        user_message="Use only supplied evidence.",
+        model_options={"disable_repo_tools": True},
+    )
+
+    outcome = await provider.invoke(call)
+    await provider.aclose()
+
+    assert isinstance(outcome, Success)
+    available = list(fake.last_create_kwargs["available_tools"])
+    assert available == list(copilot.BUILTIN_TOOLS_ISOLATED)
+    assert "view" not in available
+    assert "glob" not in available
+    assert "grep" not in available
+    prompt = _build_prompt(
+        charter="Review carefully.",
+        user_message="Evidence.",
+        schema=_TinyOut,
+        repo_tools_available=False,
+    )
+    assert "Repository inspection tools are disabled" in prompt
+    assert "Use them to inspect the repository" not in prompt
+
+
 def test_build_prompt_no_schema_concatenates_charter_and_user():
     out = _build_prompt(
         charter="Be helpful.", user_message="Hello!", schema=None,
@@ -416,24 +513,17 @@ def test_build_prompt_with_schema_appends_schema_instruction():
     assert "answer" in out  # _TinyOut's field name
 
 
-def test_build_prompt_with_schema_warns_model_off_tool_calls():
-    """Run-#31 follow-up. With `excluded_tools=builtin:*` sealing the
-    Copilot SDK tool surface (commit 4e5ccf7), sonnet-4.6 has NO
-    tools to call. But it sometimes still emits Anthropic-native
-    `<function_calls>` XML trying to call non-existent tools — which
-    appears as trailing prose AFTER the valid CoderOutput JSON and
-    breaks `json.loads`. The prompt MUST tell the model explicitly
-    that no tools exist, so it doesn't waste output tokens (and
-    contaminate the response) attempting to call them.
+def test_build_prompt_with_schema_warns_model_off_write_tool_calls():
+    """The prompt must tell the model that only read-only inspection
+    tools are available, and that it must not emit write-tool syntax
+    while returning the structured CoderOutput JSON.
     """
     out = _build_prompt(
         charter="Charter.", user_message="Do the thing.", schema=_TinyOut,
     )
     lowered = out.lower()
-    # The prompt must mention BOTH 'no tools' AND that tool-call
-    # syntax should be avoided. Otherwise the model will still try.
-    assert "no tools" in lowered or "no tool" in lowered, (
-        "prompt must explicitly state no tools are available; got:\n"
+    assert "read-only" in lowered or "inspection tools" in lowered, (
+        "prompt must explicitly mention read-only inspection tools; got:\n"
         + out
     )
     assert "function_call" in lowered or "tool call" in lowered or "tool_call" in lowered, (
@@ -515,7 +605,7 @@ def test_default_provider_prefers_copilot_when_token_set(monkeypatch):
 #
 # The first --commit dogfood ran the recursion 2 levels deep. At the
 # grandchild planner_1 (task: "Implement capacity probe mechanism"),
-# claude-sonnet-4.5 produced a high-quality JSON plan — but PREFIXED
+# claude-sonnet-5.5 produced a high-quality JSON plan — but PREFIXED
 # with prose ("Based on the codebase analysis, I can see this is a
 # CloudVault service..."). The original _strip_code_fence only stripped
 # if the *whole text* started with ```; this case starts with prose
@@ -549,7 +639,7 @@ _LIVE_GRANDCHILD_RESPONSE = '''Based on the codebase analysis, I can see this is
 
 async def test_live_dogfood_grandchild_prose_preamble_then_fenced_json():
     """REGRESSION PIN (dogfood 2026-06-17 grandchild #62759077): the
-    actual live response from claude-sonnet-4.5 must parse. Before the
+    actual live response from claude-sonnet-5.5 must parse. Before the
     fix this hit BadOutput → bad_output_gate → abort."""
 
     class _RichOut(BaseModel):
@@ -949,52 +1039,35 @@ def test_session_uses_isolated_tool_preset():
         "the model contaminates the worktree (run-#26 regression)."
     )
     tools = list(recorded["available_tools"])
-    # The exact list is the SDK's BUILTIN_TOOLS_ISOLATED constant; we
-    # compare with the constant rather than hardcoding so the SDK can
-    # rev the set without breaking our test.
-    assert tools == list(copilot.BUILTIN_TOOLS_ISOLATED), (
-        f"available_tools must equal BUILTIN_TOOLS_ISOLATED "
+    assert tools[: len(copilot.BUILTIN_TOOLS_ISOLATED)] == list(copilot.BUILTIN_TOOLS_ISOLATED), (
+        f"available_tools must start with BUILTIN_TOOLS_ISOLATED "
         f"({copilot.BUILTIN_TOOLS_ISOLATED!r}); got {tools!r}"
     )
-    # Belt + suspenders: file-writing tools must NOT be in the set.
-    for forbidden in ("write_file", "edit_file", "bash", "create_file"):
+    for allowed in ("view", "glob", "grep"):
+        assert allowed in tools, f"{allowed!r} missing from available_tools; got {tools!r}"
+    for forbidden in ("write_file", "edit_file", "bash", "create_file", "apply_patch"):
         assert forbidden not in tools, (
             f"{forbidden!r} present in available_tools — would let the "
             f"model write the host worktree mid-session"
         )
 
-    # Run #30 leaf 9 follow-up: also pin excluded_tools=ToolSet(builtin:*).
-    # available_tools is insufficient alone because the SDK forces
-    # `toolFilterPrecedence: "excluded"` — see SDK client.py around
-    # lines 1802/2369 — which makes available_tools a weak hint rather
-    # than an authoritative whitelist. Without an excluded_tools cap,
-    # the model could call powershell/apply_patch/task/view/create
-    # despite none of them appearing in BUILTIN_TOOLS_ISOLATED.
     assert "excluded_tools" in recorded, (
         "CopilotProvider.create_session must ALSO pass excluded_tools — "
-        "without it the SDK's forced 'excluded'-precedence policy lets "
-        "the model call powershell/apply_patch/task even though they "
-        "aren't in available_tools (run-#30 leaf 9: 30 .cs files "
-        "written to the worktree via powershell despite "
-        "available_tools=BUILTIN_TOOLS_ISOLATED)."
+        "the SDK needs an explicit deny-list for shell/write builtins."
     )
     excluded = recorded["excluded_tools"]
-    # The shape must be a ToolSet with builtin:* — the most aggressive
-    # cap available. The coder agent never needs an SDK-side tool —
-    # its CoderOutput JSON IS the work product; apply_changes (a
-    # requiem verb, not an SDK tool) does the file writes.
     excluded_list = excluded.to_list() if hasattr(excluded, "to_list") else list(excluded)
-    assert "builtin:*" in excluded_list, (
-        f"excluded_tools must cap ALL builtin tools via 'builtin:*'; "
-        f"got {excluded_list!r}"
-    )
+    for blocked in ("builtin:bash", "builtin:apply_patch", "builtin:write_file"):
+        assert blocked in excluded_list, (
+            f"{blocked!r} must be in excluded_tools; got {excluded_list!r}"
+        )
 
 
 # ---- model bump + reasoning knobs (run-#27 follow-up) -----------------
 
 
 def test_default_copilot_model_is_sonnet_46():
-    """Pin the default model to ``claude-sonnet-4.6``.
+    """Pin the default model to ``claude-sonnet-5``.
 
     Was ``4.5`` until 2026-06-24. Run #27 against AB#62759077 surfaced
     a hard problem on 4.5: 600s sessions that emitted only 365 output
@@ -1005,7 +1078,7 @@ def test_default_copilot_model_is_sonnet_46():
     ``max``) and has 5× the prompt window (936K vs 168K), so it's
     strictly better for the requiem coder agent."""
     from requiem.providers.copilot import DEFAULT_COPILOT_MODEL
-    assert DEFAULT_COPILOT_MODEL == "claude-sonnet-4.6"
+    assert DEFAULT_COPILOT_MODEL == "claude-sonnet-5"
 
 
 def test_reasoning_effort_omitted_from_create_session_when_unset():

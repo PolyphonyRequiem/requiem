@@ -354,11 +354,12 @@ def test_pr_complete_puts_merge_method_and_returns_result() -> None:
         strategy="squash",
         expected_head="impl/700-1",
         expected_base="feature/700",
+        expected_head_sha="validated-head-sha",
     ))
     assert seen == {
         "endpoint": "repos/acme/widgets/pulls/42/merge",
         "method": "PUT",
-        "body": {"merge_method": "squash"},
+        "body": {"merge_method": "squash", "sha": "validated-head-sha"},
     }
     assert result.number == 42
     assert result.merged is True

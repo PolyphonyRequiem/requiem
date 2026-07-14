@@ -57,7 +57,7 @@ def _ok_tool_use_response(input_payload: dict[str, Any]) -> dict[str, Any]:
         "id": "msg_test_01",
         "type": "message",
         "role": "assistant",
-        "model": "claude-sonnet-4.6",
+        "model": "claude-sonnet-5",
         "content": [
             {
                 "type": "tool_use",
@@ -77,7 +77,7 @@ def _ok_text_response(text: str) -> dict[str, Any]:
         "id": "msg_test_02",
         "type": "message",
         "role": "assistant",
-        "model": "claude-sonnet-4.6",
+        "model": "claude-sonnet-5",
         "content": [{"type": "text", "text": text}],
         "stop_reason": "end_turn",
         "stop_sequence": None,
@@ -98,7 +98,7 @@ async def test_happy_path_with_schema_returns_success():
     assert out.value["agent"] == "t"
     [receipt] = out.value["receipts"]
     assert receipt["kind"] == "llm_call"
-    assert receipt["model"] == "claude-sonnet-4.6"
+    assert receipt["model"] == "claude-sonnet-5"
     assert receipt["input_tokens"] == 11
     assert receipt["output_tokens"] == 22
     assert receipt["request_id"] == "msg_test_01"
@@ -137,7 +137,7 @@ async def test_happy_path_without_schema_returns_success_text():
 
     assert isinstance(out, Success)
     assert out.value["parsed"] == {"text": "ok"}
-    assert out.value["receipts"][0]["model"] == "claude-sonnet-4.6"
+    assert out.value["receipts"][0]["model"] == "claude-sonnet-5"
 
 
 # ---- BadOutput paths (NOT retried) -------------------------------------

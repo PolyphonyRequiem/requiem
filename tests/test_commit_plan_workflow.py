@@ -6,11 +6,11 @@ Covers the rubber-duck-hardened design:
 * real seed creates the full recursive tree with correct parent linkage + id_map
 * idempotent re-run (marker match) creates nothing
 * partial-seed recovery: a failed run leaves markers; re-run reuses + finishes
-* marker survives a human rename of a seeded item
+* lineage reuse fails closed on a human rename
 * pinned proposals are reused, never re-created
 * artifact guards: missing / unsupported schema / not-approved / misaligned /
   oversized → end_failed
-* ambiguous existing child (dup title, no marker) → human gate
+* any unpinned existing title/type match → human gate
 * unclassified twig error → human gate (Ravel L-1)
 * end-to-end from a REAL planning artifact (validates Part-1 enrichment at depth)
 """
@@ -23,6 +23,7 @@ import pytest
 
 from requiem.clients.twig import TwigItem, TwigUnknownError
 from requiem.kernel import Completed
+from requiem.plan_lineage import format_commit_marker
 from requiem.workflows import commit_plan as cp
 from requiem.workflows.commit_plan import FakeTwigClient, build_engine
 from requiem.workflows.planning import completed_from_log
@@ -127,6 +128,34 @@ async def test_real_seed_creates_full_tree_with_linkage_and_idmap(log_dir: Path)
     assert manifest["dry_run"] is False
 
 
+async def test_seed_uses_the_exact_tree_validated_by_load_tree(
+    log_dir: Path,
+    monkeypatch,
+):
+    path = _write_tree(log_dir)
+    original_validate = cp._validate_node
+
+    def validate_then_replace_file(*args, **kwargs):
+        total = original_validate(*args, **kwargs)
+        replacement = cp._demo_tree(ROOT)
+        replacement["proposals"][0]["title"] = "Unvalidated replacement"
+        path.write_text(json.dumps(replacement), encoding="utf-8")
+        return total
+
+    monkeypatch.setattr(cp, "_validate_node", validate_then_replace_file)
+    twig = _twig_with_root()
+    engine = build_engine(
+        log_dir, plan_tree_path=path, dry_run=False, twig=twig
+    )
+
+    result = await engine.run("validated-tree")
+
+    assert isinstance(result, Completed)
+    assert result.final_node == "end_success"
+    assert twig.created_titles[0] == "Data layer"
+    assert "Unvalidated replacement" not in twig.created_titles
+
+
 async def test_idempotent_rerun_creates_nothing(log_dir: Path):
     tree = _write_tree(log_dir)
     twig = _twig_with_root()
@@ -175,7 +204,48 @@ async def test_partial_seed_then_recovery(log_dir: Path):
     assert len([it for it in twig.items.values() if it.id != ROOT]) == 4  # no dups
 
 
-async def test_marker_survives_human_rename(log_dir: Path):
+async def test_timeout_like_twig_error_retries_seed_tree(log_dir: Path):
+    class OneShotTimeoutTwig(FakeTwigClient):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self._timed_out_titles: set[str] = set()
+
+        async def create_child_async(
+            self,
+            *,
+            parent_id: int,
+            title: str,
+            work_item_type: str,
+            area_path: str | None = None,
+            description: str | None = None,
+        ) -> TwigItem:
+            if title == "Data layer" and title not in self._timed_out_titles:
+                self._timed_out_titles.add(title)
+                raise TwigUnknownError("timed out", exit_code=-1, stderr="")
+            return await super().create_child_async(
+                parent_id=parent_id,
+                title=title,
+                work_item_type=work_item_type,
+                area_path=area_path,
+                description=description,
+            )
+
+    tree = _write_tree(log_dir)
+    twig = OneShotTimeoutTwig(items={ROOT: TwigItem(
+        id=ROOT, title="Demo root", state="Active",
+        area_path="Area", work_item_type="User Story", parent_id=None, raw={},
+    )})
+    engine = build_engine(log_dir, plan_tree_path=tree, dry_run=False, twig=twig)
+    result = await engine.run("timeout-retry")
+    assert isinstance(result, Completed)
+    assert result.final_node == "end_success"
+    seed = _seed_value(engine, "timeout-retry")
+    assert seed["created_count"] == 4
+    assert seed["reused_count"] == 0
+    assert twig.created_titles == ["Data layer", "Define schema", "Write migration", "API layer"]
+
+
+async def test_lineage_does_not_override_human_rename(log_dir: Path):
     tree = _write_tree(log_dir)
     twig = _twig_with_root()
     e1 = build_engine(log_dir, plan_tree_path=tree, dry_run=False, twig=twig)
@@ -191,12 +261,55 @@ async def test_marker_survives_human_rename(log_dir: Path):
         parent_id=old.parent_id, raw=old.raw,  # raw still carries the marker
     )
 
-    e2 = build_engine(log_dir, plan_tree_path=tree, dry_run=False, twig=twig)
-    await e2.run("reseed")
-    second = _seed_value(e2, "reseed")
-    # Marker match ignores the title change → reused, not duplicated.
-    assert second["created_count"] == 0
-    assert second["id_map"]["424201"] == data_layer_real
+    e2 = build_engine(
+        log_dir,
+        plan_tree_path=tree,
+        dry_run=False,
+        twig=twig,
+        gate_handler=_abort,
+    )
+    result = await e2.run("reseed")
+
+    assert result.final_node == "end_human"
+    assert twig.created_titles == [
+        "Data layer", "Define schema", "Write migration", "API layer",
+    ]
+
+
+async def test_create_fails_closed_when_ado_drops_durable_lineage(
+    log_dir: Path,
+):
+    class SanitizingTwig(FakeTwigClient):
+        async def create_child_async(self, **kwargs) -> TwigItem:
+            created = await super().create_child_async(**kwargs)
+            sanitized = TwigItem(
+                id=created.id,
+                title=created.title,
+                state=created.state,
+                area_path=created.area_path,
+                work_item_type=created.work_item_type,
+                parent_id=created.parent_id,
+                raw={"description": kwargs.get("description", "").split(
+                    "Requiem-Lineage-v1:", 1
+                )[0]},
+            )
+            self.items[created.id] = sanitized
+            return sanitized
+
+    tree = _write_tree(log_dir)
+    twig = SanitizingTwig(items=_twig_with_root().items)
+    engine = build_engine(
+        log_dir,
+        plan_tree_path=tree,
+        dry_run=False,
+        twig=twig,
+        gate_handler=_abort,
+    )
+
+    result = await engine.run("sanitized")
+
+    assert result.final_node == "end_human"
+    assert twig.created_titles == ["Data layer"]
 
 
 async def test_pinned_proposal_is_reused_not_created(log_dir: Path):
@@ -222,7 +335,8 @@ async def test_pinned_proposal_is_reused_not_created(log_dir: Path):
     twig = _twig_with_root()
     twig.items[pinned_id] = TwigItem(
         id=pinned_id, title="Existing", state="Active", area_path="Area",
-        work_item_type="Task", parent_id=ROOT, raw={},
+        work_item_type="Task", parent_id=ROOT,
+        raw={"description": format_commit_marker(f"plan-{ROOT}-prior", pinned_id)},
     )
     engine = build_engine(log_dir, plan_tree_path=path, dry_run=False, twig=twig)
     result = await engine.run("pin")
@@ -231,6 +345,123 @@ async def test_pinned_proposal_is_reused_not_created(log_dir: Path):
     assert seed["created_count"] == 1                 # only "Fresh"
     assert seed["id_map"][str(pinned_id)] == pinned_id
     assert twig.created_titles == ["Fresh"]
+
+
+async def test_duplicate_pinned_ownership_is_rejected_before_seed(log_dir: Path):
+    pinned_id = 7777
+    proposal = {
+        "title": "Existing",
+        "description": "d",
+        "work_item_type": "Task",
+        "item_id": pinned_id,
+    }
+    child = {
+        "item_id": pinned_id,
+        "plan_id": "p",
+        "decomposable": False,
+        "summary": "",
+        "review_iterations": 1,
+        "final_verdict": "approved",
+        "proposals": [],
+        "children": [],
+    }
+    tree = {
+        "schema_version": 2,
+        "plan_id": "plan-pin",
+        "item_id": ROOT,
+        "decomposable": True,
+        "verdict": "approved",
+        "proposals": [proposal, dict(proposal)],
+        "children": [child, dict(child)],
+    }
+    path = _write_tree(log_dir, tree, name="duplicate-pin")
+    twig = _twig_with_root()
+    twig.items[pinned_id] = TwigItem(
+        id=pinned_id,
+        title="Existing",
+        state="Active",
+        area_path="Area",
+        work_item_type="Task",
+        parent_id=ROOT,
+        raw={"description": format_commit_marker(f"plan-{ROOT}-prior", pinned_id)},
+    )
+
+    result = await build_engine(
+        log_dir, plan_tree_path=path, dry_run=False, twig=twig
+    ).run("duplicate-pin")
+
+    assert result.final_node == "end_failed"
+    assert twig.created_titles == []
+
+
+async def test_pinned_item_remains_a_conflict_for_later_unpinned_match(
+    log_dir: Path,
+):
+    pinned_id = 7777
+    tree = {
+        "schema_version": 2,
+        "plan_id": "plan-pin",
+        "item_id": ROOT,
+        "decomposable": True,
+        "verdict": "approved",
+        "proposals": [
+            {
+                "title": "Existing",
+                "description": "d",
+                "work_item_type": "Task",
+                "item_id": pinned_id,
+            },
+            {
+                "title": "Existing",
+                "description": "d",
+                "work_item_type": "Task",
+            },
+        ],
+        "children": [
+            {
+                "item_id": pinned_id,
+                "plan_id": "p",
+                "decomposable": False,
+                "summary": "",
+                "review_iterations": 1,
+                "final_verdict": "approved",
+                "proposals": [],
+                "children": [],
+            },
+            {
+                "item_id": ROOT * 100 + 2,
+                "plan_id": "p",
+                "decomposable": False,
+                "summary": "",
+                "review_iterations": 1,
+                "final_verdict": "approved",
+                "proposals": [],
+                "children": [],
+            },
+        ],
+    }
+    path = _write_tree(log_dir, tree, name="pin-then-unpinned")
+    twig = _twig_with_root()
+    twig.items[pinned_id] = TwigItem(
+        id=pinned_id,
+        title="Existing",
+        state="Active",
+        area_path="Area",
+        work_item_type="Task",
+        parent_id=ROOT,
+        raw={"description": format_commit_marker(f"plan-{ROOT}-prior", pinned_id)},
+    )
+
+    result = await build_engine(
+        log_dir,
+        plan_tree_path=path,
+        dry_run=False,
+        twig=twig,
+        gate_handler=_abort,
+    ).run("pin-then-unpinned")
+
+    assert result.final_node == "end_human"
+    assert twig.created_titles == []
 
 
 # ---- artifact guards (load_tree) ---------------------------------------
@@ -276,24 +507,30 @@ async def test_policy_forced_leaf_child_passes_validation(log_dir: Path):
     )
 
 
-async def test_needs_human_decomposable_child_passes_validation(log_dir: Path):
-    """ADR-0027 regression pin: when --on-escalate=accept-last fires on a
-    decomposable child, the planning workflow ships the last planner output
-    as final_verdict='needs_human'. The child carries the planner's
-    proposals (e.g. 5 grandchildren the reviewer kept rejecting) but ZERO
-    committed children — the workflow short-circuited before recursing.
+async def test_needs_human_root_verdict_is_rejected_before_seed(log_dir: Path):
+    tree = {
+        "schema_version": 2, "plan_id": "plan-root-nh", "item_id": ROOT,
+        "decomposable": True, "verdict": "needs_human",
+        "proposals": [
+            {"title": "Alpha", "description": "d", "work_item_type": "Task"},
+            {"title": "Beta", "description": "d", "work_item_type": "Task"},
+        ],
+        "children": [],
+    }
+    path = _write_tree(log_dir, tree, name="root-nh")
+    twig = _twig_with_root()
+    engine = build_engine(
+        log_dir, plan_tree_path=path, dry_run=False, twig=twig
+    )
+    result = await engine.run("root-nh")
+    assert isinstance(result, Completed)
+    assert result.final_node == "end_failed"
+    assert twig.created_titles == []
 
-    commit_plan's load_tree validator must:
-      1. Accept 'needs_human' as terminal (don't reject as 'not approved')
-      2. NOT descend into a needs_human child (its `children: []` is
-         intentional, not 'missing 5 proposals'-misalignment)
 
-    This is exactly what broke SKU-fallback dogfood run 21 (2026-06-21):
-    one of the five Deliverables had reviewer escalate, accept-last fired,
-    children remained empty, and load_tree errored with both
-    \"final_verdict 'needs_human' is not approved\" AND
-    \"0 children != 5 proposals — artifact misaligned\".
-    """
+async def test_needs_human_decomposable_child_is_rejected_before_seed(
+    log_dir: Path,
+):
     tree = {
         "schema_version": 2, "plan_id": "plan-nh", "item_id": ROOT,
         "decomposable": True, "verdict": "approved",
@@ -343,17 +580,14 @@ async def test_needs_human_decomposable_child_passes_validation(log_dir: Path):
         ],
     }
     path = _write_tree(log_dir, tree, name="nh")
+    twig = _twig_with_root()
     engine = build_engine(
-        log_dir, plan_tree_path=path, dry_run=False, twig=_twig_with_root()
+        log_dir, plan_tree_path=path, dry_run=False, twig=twig
     )
     result = await engine.run("nh")
     assert isinstance(result, Completed)
-    # The whole point: don't fail at load_tree validation.
-    assert result.final_node != "end_failed", (
-        f"needs_human decomposable child must be accepted by load_tree "
-        f"AND its empty children must NOT be flagged as misaligned; "
-        f"final={result.final_node}"
-    )
+    assert result.final_node == "end_failed"
+    assert twig.created_titles == []
 
 
 async def test_missing_artifact_routes_to_end_failed(log_dir: Path):
@@ -373,13 +607,7 @@ async def test_unsupported_schema_routes_to_end_failed(log_dir: Path):
 
 
 async def test_unknown_verdict_routes_to_end_failed(log_dir: Path):
-    """commit_plan accepts `verdict in {"approved", "needs_human"}` —
-    the `needs_human` verdict shipped by ``--on-escalate accept-last``
-    must NOT bounce here (the escalation policy already gated the
-    workflow at the planning phase; commit_plan trusts that decision).
-
-    Any OTHER verdict (e.g. ``"rejected"``, ``"abort"``, ``"unknown"``)
-    is still a hard fail at load_tree."""
+    """Any verdict other than approved is a hard fail at load_tree."""
     tree = cp._demo_tree(ROOT)
     tree["verdict"] = "rejected"
     path = _write_tree(log_dir, tree, name="rejected")
@@ -388,20 +616,17 @@ async def test_unknown_verdict_routes_to_end_failed(log_dir: Path):
     assert result.final_node == "end_failed"
 
 
-async def test_needs_human_verdict_proceeds_through_commit(log_dir: Path):
-    """ADR-0027 (accept-last): a tree with ``verdict=needs_human`` is
-    a valid commit_plan input. The operator's escalation policy already
-    decided to ship; commit_plan honors that and proceeds to seed.
-
-    This is the load-bearing path for the `--on-escalate accept-last`
-    dogfood: the planner's last-good plan rides through with a
-    needs_human verdict and commit_plan seeds ADO children as normal."""
+async def test_needs_human_verdict_never_proceeds_through_commit(log_dir: Path):
     tree = cp._demo_tree(ROOT)
     tree["verdict"] = "needs_human"
     path = _write_tree(log_dir, tree, name="nh")
-    engine = build_engine(log_dir, plan_tree_path=path, dry_run=False, twig=_twig_with_root())
+    twig = _twig_with_root()
+    engine = build_engine(
+        log_dir, plan_tree_path=path, dry_run=False, twig=twig
+    )
     result = await engine.run("nh")
-    assert result.final_node == "end_success"
+    assert result.final_node == "end_failed"
+    assert twig.created_titles == []
 
 
 async def test_misaligned_tree_fails_validation(log_dir: Path):
@@ -448,6 +673,35 @@ async def test_ambiguous_existing_child_routes_to_human(log_dir: Path):
     result = await engine.run("ambig")
     assert isinstance(result, Completed)
     assert result.final_node == "end_human"
+
+
+async def test_single_unpinned_existing_child_routes_to_human(log_dir: Path):
+    tree = _write_tree(log_dir)
+    twig = _twig_with_root()
+    twig.items[5001] = TwigItem(
+        id=5001,
+        title="Data layer",
+        state="New",
+        area_path="Area",
+        work_item_type="Task",
+        parent_id=ROOT,
+        raw={
+            "description": format_commit_marker(
+                f"plan-{ROOT}-prior", ROOT * 100 + 1
+            )
+        },
+    )
+    engine = build_engine(
+        log_dir,
+        plan_tree_path=tree,
+        dry_run=False,
+        twig=twig,
+        gate_handler=_abort,
+    )
+    result = await engine.run("unpinned-existing")
+    assert isinstance(result, Completed)
+    assert result.final_node == "end_human"
+    assert twig.created_titles == []
 
 
 async def test_unclassified_twig_error_routes_to_human(log_dir: Path):
@@ -500,17 +754,22 @@ async def test_seeds_a_real_planning_artifact(log_dir: Path):
         "plan_reviewer": [{"verdict": "approve", "feedback": "ok"}] * 5,
     })
 
-    # Pre-register the synthesised ids the recursion fetches.
+    # Recursive planning carries parent proposals directly; only the real root
+    # exists in ADO before commit creates the synthetic descendants.
     from requiem.workflows.planning import FakeTwigClient as PlanFakeTwig
-    plan_twig = PlanFakeTwig(items={})
-    for iid, title, parent in [
-        (R, "Root", None), (A, "Part A", R), (B, "Part B", R),
-        (A1, "A-one", A), (A2, "A-two", A),
-    ]:
-        plan_twig.items[iid] = TwigItem(
-            id=iid, title=title, state="New", area_path="Area",
-            work_item_type="Task", parent_id=parent, raw={},
-        )
+    plan_twig = PlanFakeTwig(
+        items={
+            R: TwigItem(
+                id=R,
+                title="Root",
+                state="New",
+                area_path="Area",
+                work_item_type="Task",
+                parent_id=None,
+                raw={},
+            )
+        }
+    )
 
     pe = plan_engine(log_dir, item_id=R, twig=plan_twig, provider=provider)
     plan_result = await pe.run("planrun")

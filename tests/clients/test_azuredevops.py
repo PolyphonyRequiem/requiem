@@ -397,17 +397,44 @@ def test_pr_mergeability_maps_succeeded_to_green() -> None:
             "sourceRefName": "refs/heads/impl/700-1",
         },
         {"value": [{"name": "refs/heads/impl/700-1", "objectId": "headsha42"}]},
-        {"value": [{"state": "succeeded"}]},
+        {
+            "value": [{
+                "state": "succeeded",
+                "context": {"name": "requiem/local-tests", "genre": "requiem"},
+            }],
+        },
     ])
     report = asyncio.run(client.pr_mergeability("Contoso/P/repo", 42))
     assert calls[0]["url"].endswith("/pullrequests/42")
     assert calls[1]["url"].endswith("/refs")
     assert calls[2]["url"].endswith("/commits/headsha42/statuses")
+    assert calls[2]["params"]["latestOnly"] is True
     assert report.mergeable is True
     assert report.mergeable_state == "succeeded"
     assert report.checks_state == "success"
+    assert report.head_sha == "headsha42"
     assert report.conflicts is False
     assert report.policies_satisfied is True
+
+
+def test_pr_mergeability_ignores_unrelated_success_status() -> None:
+    client, _ = _stub_client([
+        {
+            "mergeStatus": "succeeded",
+            "sourceRefName": "refs/heads/impl/700-1",
+        },
+        {"value": [{"name": "refs/heads/impl/700-1", "objectId": "headsha42"}]},
+        {
+            "value": [{
+                "state": "succeeded",
+                "context": {"name": "unrelated-ci", "genre": "continuous-integration"},
+            }],
+        },
+    ])
+
+    report = asyncio.run(client.pr_mergeability("Contoso/P/repo", 42))
+
+    assert report.checks_state == "unknown"
 
 
 def test_pr_mergeability_with_no_commit_statuses_reports_unknown() -> None:
@@ -494,6 +521,7 @@ def test_pr_complete_patches_completion_options_with_strategy() -> None:
             "targetRefName": "refs/heads/feature/700",
             "lastMergeSourceCommit": {"commitId": "head-sha-700-1"},
         },
+        {"value": [{"objectId": "head-sha-700-1"}]},
         {
             "pullRequestId": 42,
             "status": "completed",
@@ -506,10 +534,11 @@ def test_pr_complete_patches_completion_options_with_strategy() -> None:
         strategy="squash",
         expected_head="impl/700-1",
         expected_base="feature/700",
+        expected_head_sha="head-sha-700-1",
     ))
-    assert calls[1]["method"] == "PATCH"
-    assert calls[1]["url"].endswith("/pullrequests/42")
-    assert calls[1]["body"] == {
+    assert calls[2]["method"] == "PATCH"
+    assert calls[2]["url"].endswith("/pullrequests/42")
+    assert calls[2]["body"] == {
         "status": "completed",
         "completionOptions": {"mergeStrategy": "squash"},
         "lastMergeSourceCommit": {"commitId": "head-sha-700-1"},
@@ -518,6 +547,30 @@ def test_pr_complete_patches_completion_options_with_strategy() -> None:
     assert result.merged is True
     assert result.merge_sha == "merge-ado-42"
     assert result.strategy == "squash"
+
+
+def test_pr_complete_refuses_validated_head_sha_mismatch() -> None:
+    client, calls = _stub_client([
+        {
+            "status": "active",
+            "sourceRefName": "refs/heads/impl/700-1",
+            "targetRefName": "refs/heads/feature/700",
+            "lastMergeSourceCommit": {"commitId": "new-head-sha"},
+        },
+        {"value": [{"objectId": "new-head-sha"}]},
+    ])
+
+    with pytest.raises(AdoUnknownError):
+        asyncio.run(client.pr_complete(
+            "Contoso/P/repo",
+            42,
+            strategy="squash",
+            expected_head="impl/700-1",
+            expected_base="feature/700",
+            expected_head_sha="validated-head-sha",
+        ))
+
+    assert [call["method"] for call in calls] == ["GET", "GET"]
 
 
 def test_pr_complete_keeps_queued_async_completion_unconfirmed() -> None:

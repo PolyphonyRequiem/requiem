@@ -17,11 +17,16 @@ Pipeline
                                        set, else legacy feature/<item_id>; idempotent)
       → invoke_coder                (agent  · CoderOutput)
           ├─ success           → apply_changes
-          ├─ bad_output        → end_needs_human (surrender)
+      ├─ bad_output        → invoke_coder_retry
           └─ permanent_failure → end_failed
-      → apply_changes               (script · fs.write_text per FileChange)
+  → invoke_coder_retry          (agent  · CoderOutput, one retry after
+                                   malformed prior output)
+      ├─ success           → apply_changes
+      ├─ bad_output        → end_needs_human (surrender)
+      └─ permanent_failure → end_needs_human
+  → apply_changes               (script · fs.write_text per FileChange)
           ├─ success                       → run_tests
-          ├─ permanent_failure:no_changes  → end_failed
+          ├─ permanent_failure:no_changes  → end_needs_human (surrender)
           └─ permanent_failure:invalid_path→ end_needs_human (surrender)
       → run_tests                   (script · subprocess: test_command)
           ├─ success                       → commit_changes
@@ -76,6 +81,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import subprocess
 import sys
 import time
@@ -91,6 +97,7 @@ from requiem import branch_model
 from requiem.clients.fs import FilesystemClient, FsClientError, FsGitError
 from requiem.clients.gh import GhClient, GhClientError
 from requiem.clients.azuredevops import AdoClientError
+from requiem.clients.repo import REQUIRED_TEST_STATUS_CONTEXT
 from requiem.clients.twig import (
     TwigClient,
     TwigClientError,
@@ -291,29 +298,63 @@ def _validate_relative_path(p: str) -> Path | None:
 # ---- test-command auto-detection -------------------------------------
 
 
-def detect_test_command(repo_path: Path) -> str | None:
+@dataclass(frozen=True, slots=True)
+class DetectedTestCommand:
+    """A discovered command plus the working directory to run it in."""
+
+    command: str
+    cwd: Path | None = None
+
+
+def detect_test_command(repo_path: Path) -> DetectedTestCommand | None:
     """Best-effort guess at the project's test command.
 
     Detection rules (first match wins):
 
-    * ``pyproject.toml`` or ``setup.py`` or ``setup.cfg`` → ``"pytest -q"``
-    * ``package.json``                                    → ``"npm test"``
-    * any ``*.csproj`` or ``*.sln`` at the root           → ``"dotnet test --no-build"``
+    * ``pyproject.toml`` / ``setup.py`` / ``setup.cfg`` → ``pytest -q``
+    * ``package.json`` → ``npm test``
+    * any ``*.csproj`` / ``*.sln`` → ``dotnet test --no-build``
 
-    Returns ``None`` if nothing matched — the caller should then refuse
-    to run, since running an unguessed test surface "best-effortly"
-    would violate INV-NO-CORRUPT-FORWARD.
+    The search walks the repo tree (not just the root) so nested project
+    layouts still get a usable local test command. Returns ``None`` if
+    nothing matched — the caller should then refuse to run, since running
+    an unguessed test surface "best-effortly" would violate
+    INV-NO-CORRUPT-FORWARD.
     """
-    if (repo_path / "pyproject.toml").exists():
-        return "pytest -q"
-    if (repo_path / "setup.py").exists():
-        return "pytest -q"
-    if (repo_path / "setup.cfg").exists():
-        return "pytest -q"
-    if (repo_path / "package.json").exists():
-        return "npm test"
-    if any(repo_path.glob("*.csproj")) or any(repo_path.glob("*.sln")):
-        return "dotnet test --no-build"
+    repo_path = repo_path.resolve()
+    if not repo_path.exists():
+        return None
+
+    excluded_dirs = {
+        ".git",
+        ".hg",
+        ".svn",
+        ".idea",
+        ".vscode",
+        ".venv",
+        "venv",
+        "node_modules",
+        "dist",
+        "build",
+        "bin",
+        "obj",
+        ".tox",
+        ".pytest_cache",
+        "__pycache__",
+    }
+
+    for dirpath, dirnames, filenames in os.walk(repo_path):
+        current = Path(dirpath).resolve()
+        dirnames[:] = sorted(
+            d for d in dirnames if d not in excluded_dirs and not (current / d).resolve().is_symlink()
+        )
+        for filename in sorted(filenames):
+            if filename == "pyproject.toml" or filename == "setup.py" or filename == "setup.cfg":
+                return DetectedTestCommand(command="pytest -q", cwd=current)
+            if filename == "package.json":
+                return DetectedTestCommand(command="npm test", cwd=current)
+            if filename.endswith(".csproj") or filename.endswith(".sln"):
+                return DetectedTestCommand(command="dotnet test --no-build", cwd=current)
     return None
 
 
@@ -370,7 +411,7 @@ class ImplementationInputs:
     None`` on every agent call and falls through to the provider's
     default model — silently ignoring any operator-supplied
     ``models:`` block in process.yaml. Run #28 against AB#62759077
-    caught this gap: ``models.implementer: claude-sonnet-4.6`` in the
+    caught this gap: ``models.implementer: claude-sonnet-5`` in the
     operator yaml had zero effect on the coder agent because
     ``fanout._dispatch_in_process`` built ``ImplementationInputs``
     without the field, and ``implementation.build_engine`` constructed
@@ -817,6 +858,45 @@ def build_verb_registry(
             )
         return header + tail_instruction
 
+    @verbs.register("coder_retry_prompt")
+    def _coder_retry_prompt(ctx):
+        plan = ctx.completed["fetch_plan"]["value"]
+        prior = ctx.completed.get("invoke_coder", {})
+        prior_kind = prior.get("kind", "unknown")
+        prior_error = prior.get("error_kind", "")
+        prior_errors = prior.get("validation_errors") or ()
+        prior_output = prior.get("raw_output", "")
+        from requiem.context_pack import read_agents_md
+        pack_text = read_agents_md(inputs.repo_path)
+        header = (
+            f"# Work item AB#{plan['item_id']}: {plan['title']}\n\n"
+            f"## Plan\n\n{plan['plan_text']}\n\n"
+            f"## Repository\n\n"
+            f"Local path: {plan['repo_path']}\n"
+            f"GitHub: {plan['repo']}\n\n"
+        )
+        retry_note = (
+            "Your previous response failed structured validation. "
+            f"Outcome: {prior_kind}. Error: {prior_error or '(none)'}\n"
+            f"Validation errors: {', '.join(prior_errors) if prior_errors else '(none)'}\n"
+            f"Raw output:\n{prior_output or '(empty)'}\n\n"
+            "Please return a corrected CoderOutput now."
+        )
+        tail_instruction = (
+            "Return a CoderOutput with the minimal set of file_changes "
+            "that satisfies the plan."
+        )
+        if pack_text:
+            return (
+                header
+                + "## Curated context from Requiem\n\n"
+                + pack_text
+                + "\n\n"
+                + retry_note
+                + tail_instruction
+            )
+        return header + retry_note + tail_instruction
+
     @verbs.register("coder_revision_prompt")
     def _coder_revision_prompt(ctx):
         plan = ctx.completed["fetch_plan"]["value"]
@@ -838,16 +918,16 @@ def build_verb_registry(
 
     def _apply_changes_impl(
         ctx,
-        coder_node: str,
+        coder_nodes: tuple[str, ...],
         *,
         dry_run_passthrough: bool,
     ) -> Outcome:
         if inputs.dry_run and dry_run_passthrough:
-            parsed = (
-                ctx.completed.get(coder_node, {})
-                .get("value", {})
-                .get("parsed", {})
-            )
+            parsed = {}
+            for node in coder_nodes:
+                parsed = ctx.completed.get(node, {}).get("value", {}).get("parsed", {})
+                if parsed:
+                    break
             return Success(value={
                 "applied_paths": [],
                 "dry_run": True,
@@ -856,12 +936,22 @@ def build_verb_registry(
         fs = _require_fs(ctx)
         if isinstance(fs, PermanentFailure):
             return fs
-        parsed = ctx.completed[coder_node]["value"]["parsed"]
+        parsed = None
+        for node in coder_nodes:
+            value = ctx.completed.get(node, {}).get("value", {})
+            if value.get("parsed") is not None:
+                parsed = value["parsed"]
+                break
+        if parsed is None:
+            return PermanentFailure(
+                error_kind="coder.apply_failed",
+                message=f"no parsed coder output available from {coder_nodes}",
+            )
         raw_changes = parsed.get("file_changes") or []
         if not raw_changes:
             return PermanentFailure(
                 error_kind="coder.no_changes",
-                message=f"coder agent returned 0 file_changes ({coder_node})",
+                message=f"coder agent returned 0 file_changes ({coder_nodes})",
             )
         applied: list[str] = []
         for entry in raw_changes:
@@ -922,13 +1012,13 @@ def build_verb_registry(
     @verbs.register("apply_changes")
     def _apply_changes(ctx):
         return _apply_changes_impl(
-            ctx, "invoke_coder", dry_run_passthrough=True
+            ctx, ("invoke_coder_retry", "invoke_coder"), dry_run_passthrough=True
         )
 
     @verbs.register("apply_changes_revision")
     def _apply_changes_revision(ctx):
         return _apply_changes_impl(
-            ctx, "invoke_coder_revision", dry_run_passthrough=False
+            ctx, ("invoke_coder_revision",), dry_run_passthrough=False
         )
 
     # ---- run_tests ----------------------------------------------------
@@ -940,8 +1030,12 @@ def build_verb_registry(
                 "summary": "(dry-run: tests not executed)",
                 "command": inputs.test_command or "(auto-detect skipped)",
             })
-        cmd = inputs.test_command or detect_test_command(inputs.repo_path)
-        if cmd is None:
+        detected = None
+        if inputs.test_command is not None:
+            detected = DetectedTestCommand(command=inputs.test_command, cwd=inputs.repo_path)
+        else:
+            detected = detect_test_command(inputs.repo_path)
+        if detected is None:
             return PermanentFailure(
                 error_kind="tests.undetected",
                 message=(
@@ -950,7 +1044,7 @@ def build_verb_registry(
                 ),
             )
         try:
-            result = test_runner(cmd, inputs.repo_path)
+            result = test_runner(detected.command, detected.cwd or inputs.repo_path)
         except Exception as e:  # noqa: BLE001
             # A crashed runner (binary not found, etc.) is distinct from
             # tests failing: it's "we don't know what the truth is".
@@ -963,15 +1057,15 @@ def build_verb_registry(
             return Success(value={
                 "passed": True,
                 "summary": result.summary,
-                "command": cmd,
+                "command": detected.command,
             })
         return PermanentFailure(
             error_kind="tests.failed",
-            message=f"tests failed via {cmd!r}",
+            message=f"tests failed via {detected.command!r}",
             details={
                 "passed": False,
                 "summary": result.summary,
-                "command": cmd,
+                "command": detected.command,
             },
         )
 
@@ -1091,7 +1185,7 @@ def build_verb_registry(
             await poster(
                 inputs.repo,
                 sha,
-                context="requiem/local-tests",
+                context=REQUIRED_TEST_STATUS_CONTEXT,
                 state="success",
                 description="requiem: local test run passed before push",
             )
@@ -1299,17 +1393,17 @@ def build_workflow() -> Workflow:
                 .edge("commit_context_pack", on="permanent_failure", to="end_failed")
             .agent("invoke_coder", agent="coder", prompt_verb="coder_prompt")
                 .edge("invoke_coder", on="success", to="apply_changes")
-                # Post-coder failures route through cleanup_worktree so a
-                # misbehaving SDK that wrote files to the worktree (run-#30
-                # leaf 9 shape) can't cascade `workspace.dirty` into every
-                # subsequent sequential leaf. The cleanup verb is
-                # best-effort and always returns Success → the disposition
-                # is preserved by which cleanup node we route to.
-                .edge("invoke_coder", on="bad_output", to="cleanup_for_needs_human")
+                # A malformed first response is usually recoverable with one
+                # follow-up nudge; retry once before surrendering to human.
+                .edge("invoke_coder", on="bad_output", to="invoke_coder_retry")
                 .edge("invoke_coder", on="permanent_failure", to="cleanup_for_failed")
+            .agent("invoke_coder_retry", agent="coder", prompt_verb="coder_retry_prompt")
+                .edge("invoke_coder_retry", on="success", to="apply_changes")
+                .edge("invoke_coder_retry", on="bad_output", to="cleanup_for_needs_human")
+                .edge("invoke_coder_retry", on="permanent_failure", to="cleanup_for_needs_human")
             .script("apply_changes", verb="apply_changes")
                 .edge("apply_changes", on="success", to="run_tests")
-                .edge("apply_changes", on="permanent_failure:coder.no_changes", to="cleanup_for_failed")
+                .edge("apply_changes", on="permanent_failure:coder.no_changes", to="cleanup_for_needs_human")
                 .edge("apply_changes", on="permanent_failure", to="cleanup_for_needs_human")
             .script("run_tests", verb="run_tests")
                 .edge("run_tests", on="success", to="commit_changes")
@@ -1374,6 +1468,7 @@ def build_workflow() -> Workflow:
                 "create_branch":           "Created feature branch",
                 "commit_context_pack":     "Committed Requiem context pack",
                 "invoke_coder":            "Coder agent (first pass)",
+                "invoke_coder_retry":      "Coder agent (retry)",
                 "apply_changes":           "Applied file changes",
                 "run_tests":               "Ran tests",
                 "invoke_coder_revision":   "Coder agent (revision)",

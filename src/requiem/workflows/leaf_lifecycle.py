@@ -18,12 +18,16 @@ reviewer and comment-addresser agents)::
       → check_tests_passed
       → prepare_review
       → review_leaf
+          └─ token exhaustion    → compacted tool-free review → dispatch_review
       → dispatch_review
-          ├─ approve             → prune_context_pack → check_can_merge → merge_pr
-          │                                                           ├─ confirmed → end_merged
-          │                                                           └─ unconfirmed → verify_merge_confirmation
+          ├─ approve             → prune_context_pack → check_can_merge
+          │                                           ├─ ready → merge_pr
+          │                                           │           ├─ confirmed → end_merged
+          │                                           │           └─ unconfirmed → verify_merge_confirmation
+          │                                           └─ indeterminate → verify_mergeability
           ├─ request_changes     → synthesize_comments → address_comments
-          │                        → apply_addressal → push_addressal
+          │                        → apply_addressal → run_addressal_tests
+          │                        → push_addressal
           │                        → check_progress → prepare_review
           ├─ inconsistent review → reconcile_review_inconsistency
           │                        ├─ deterministic → verify_review_reconciliation
@@ -37,22 +41,24 @@ Fail-closed rules:
   review. Self-reported handoff metadata is not used as a pass/fail signal.
 * The live PR head/base must stay exactly ``impl/<root>-<item>`` →
   ``feature/<root>``; any drift or protected-base target escalates.
-* Conflicts, failing/pending checks, unsatisfied policies, indeterminate
-  mergeability, repeated identical findings, and no-progress loops surrender to a
-  human — never an optimistic merge.
+* Conflicts, failing checks, unsatisfied policies, repeated identical findings,
+  and no-progress loops surrender to a human. Pending or freshly published test
+  evidence and indeterminate mergeability receive bounded authoritative rereads;
+  unresolved states still surrender rather than merge optimistically.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from requiem import branch_model
-from requiem.agent import LEAF_REVIEWER, FakeProvider
+from requiem.agent import AgentSpec, LEAF_REVIEWER, FakeProvider
 from requiem.clients.azuredevops import (
     AdoAuthError,
     AdoClientError,
@@ -73,6 +79,7 @@ from requiem.clients.gh import (
 )
 from requiem.clients.repo import (
     MergeCapableRepoPlatform,
+    REQUIRED_TEST_STATUS_CONTEXT,
     RepoCompleteResult,
     RepoMergeStrategy,
     RepoMergeabilityReport,
@@ -89,7 +96,16 @@ from requiem.outcomes import (
     Success,
 )
 from requiem.review_schemas import LeafReviewReport
+from requiem.token_budget import (
+    is_cumulative_input_exhaustion,
+    token_failure_evidence,
+)
 from requiem.toolbelt import Toolbelt
+from requiem.workflows.implementation import (
+    DetectedTestCommand,
+    _default_test_runner as default_test_runner,
+    detect_test_command,
+)
 from requiem.workflows.pr_lifecycle import (
     COMMENT_ADDRESSER,
     COMMENT_SYNTHESIZER,
@@ -100,6 +116,26 @@ MODULE = "requiem.workflows.leaf_lifecycle"
 LeafLifecycleState = Literal["merged", "already_merged", "needs_human", "failed"]
 MERGE_CONFIRMATION_RETRY_MAX = 2
 MERGE_CONFIRMATION_RETRY_DELAY_S = 1.0
+MERGEABILITY_RETRY_MAX = 2
+MERGEABILITY_RETRY_DELAY_S = 1.0
+TEST_STATUS_RETRY_MAX = 2
+TEST_STATUS_RETRY_DELAY_S = 1.0
+MAX_REVIEW_DIFF_CHARS = 30_000
+MAX_COMPACTED_REVIEW_DIFF_CHARS = 20_000
+
+COMPACTED_LEAF_REVIEWER = AgentSpec(
+    name="compacted_leaf_reviewer",
+    charter=(
+        "You are Requiem's bounded recovery reviewer. A prior reviewer session "
+        "exhausted its input-token budget. Review only the complete merge-bound "
+        "diff supplied in the prompt; repository inspection tools are disabled. "
+        "Return `approve`, `request_changes`, or `needs_human` using the same "
+        "safety standard as the normal leaf reviewer."
+    ),
+    response_model=LeafReviewReport,
+    role="reviewer",
+    model_options={"disable_repo_tools": True},
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +148,7 @@ class LeafLifecycleInputs:
     default_branch: str
     max_iterations: int = 3
     merge_strategy: RepoMergeStrategy = "squash"
+    test_command: str | None = None
     dry_run: bool = False
 
     def __post_init__(self) -> None:
@@ -167,6 +204,7 @@ class LeafLifecycleToolkit(Protocol):
         strategy: RepoMergeStrategy,
         expected_head: str | None = None,
         expected_base: str | None = None,
+        expected_head_sha: str | None = None,
     ) -> RepoCompleteResult: ...
     async def git_push(self, repo_path: Path, branch: str) -> str: ...
     def review_diff(self, repo_path: Path, *, base: str, head: str) -> str: ...
@@ -215,6 +253,7 @@ class RealLeafLifecycleToolkit:
         strategy: RepoMergeStrategy,
         expected_head: str | None = None,
         expected_base: str | None = None,
+        expected_head_sha: str | None = None,
     ) -> RepoCompleteResult:
         return await self._repo.pr_complete(
             repo,
@@ -222,6 +261,7 @@ class RealLeafLifecycleToolkit:
             strategy=strategy,
             expected_head=expected_head,
             expected_base=expected_base,
+            expected_head_sha=expected_head_sha,
         )
 
     async def git_push(self, repo_path: Path, branch: str) -> str:
@@ -298,6 +338,7 @@ class FakeLeafLifecycleToolkit:
         self._sha_idx = 0
         self._merge_idx = 0
         self._push_idx = 0
+        self._last_head_sha: str | None = None
 
     async def pr_view(self, repo: str, number: int) -> RepoPullRequest:
         self.calls.append(("pr_view", (repo, number)))
@@ -311,6 +352,7 @@ class FakeLeafLifecycleToolkit:
         self.calls.append(("branch_sha", (repo, branch)))
         sha = self.branch_sha_snapshots[min(self._sha_idx, len(self.branch_sha_snapshots) - 1)]
         self._sha_idx += 1
+        self._last_head_sha = sha
         return sha
 
     async def post_commit_status(
@@ -345,6 +387,8 @@ class FakeLeafLifecycleToolkit:
             min(self._merge_idx, len(self.mergeability_snapshots) - 1)
         ]
         self._merge_idx += 1
+        if report.head_sha is None and self._last_head_sha is not None:
+            return replace(report, head_sha=self._last_head_sha)
         return report
 
     async def pr_complete(
@@ -355,9 +399,20 @@ class FakeLeafLifecycleToolkit:
         strategy: RepoMergeStrategy,
         expected_head: str | None = None,
         expected_base: str | None = None,
+        expected_head_sha: str | None = None,
     ) -> RepoCompleteResult:
         self.calls.append(
-            ("pr_complete", (repo, number, strategy, expected_head, expected_base))
+            (
+                "pr_complete",
+                (
+                    repo,
+                    number,
+                    strategy,
+                    expected_head,
+                    expected_base,
+                    expected_head_sha,
+                ),
+            )
         )
         if self.raise_on_complete is not None:
             raise self.raise_on_complete
@@ -372,6 +427,7 @@ class FakeLeafLifecycleToolkit:
             "strategy": strategy,
             "expected_head": expected_head,
             "expected_base": expected_base,
+            "expected_head_sha": expected_head_sha,
         })
         if self.complete_result is None:
             raise RuntimeError("FakeLeafLifecycleToolkit: no complete_result scripted")
@@ -385,6 +441,7 @@ class FakeLeafLifecycleToolkit:
             raise RuntimeError("FakeLeafLifecycleToolkit: no push_shas scripted")
         sha = self.push_shas[min(self._push_idx, len(self.push_shas) - 1)]
         self._push_idx += 1
+        self._last_head_sha = sha
         return sha
 
     def review_diff(self, repo_path: Path, *, base: str, head: str) -> str:
@@ -404,6 +461,28 @@ def _fingerprint_comments(comments: list[dict[str, Any]]) -> str:
         )
     )
     return hashlib.sha256(repr(canon).encode("utf-8")).hexdigest()
+
+
+def _without_context_pack_diff(diff: str) -> tuple[str, list[str]]:
+    """Remove Requiem's internal context pack from merge-bound review evidence."""
+    sections = re.split(r"(?m)(?=^diff --git )", diff)
+    if len(sections) == 1:
+        return diff, []
+
+    kept: list[str] = []
+    omitted: list[str] = []
+    context_prefix = f"diff --git a/{CONTEXT_PACK_DIR}/"
+    for section in sections:
+        if not section.startswith("diff --git "):
+            kept.append(section)
+            continue
+        header = section.partition("\n")[0]
+        if header.startswith(context_prefix):
+            omitted.append(header.partition(" b/")[2] or header)
+            continue
+        kept.append(section)
+
+    return "".join(kept).strip(), omitted
 
 
 def _merge_sha_from_pr(pr: RepoPullRequest) -> str | None:
@@ -433,6 +512,72 @@ def _merge_confirmation_evidence(pr: RepoPullRequest) -> dict[str, Any]:
         "merge_sha": _merge_sha_from_pr(pr),
         "url": pr.url,
     }
+
+
+def _mergeability_evidence(report: RepoMergeabilityReport) -> dict[str, Any]:
+    return {
+        "mergeable": report.mergeable,
+        "mergeable_state": report.mergeable_state,
+        "checks_state": report.checks_state,
+        "conflicts": report.conflicts,
+        "policies_satisfied": report.policies_satisfied,
+        "head_sha": report.head_sha,
+    }
+
+
+def _published_test_status_for_head(
+    completed: dict[str, dict[str, Any]],
+    head_sha: str,
+) -> dict[str, Any] | None:
+    for node_id in ("prune_context_pack", "push_addressal"):
+        value = (completed.get(node_id) or {}).get("value") or {}
+        if value.get("status_posted") is True and value.get("sha") == head_sha:
+            return {
+                "kind": "fresh_status_publication",
+                "source_node": node_id,
+                "sha": head_sha,
+            }
+    return None
+
+
+def _assess_concrete_mergeability(report: RepoMergeabilityReport) -> Outcome | None:
+    evidence = _mergeability_evidence(report)
+    if report.conflicts:
+        return PermanentFailure(
+            error_kind="needs_human.conflicts",
+            message=f"leaf PR has merge conflicts ({report.mergeable_state})",
+            details={"report": evidence},
+        )
+    if report.checks_state == "failure":
+        return PermanentFailure(
+            error_kind="needs_human.tests_not_passed",
+            message=f"leaf PR checks/build validation are failing ({report.mergeable_state})",
+            details={"report": evidence},
+        )
+    if report.checks_state != "success":
+        return PermanentFailure(
+            error_kind="needs_human.tests_status_unknown",
+            message=(
+                "leaf PR checks/build validation are pending or unavailable "
+                f"({report.checks_state})"
+            ),
+            details={"report": evidence},
+        )
+    if report.mergeable is None:
+        return None
+    if not report.policies_satisfied:
+        return PermanentFailure(
+            error_kind="needs_human.policies_unsatisfied",
+            message="required merge policies are not satisfied",
+            details={"report": evidence},
+        )
+    if not report.mergeable:
+        return PermanentFailure(
+            error_kind="needs_human.not_mergeable",
+            message=f"leaf PR is not mergeable ({report.mergeable_state})",
+            details={"report": evidence},
+        )
+    return Success(value=evidence)
 
 
 def _map_platform_error(
@@ -489,7 +634,10 @@ def _map_platform_error(
 
 
 def build_verb_registry(
-    inputs: LeafLifecycleInputs, toolkit: LeafLifecycleToolkit
+    inputs: LeafLifecycleInputs,
+    toolkit: LeafLifecycleToolkit,
+    *,
+    test_runner=default_test_runner,
 ) -> VerbRegistry:
     verbs = VerbRegistry()
     protected_bases = {inputs.default_branch, "main", "master"}
@@ -508,6 +656,62 @@ def build_verb_registry(
         if dispatch.get("kind") == "success":
             return dispatch["value"]
         return ctx.completed["verify_review_reconciliation"]["value"]
+
+    async def _assess_test_status(ctx, report: RepoMergeabilityReport) -> Outcome | None:
+        evidence = _mergeability_evidence(report)
+        if report.checks_state == "success":
+            return None
+        if report.checks_state == "failure":
+            return PermanentFailure(
+                error_kind="needs_human.tests_not_passed",
+                message="leaf PR checks/build validation are failing",
+                details={"report": evidence},
+            )
+        head_sha = report.head_sha
+        if head_sha is None:
+            try:
+                head_sha = await toolkit.branch_sha(inputs.repo, inputs.expected_head)
+            except Exception as e:  # noqa: BLE001
+                return _map_platform_error(
+                    e,
+                    run_id=ctx.run_id,
+                    node_id=ctx.node_id,
+                    attempt=ctx.attempt,
+                    operation="check_tests_head",
+                )
+        publication = _published_test_status_for_head(ctx.completed, head_sha)
+        if report.checks_state == "pending":
+            recovery_basis: dict[str, Any] | None = {
+                "kind": "authoritative_pending_status",
+                "sha": head_sha,
+            }
+        else:
+            recovery_basis = publication
+        if recovery_basis is not None:
+            return PermanentFailure(
+                error_kind="tests_status.recheck_required",
+                message=(
+                    "required validation is still propagating for the current "
+                    f"leaf head ({report.checks_state})"
+                ),
+                details={
+                    "report": evidence,
+                    "head_sha": head_sha,
+                    "recovery_basis": recovery_basis,
+                },
+            )
+        return PermanentFailure(
+            error_kind="needs_human.tests_status_unknown",
+            message=(
+                "no required validation status is available for the current "
+                "leaf head"
+            ),
+            details={
+                "report": evidence,
+                "head_sha": head_sha,
+                "recovery_basis": None,
+            },
+        )
 
     @verbs.register("start_run")
     def _start(ctx):
@@ -619,31 +823,148 @@ def build_verb_registry(
                 attempt=ctx.attempt,
                 operation="check_tests_passed",
             )
+        assessment = await _assess_test_status(ctx, report)
+        if assessment is not None:
+            return assessment
+        return Success(
+            value={
+                "checks_state": report.checks_state,
+                "mergeable": report.mergeable,
+                "mergeable_state": report.mergeable_state,
+                "conflicts": report.conflicts,
+                "policies_satisfied": report.policies_satisfied,
+            },
+        )
+
+    @verbs.register("verify_tests_status")
+    async def _verify_tests_status(ctx):
+        before_merge = ctx.node_id == "verify_tests_status_before_merge"
+        source_nodes = (
+            ("check_can_merge", "verify_mergeability")
+            if before_merge
+            else ("check_tests_passed",)
+        )
+        trigger_source = next(
+            (
+                node_id
+                for node_id in source_nodes
+                if (ctx.completed.get(node_id) or {}).get("error_kind")
+                == "tests_status.recheck_required"
+            ),
+            None,
+        )
+        if trigger_source is None:
+            return PermanentFailure(
+                error_kind="needs_human.tests_status_unknown",
+                message="test-status verification has no recovery trigger",
+            )
+        trigger = ctx.completed[trigger_source]
+        trigger_details = trigger.get("details") or {}
+        expected_head_sha = str(trigger_details.get("head_sha") or "")
+        recovery_basis = trigger_details.get("recovery_basis") or {}
+        try:
+            report = await toolkit.pr_mergeability(inputs.repo, inputs.pr_number)
+            current_head_sha = await toolkit.branch_sha(
+                inputs.repo,
+                inputs.expected_head,
+            )
+        except Exception as e:  # noqa: BLE001
+            return _map_platform_error(
+                e,
+                run_id=ctx.run_id,
+                node_id=ctx.node_id,
+                attempt=ctx.attempt,
+                operation="verify_tests_status",
+            )
+
+        evidence = {
+            **_mergeability_evidence(report),
+            "head_sha": current_head_sha,
+        }
+        if report.head_sha is not None and report.head_sha != current_head_sha:
+            return PermanentFailure(
+                error_kind="needs_human.tests_status_unknown",
+                message="leaf head changed during required-validation verification",
+                details={
+                    "expected_head_sha": expected_head_sha,
+                    "status_head_sha": report.head_sha,
+                    "current_head_sha": current_head_sha,
+                    "report": evidence,
+                },
+            )
+        if current_head_sha != expected_head_sha:
+            return PermanentFailure(
+                error_kind="needs_human.tests_status_unknown",
+                message="leaf head changed while required validation was being verified",
+                details={
+                    "expected_head_sha": expected_head_sha,
+                    "current_head_sha": current_head_sha,
+                    "report": evidence,
+                },
+            )
         if report.checks_state == "success":
             return Success(
                 value={
-                    "checks_state": report.checks_state,
-                    "mergeable": report.mergeable,
-                    "mergeable_state": report.mergeable_state,
-                    "conflicts": report.conflicts,
-                    "policies_satisfied": report.policies_satisfied,
+                    **evidence,
+                    "verification_method": "authoritative_test_status_reread",
+                    "verification_attempt": ctx.attempt,
                 }
             )
         if report.checks_state == "failure":
             return PermanentFailure(
                 error_kind="needs_human.tests_not_passed",
                 message="leaf PR checks/build validation are failing",
-                details={
-                    "checks_state": report.checks_state,
-                    "mergeable_state": report.mergeable_state,
-                },
+                details={"report": evidence},
             )
-        return PermanentFailure(
-            error_kind="needs_human.tests_status_unknown",
-            message="leaf PR checks/build validation are pending or unavailable",
-            details={
-                "checks_state": report.checks_state,
-                "mergeable_state": report.mergeable_state,
+
+        can_wait = recovery_basis.get("kind") in {
+            "authoritative_pending_status",
+            "fresh_status_publication",
+        }
+        if can_wait and ctx.attempt <= TEST_STATUS_RETRY_MAX:
+            return RetryableFailure(
+                retry_key=f"{ctx.run_id}:{ctx.node_id}:tests-status",
+                error_kind="tests_status.propagating",
+                message=(
+                    "required validation has not appeared on the authoritative "
+                    f"commit-status feed yet ({report.checks_state})"
+                ),
+                attempt=ctx.attempt,
+                after=TEST_STATUS_RETRY_DELAY_S,
+            )
+
+        return NeedsHuman(
+            gate="tests_status_unknown",
+            prompt=(
+                "Authoritative ADO reads still cannot establish required "
+                "validation for the exact leaf head. Retry the read-only "
+                "verification or abort this leaf."
+            ),
+            options=("retry_verification", "abort"),
+            context={
+                "trigger": {
+                    "source_node": trigger_source,
+                    "problem_kind": trigger.get("error_kind"),
+                    "message": trigger.get("message"),
+                },
+                "evidence": evidence,
+                "recovery_attempts": [
+                    {
+                        "kind": "authoritative_test_status_reread",
+                        "attempts": ctx.attempt,
+                        "result": f"checks_{report.checks_state}",
+                    }
+                ],
+                "remaining_uncertainty": {
+                    "head_sha": current_head_sha,
+                    "checks_state": report.checks_state,
+                },
+                "recommended_option": "retry_verification",
+                "rationale": (
+                    "The workflow has evidence that required validation was "
+                    "pending or freshly published for this exact SHA, but ADO "
+                    "has not produced an authoritative terminal status."
+                ),
             },
         )
 
@@ -674,7 +995,9 @@ def build_verb_registry(
             )
         try:
             head_sha = await toolkit.branch_sha(inputs.repo, pr.head)
-            diff = toolkit.review_diff(inputs.repo_path, base=pr.base, head=pr.head)
+            raw_diff = toolkit.review_diff(
+                inputs.repo_path, base=pr.base, head=pr.head
+            )
         except Exception as e:  # noqa: BLE001
             return _map_platform_error(
                 e,
@@ -683,12 +1006,19 @@ def build_verb_registry(
                 attempt=ctx.attempt,
                 operation="prepare_review",
             )
+        review_diff, omitted_context_files = _without_context_pack_diff(raw_diff)
+        if not review_diff:
+            review_diff = "(no merge-bound diff after excluding Requiem context pack)"
         return Success(
             value={
                 "head": pr.head,
                 "base": pr.base,
                 "head_sha": head_sha,
-                "diff": diff[:30000],
+                "diff": review_diff[:MAX_REVIEW_DIFF_CHARS],
+                "diff_complete": len(review_diff) <= MAX_REVIEW_DIFF_CHARS,
+                "review_diff_chars": len(review_diff),
+                "raw_diff_chars": len(raw_diff),
+                "omitted_context_pack_files": omitted_context_files,
             }
         )
 
@@ -704,12 +1034,113 @@ def build_verb_registry(
             "feature trunk as-is. Return `request_changes` for concrete code fixes "
             "Requiem can implement automatically. Return `needs_human` for any "
             "ambiguous or unsafe case.\n\n"
+            "Requiem-internal context files omitted: "
+            f"{len(prep['omitted_context_pack_files'])}\n\n"
             f"Diff:\n{prep['diff']}"
+        )
+
+    @verbs.register("recover_review_token_exhaustion")
+    def _recover_review_token_exhaustion(ctx):
+        trigger = ctx.completed["review_leaf"]
+        evidence = token_failure_evidence(trigger)
+        if not is_cumulative_input_exhaustion(trigger):
+            return PermanentFailure(
+                error_kind="review.runtime_failure",
+                message="reviewer failed before producing a review report",
+                details={"trigger": evidence},
+                receipts=tuple(trigger.get("receipts") or ()),
+            )
+
+        prep = ctx.completed["prepare_review"]["value"]
+        diff = str(prep.get("diff") or "")
+        if not prep.get("diff_complete") or len(diff) > MAX_COMPACTED_REVIEW_DIFF_CHARS:
+            return PermanentFailure(
+                error_kind="review.compaction_unsafe",
+                message=(
+                    "reviewer exhausted its token budget, but the complete "
+                    "merge-bound diff is too large for the bounded compacted retry"
+                ),
+                details={
+                    "trigger": evidence,
+                    "review_diff_chars": prep.get("review_diff_chars"),
+                    "max_compacted_review_diff_chars": (
+                        MAX_COMPACTED_REVIEW_DIFF_CHARS
+                    ),
+                },
+                receipts=tuple(trigger.get("receipts") or ()),
+            )
+
+        return Success(
+            value={
+                "diff": diff,
+                "diff_complete": True,
+                "omitted_context_pack_files": prep.get(
+                    "omitted_context_pack_files", []
+                ),
+                "trigger": evidence,
+            }
+        )
+
+    @verbs.register("compacted_review_prompt")
+    def _compacted_review_prompt(ctx):
+        recovery = ctx.completed["recover_review_token_exhaustion"]["value"]
+        return (
+            f"Retry the review for leaf PR #{inputs.pr_number} after the prior "
+            "reviewer exhausted its input-token budget. This is the single "
+            "bounded recovery attempt.\n\n"
+            "The diff below is complete for merge-bound files. Requiem's "
+            f"internal `{CONTEXT_PACK_DIR}/` context pack was omitted because "
+            "the workflow removes it before merge. Do not call tools or seek "
+            "additional repository context. If the supplied diff is genuinely "
+            "insufficient to decide safely, return `needs_human`.\n\n"
+            f"Previous failure evidence:\n"
+            f"{json.dumps(recovery['trigger'], indent=2, sort_keys=True)}\n\n"
+            f"Diff:\n{recovery['diff']}"
+        )
+
+    @verbs.register("verify_compacted_review")
+    def _verify_compacted_review(ctx):
+        recovery = ctx.completed["recover_review_token_exhaustion"]
+        replacement = ctx.completed["review_leaf_compacted"]
+        if recovery.get("kind") != "success" or replacement.get("kind") != "success":
+            return PermanentFailure(
+                error_kind="review.compacted_verification_failed",
+                message="compacted review did not produce verifiable replacement evidence",
+            )
+        parsed = LeafReviewReport.model_validate(
+            replacement["value"]["parsed"]
+        ).model_dump()
+        return Success(
+            value={
+                "parsed": parsed,
+                "recovery": recovery["value"]["trigger"],
+            }
+        )
+
+    @verbs.register("finalize_review_runtime_failure")
+    def _finalize_review_runtime_failure(ctx):
+        trigger = ctx.completed["review_leaf_compacted"]
+        evidence = token_failure_evidence(trigger)
+        return PermanentFailure(
+            error_kind="review.compacted_retry_failed",
+            message=(
+                "bounded compacted reviewer retry failed before producing "
+                "a review report"
+            ),
+            details={
+                "trigger": evidence,
+                "recovery": ctx.completed["recover_review_token_exhaustion"]["value"],
+            },
+            receipts=tuple(trigger.get("receipts") or ()),
         )
 
     @verbs.register("dispatch_review")
     def _dispatch_review(ctx):
-        parsed = ctx.completed["review_leaf"]["value"]["parsed"]
+        primary = ctx.completed["review_leaf"]
+        if primary.get("kind") == "success":
+            parsed = primary["value"]["parsed"]
+        else:
+            parsed = ctx.completed["verify_compacted_review"]["value"]["parsed"]
         verdict = parsed.get("verdict")
         comments = list(parsed.get("comments") or [])
         summary = str(parsed.get("summary", ""))
@@ -958,6 +1389,77 @@ def build_verb_registry(
             return fs
         return apply_file_changes(inputs.repo_path, fs, raw_changes)
 
+    @verbs.register("run_addressal_tests")
+    async def _run_addressal_tests(ctx):
+        if inputs.dry_run:
+            return Success(
+                value={
+                    "passed": True,
+                    "summary": "(dry-run: tests not executed)",
+                    "command": inputs.test_command or "(auto-detect skipped)",
+                    "tested_tree_sha": None,
+                }
+            )
+        detected = (
+            DetectedTestCommand(command=inputs.test_command, cwd=inputs.repo_path)
+            if inputs.test_command is not None
+            else detect_test_command(inputs.repo_path)
+        )
+        if detected is None:
+            return PermanentFailure(
+                error_kind="needs_human.tests_status_unknown",
+                message=(
+                    f"could not detect the required test command in {inputs.repo_path}"
+                ),
+                details={"reason": "test_command_undetected"},
+            )
+        try:
+            result = test_runner(
+                detected.command,
+                detected.cwd or inputs.repo_path,
+            )
+        except Exception as e:  # noqa: BLE001
+            return PermanentFailure(
+                error_kind="needs_human.tests_status_unknown",
+                message=f"test runner crashed: {type(e).__name__}: {e}",
+                details={
+                    "reason": "test_runner_error",
+                    "command": detected.command,
+                },
+            )
+        if not result.passed:
+            return PermanentFailure(
+                error_kind="needs_human.tests_not_passed",
+                message=f"review-fix tests failed via {detected.command!r}",
+                details={
+                    "passed": False,
+                    "summary": result.summary,
+                    "command": detected.command,
+                },
+            )
+        fs = _require_fs(ctx)
+        if isinstance(fs, PermanentFailure):
+            return fs
+        try:
+            tested_tree_sha = await fs.git_stage_all_and_tree_sha()
+        except FsGitError as e:
+            return PermanentFailure(
+                error_kind="needs_human.tests_status_unknown",
+                message=f"could not snapshot the tested worktree: {e.stderr.strip() or e}",
+                details={
+                    "reason": "tested_tree_unavailable",
+                    "stderr": e.stderr,
+                },
+            )
+        return Success(
+            value={
+                "passed": True,
+                "summary": result.summary,
+                "command": detected.command,
+                "tested_tree_sha": tested_tree_sha,
+            }
+        )
+
     @verbs.register("push_addressal")
     async def _push_addressal(ctx):
         addr_outcome = ctx.completed["address_comments"]["value"]
@@ -968,6 +1470,7 @@ def build_verb_registry(
                 value={
                     "sha": None,
                     "pushed": False,
+                    "status_posted": False,
                     "reason": "dry_run",
                     "change_count": applied.get("change_count", 0),
                 }
@@ -976,12 +1479,31 @@ def build_verb_registry(
         if isinstance(fs, PermanentFailure):
             return fs
         message = f"address review comments: {parsed.get('summary', '')[:200]}".strip()
+        tested_tree_sha = str(
+            ctx.completed["run_addressal_tests"]["value"].get("tested_tree_sha") or ""
+        )
+        if not tested_tree_sha:
+            return PermanentFailure(
+                error_kind="needs_human.tests_status_unknown",
+                message="review-fix test evidence is missing its Git tree identity",
+                details={"reason": "tested_tree_unavailable"},
+            )
         try:
+            current_tree_sha = await fs.git_stage_all_and_tree_sha()
+            if current_tree_sha != tested_tree_sha:
+                return PermanentFailure(
+                    error_kind="needs_human.tests_status_unknown",
+                    message="worktree changed after review-fix tests passed",
+                    details={
+                        "reason": "tested_tree_changed",
+                        "tested_tree_sha": tested_tree_sha,
+                        "current_tree_sha": current_tree_sha,
+                    },
+                )
             if await fs.git_is_clean():
                 # Idempotent resume: a prior commit already landed.
                 commit_sha = None
             else:
-                await fs._git("add", "-A")  # noqa: SLF001 — staging shortcut
                 commit_sha = await fs.git_commit(message or "address review comments")
         except FsGitError as e:
             return PermanentFailure(
@@ -999,8 +1521,29 @@ def build_verb_registry(
                 attempt=ctx.attempt,
                 operation="git_push",
             )
+        try:
+            await toolkit.post_commit_status(
+                inputs.repo,
+                sha,
+                context=REQUIRED_TEST_STATUS_CONTEXT,
+                state="success",
+                description="requiem: local tests passed after review fixes",
+            )
+        except Exception as e:  # noqa: BLE001
+            return _map_platform_error(
+                e,
+                run_id=ctx.run_id,
+                node_id=ctx.node_id,
+                attempt=ctx.attempt,
+                operation="post_commit_status",
+            )
         return Success(
-            value={"sha": sha, "pushed": True, "commit_sha": commit_sha},
+            value={
+                "sha": sha,
+                "pushed": True,
+                "commit_sha": commit_sha,
+                "status_posted": True,
+            },
             inspected_artifacts=(f"commit:{sha}",),
         )
 
@@ -1111,7 +1654,7 @@ def build_verb_registry(
             await toolkit.post_commit_status(
                 inputs.repo,
                 sha,
-                context="requiem/local-tests",
+                context=REQUIRED_TEST_STATUS_CONTEXT,
                 state="success",
                 description=(
                     "requiem: local tests passed before framework-only "
@@ -1149,43 +1692,98 @@ def build_verb_registry(
                 operation="check_can_merge",
             )
         if report.conflicts:
-            return PermanentFailure(
-                error_kind="needs_human.conflicts",
-                message=f"leaf PR has merge conflicts ({report.mergeable_state})",
+            return _assess_concrete_mergeability(report)
+        test_assessment = await _assess_test_status(ctx, report)
+        if test_assessment is not None:
+            return test_assessment
+        assessment = _assess_concrete_mergeability(report)
+        if assessment is not None:
+            return assessment
+        return PermanentFailure(
+            error_kind="mergeability.recheck_required",
+            message=(
+                "ADO mergeability is still being computed "
+                f"({report.mergeable_state})"
+            ),
+            details={"report": _mergeability_evidence(report)},
+        )
+
+    # ADO commonly reports queued/notSet immediately after the cleanup push,
+    # then converges without another mutation. Re-read only the authoritative
+    # server projection and never infer mergeability from the local checkout.
+    @verbs.register("verify_mergeability")
+    async def _verify_mergeability(ctx):
+        try:
+            report = await toolkit.pr_mergeability(inputs.repo, inputs.pr_number)
+        except Exception as e:  # noqa: BLE001
+            return _map_platform_error(
+                e,
+                run_id=ctx.run_id,
+                node_id=ctx.node_id,
+                attempt=ctx.attempt,
+                operation="verify_mergeability",
             )
-        if report.checks_state == "failure":
-            return PermanentFailure(
-                error_kind="needs_human.tests_not_passed",
-                message=f"leaf PR checks/build validation are failing ({report.mergeable_state})",
+
+        if report.conflicts:
+            return _assess_concrete_mergeability(report)
+        test_assessment = await _assess_test_status(ctx, report)
+        if test_assessment is not None:
+            return test_assessment
+        assessment = _assess_concrete_mergeability(report)
+        if assessment is not None:
+            if isinstance(assessment, Success):
+                return Success(
+                    value={
+                        **assessment.value,
+                        "verification_method": "authoritative_mergeability_reread",
+                        "verification_attempt": ctx.attempt,
+                    }
+                )
+            return assessment
+
+        if ctx.attempt <= MERGEABILITY_RETRY_MAX:
+            return RetryableFailure(
+                retry_key=f"{ctx.run_id}:{ctx.node_id}:mergeability",
+                error_kind="mergeability.propagating",
+                message=(
+                    "ADO mergeability is still being computed "
+                    f"({report.mergeable_state})"
+                ),
+                attempt=ctx.attempt,
+                after=MERGEABILITY_RETRY_DELAY_S,
             )
-        if report.checks_state != "success":
-            return PermanentFailure(
-                error_kind="needs_human.tests_status_unknown",
-                message=f"leaf PR checks/build validation are pending or unavailable ({report.checks_state})",
-            )
-        if report.mergeable is None:
-            return PermanentFailure(
-                error_kind="needs_human.mergeability_unknown",
-                message="mergeability is indeterminate",
-            )
-        if not report.policies_satisfied:
-            return PermanentFailure(
-                error_kind="needs_human.policies_unsatisfied",
-                message="required merge policies are not satisfied",
-            )
-        if not report.mergeable:
-            return PermanentFailure(
-                error_kind="needs_human.not_mergeable",
-                message=f"leaf PR is not mergeable ({report.mergeable_state})",
-            )
-        return Success(
-            value={
-                "mergeable": report.mergeable,
-                "mergeable_state": report.mergeable_state,
-                "checks_state": report.checks_state,
-                "conflicts": report.conflicts,
-                "policies_satisfied": report.policies_satisfied,
-            }
+
+        trigger = ctx.completed["check_can_merge"]
+        evidence = _mergeability_evidence(report)
+        return NeedsHuman(
+            gate="mergeability_unknown",
+            prompt=(
+                "Authoritative ADO reads still cannot establish whether the leaf "
+                "PR is mergeable. Retry the read-only verification or abort this leaf."
+            ),
+            options=("retry_verification", "abort"),
+            context={
+                "trigger": {
+                    "source_node": "check_can_merge",
+                    "problem_kind": trigger.get("error_kind"),
+                    "message": trigger.get("message"),
+                },
+                "evidence": evidence,
+                "recovery_attempts": [
+                    {
+                        "kind": "authoritative_mergeability_reread",
+                        "attempts": ctx.attempt,
+                        "result": f"mergeability_{report.mergeable_state}",
+                    }
+                ],
+                "remaining_uncertainty": evidence,
+                "recommended_option": "retry_verification",
+                "rationale": (
+                    "The PR still has green checks and no reported conflict, so "
+                    "another authoritative read may observe ADO's asynchronous "
+                    "mergeability computation."
+                ),
+            },
         )
 
     @verbs.register("merge_pr")
@@ -1199,6 +1797,21 @@ def build_verb_registry(
                     "dry_run": True,
                 }
             )
+        validated_head_sha = ""
+        for source_node in ("check_can_merge", "verify_mergeability"):
+            source = ctx.completed.get(source_node) or {}
+            if source.get("kind") != "success":
+                continue
+            validated_head_sha = str(
+                (source.get("value") or {}).get("head_sha") or ""
+            )
+            if validated_head_sha:
+                break
+        if not validated_head_sha:
+            return PermanentFailure(
+                error_kind="needs_human.tests_status_unknown",
+                message="merge refused because the validated leaf head SHA is unavailable",
+            )
         try:
             result = await toolkit.pr_complete(
                 inputs.repo,
@@ -1206,6 +1819,7 @@ def build_verb_registry(
                 strategy=inputs.merge_strategy,
                 expected_head=inputs.expected_head,
                 expected_base=inputs.expected_base,
+                expected_head_sha=validated_head_sha,
             )
         except Exception as e:  # noqa: BLE001
             return _map_platform_error(
@@ -1338,6 +1952,7 @@ def build_verb_registry(
 def build_agent_registry() -> AgentRegistry:
     reg = AgentRegistry()
     reg.register(LEAF_REVIEWER)
+    reg.register(COMPACTED_LEAF_REVIEWER)
     reg.register(COMMENT_SYNTHESIZER)
     reg.register(COMMENT_ADDRESSER)
     return reg
@@ -1345,7 +1960,7 @@ def build_agent_registry() -> AgentRegistry:
 
 def build_workflow() -> Workflow:
     return (
-        WorkflowBuilder("leaf-lifecycle", module=MODULE, version="0.1")
+        WorkflowBuilder("leaf-lifecycle", module=MODULE, version="0.2")
         .entry("start")
         .script("start", verb="start_run")
             .edge("start", on="success", to="fetch_pr")
@@ -1363,15 +1978,94 @@ def build_workflow() -> Workflow:
             .edge("assert_leaf_scope", on="permanent_failure", to="needs_human_end")
         .script("check_tests_passed", verb="check_tests_passed")
             .edge("check_tests_passed", on="success", to="prepare_review")
+            .edge(
+                "check_tests_passed",
+                on="permanent_failure:tests_status.recheck_required",
+                to="verify_tests_status_before_review",
+            )
             .edge("check_tests_passed", on="permanent_failure", to="needs_human_end")
+        .script(
+            "verify_tests_status_before_review",
+            verb="verify_tests_status",
+            retry_max=TEST_STATUS_RETRY_MAX,
+        )
+            .edge(
+                "verify_tests_status_before_review",
+                on="success",
+                to="prepare_review",
+            )
+            .edge(
+                "verify_tests_status_before_review",
+                on="needs_human:retry_verification",
+                to="verify_tests_status_before_review",
+            )
+            .edge(
+                "verify_tests_status_before_review",
+                on="needs_human:abort",
+                to="needs_human_end",
+            )
+            .edge(
+                "verify_tests_status_before_review",
+                on="retry_exhausted",
+                to="needs_human_end",
+            )
+            .edge(
+                "verify_tests_status_before_review",
+                on="permanent_failure",
+                to="needs_human_end",
+            )
         .script("prepare_review", verb="prepare_review", retry_max=2)
             .edge("prepare_review", on="success", to="review_leaf")
             .edge("prepare_review", on="retry_exhausted", to="needs_human_end")
             .edge("prepare_review", on="permanent_failure", to="needs_human_end")
         .agent("review_leaf", agent="leaf_reviewer", prompt_verb="review_prompt")
             .edge("review_leaf", on="success", to="dispatch_review")
+            .edge("review_leaf", on="retry_exhausted", to="recover_review_token_exhaustion")
             .edge("review_leaf", on="bad_output", to="needs_human_end")
             .edge("review_leaf", on="permanent_failure", to="needs_human_end")
+        .script(
+            "recover_review_token_exhaustion",
+            verb="recover_review_token_exhaustion",
+        )
+            .edge(
+                "recover_review_token_exhaustion",
+                on="success",
+                to="review_leaf_compacted",
+            )
+            .edge(
+                "recover_review_token_exhaustion",
+                on="permanent_failure",
+                to="needs_human_end",
+            )
+        .agent(
+            "review_leaf_compacted",
+            agent="compacted_leaf_reviewer",
+            prompt_verb="compacted_review_prompt",
+        )
+            .edge("review_leaf_compacted", on="success", to="verify_compacted_review")
+            .edge(
+                "review_leaf_compacted",
+                on="retry_exhausted",
+                to="finalize_review_runtime_failure",
+            )
+            .edge(
+                "review_leaf_compacted",
+                on="bad_output",
+                to="finalize_review_runtime_failure",
+            )
+            .edge("review_leaf_compacted", on="permanent_failure", to="needs_human_end")
+        .script("verify_compacted_review", verb="verify_compacted_review")
+            .edge("verify_compacted_review", on="success", to="dispatch_review")
+            .edge("verify_compacted_review", on="permanent_failure", to="needs_human_end")
+        .script(
+            "finalize_review_runtime_failure",
+            verb="finalize_review_runtime_failure",
+        )
+            .edge(
+                "finalize_review_runtime_failure",
+                on="permanent_failure",
+                to="needs_human_end",
+            )
         .script("dispatch_review", verb="dispatch_review")
             .edge("dispatch_review", on="success", to="synthesize_comments")
             .edge("dispatch_review", on="permanent_failure:review.approved", to="prune_context_pack")
@@ -1400,8 +2094,15 @@ def build_workflow() -> Workflow:
             .edge("address_comments", on="bad_output", to="needs_human_end")
             .edge("address_comments", on="permanent_failure", to="needs_human_end")
         .script("apply_addressal", verb="apply_addressal")
-            .edge("apply_addressal", on="success", to="push_addressal")
+            .edge("apply_addressal", on="success", to="run_addressal_tests")
             .edge("apply_addressal", on="permanent_failure", to="needs_human_end")
+        .script("run_addressal_tests", verb="run_addressal_tests")
+            .edge("run_addressal_tests", on="success", to="push_addressal")
+            .edge(
+                "run_addressal_tests",
+                on="permanent_failure",
+                to="needs_human_end",
+            )
         .script("push_addressal", verb="push_addressal", retry_max=2)
             .edge("push_addressal", on="success", to="check_progress")
             .edge("push_addressal", on="retry_exhausted", to="needs_human_end")
@@ -1415,8 +2116,67 @@ def build_workflow() -> Workflow:
             .edge("prune_context_pack", on="permanent_failure", to="needs_human_end")
         .script("check_can_merge", verb="check_can_merge", retry_max=2)
             .edge("check_can_merge", on="success", to="merge_pr")
+            .edge(
+                "check_can_merge",
+                on="permanent_failure:tests_status.recheck_required",
+                to="verify_tests_status_before_merge",
+            )
+            .edge(
+                "check_can_merge",
+                on="permanent_failure:mergeability.recheck_required",
+                to="verify_mergeability",
+            )
             .edge("check_can_merge", on="retry_exhausted", to="needs_human_end")
             .edge("check_can_merge", on="permanent_failure", to="needs_human_end")
+        .script(
+            "verify_mergeability",
+            verb="verify_mergeability",
+            retry_max=MERGEABILITY_RETRY_MAX,
+        )
+            .edge("verify_mergeability", on="success", to="merge_pr")
+            .edge(
+                "verify_mergeability",
+                on="permanent_failure:tests_status.recheck_required",
+                to="verify_tests_status_before_merge",
+            )
+            .edge(
+                "verify_mergeability",
+                on="needs_human:retry_verification",
+                to="verify_mergeability",
+            )
+            .edge("verify_mergeability", on="needs_human:abort", to="needs_human_end")
+            .edge("verify_mergeability", on="retry_exhausted", to="needs_human_end")
+            .edge("verify_mergeability", on="permanent_failure", to="needs_human_end")
+        .script(
+            "verify_tests_status_before_merge",
+            verb="verify_tests_status",
+            retry_max=TEST_STATUS_RETRY_MAX,
+        )
+            .edge(
+                "verify_tests_status_before_merge",
+                on="success",
+                to="check_can_merge",
+            )
+            .edge(
+                "verify_tests_status_before_merge",
+                on="needs_human:retry_verification",
+                to="verify_tests_status_before_merge",
+            )
+            .edge(
+                "verify_tests_status_before_merge",
+                on="needs_human:abort",
+                to="needs_human_end",
+            )
+            .edge(
+                "verify_tests_status_before_merge",
+                on="retry_exhausted",
+                to="needs_human_end",
+            )
+            .edge(
+                "verify_tests_status_before_merge",
+                on="permanent_failure",
+                to="needs_human_end",
+            )
         .script("merge_pr", verb="merge_pr", retry_max=2)
             .edge("merge_pr", on="success", to="end_merged")
             .edge(
@@ -1449,8 +2209,13 @@ def build_workflow() -> Workflow:
             "check_initial_state": "Checked leaf PR state",
             "assert_leaf_scope": "Verified leaf PR scope",
             "check_tests_passed": "Verified leaf test precondition",
+            "verify_tests_status_before_review": "Verified leaf test-status propagation",
             "prepare_review": "Prepared local leaf review context",
             "review_leaf": "Reviewed leaf PR",
+            "recover_review_token_exhaustion": "Prepared bounded review recovery",
+            "review_leaf_compacted": "Retried leaf review with compact context",
+            "verify_compacted_review": "Verified compacted review evidence",
+            "finalize_review_runtime_failure": "Recorded reviewer runtime failure",
             "dispatch_review": "Dispatched review verdict",
             "reconcile_review_inconsistency": "Reconciled inconsistent review evidence",
             "deliberate_review_inconsistency": "Deliberated on inconsistent review evidence",
@@ -1458,10 +2223,13 @@ def build_workflow() -> Workflow:
             "synthesize_comments": "Synthesised reviewer findings",
             "address_comments": "Addressed reviewer findings",
             "apply_addressal": "Applied addressal file changes",
+            "run_addressal_tests": "Re-ran tests after review fixes",
             "push_addressal": "Pushed addressal commits",
             "check_progress": "Checked review-loop progress",
             "prune_context_pack": "Pruned requiem context-pack scaffold before merge",
             "check_can_merge": "Checked leaf mergeability",
+            "verify_mergeability": "Verified leaf mergeability propagation",
+            "verify_tests_status_before_merge": "Verified final test-status propagation",
             "merge_pr": "Merged leaf PR",
             "verify_merge_confirmation": "Verified leaf merge completion",
             "end_merged": "Leaf PR lifecycle",
@@ -1480,6 +2248,7 @@ def build_engine(
     provider: Any = None,
     toolbelt: Toolbelt | None = None,
     gate_handler=None,
+    test_runner=None,
 ) -> Engine:
     log_dir.mkdir(parents=True, exist_ok=True)
     demo_mode = inputs is None
@@ -1551,7 +2320,11 @@ def build_engine(
 
     return Engine(
         workflow=build_workflow(),
-        verbs=build_verb_registry(inputs, toolkit),
+        verbs=build_verb_registry(
+            inputs,
+            toolkit,
+            test_runner=test_runner or default_test_runner,
+        ),
         agents=build_agent_registry(),
         provider=provider,
         toolbelt=tb,

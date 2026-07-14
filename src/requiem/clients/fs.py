@@ -244,9 +244,18 @@ class FilesystemClient:
         out = await self._git("rev-parse", "--abbrev-ref", "HEAD")
         return out.strip()
 
+    async def git_head_sha(self) -> str:
+        """Return the commit currently checked out at ``HEAD``."""
+        return (await self._git("rev-parse", "HEAD")).strip()
+
     async def git_is_clean(self) -> bool:
         """True iff ``git status --porcelain`` is empty."""
         return not await self.git_status_porcelain()
+
+    async def git_stage_all_and_tree_sha(self) -> str:
+        """Stage the full worktree and return its exact Git tree object id."""
+        await self._git("add", "-A")
+        return (await self._git("write-tree")).strip()
 
     async def git_commit(
         self, message: str, paths: list[Path] | None = None
@@ -325,6 +334,107 @@ class FilesystemClient:
             f"refs/heads/{name}",
             expected_sha,
         )
+
+    async def git_detach_head(
+        self,
+        *,
+        expected_branch: str,
+        expected_sha: str,
+    ) -> None:
+        """Detach this worktree at its current, compare-verified commit."""
+        current_branch = await self.git_current_branch()
+        current_sha = (await self._git("rev-parse", "HEAD")).strip()
+        if current_branch != expected_branch or current_sha != expected_sha:
+            raise FsGitError(
+                ["checkout", "--detach", "HEAD"],
+                -1,
+                "refused to detach changed HEAD: "
+                f"expected {expected_branch}@{expected_sha}, "
+                f"found {current_branch}@{current_sha}",
+            )
+
+        await self._git("checkout", "--detach", "HEAD")
+
+        detached_branch = await self.git_current_branch()
+        detached_sha = (await self._git("rev-parse", "HEAD")).strip()
+        if detached_branch != "HEAD" or detached_sha != expected_sha:
+            raise FsGitError(
+                ["checkout", "--detach", "HEAD"],
+                -1,
+                "HEAD did not remain detached at the verified commit: "
+                f"found {detached_branch}@{detached_sha}",
+            )
+
+    async def git_rebaseline_head(
+        self,
+        *,
+        remote: str,
+        branch: str,
+        expected_current_branch: str,
+        expected_current_sha: str,
+        expected_target_sha: str,
+    ) -> None:
+        """Move a clean checkout to a compare-verified remote branch commit.
+
+        The source branch ref is never moved or deleted. The remote branch is
+        fetched into ``FETCH_HEAD`` only, compared with the authoritative SHA,
+        and checked out detached so another worktree may still own its local
+        branch. Dirty or drifting state fails before checkout.
+        """
+
+        async def _verify_source() -> None:
+            current_branch = await self.git_current_branch()
+            current_sha = await self.git_head_sha()
+            if (
+                current_branch != expected_current_branch
+                or current_sha != expected_current_sha
+            ):
+                raise FsGitError(
+                    ["checkout", "--detach", expected_target_sha],
+                    -1,
+                    "refused to rebaseline changed HEAD: "
+                    f"expected {expected_current_branch}@{expected_current_sha}, "
+                    f"found {current_branch}@{current_sha}",
+                )
+            if not await self.git_is_clean():
+                raise FsGitError(
+                    ["checkout", "--detach", expected_target_sha],
+                    -1,
+                    "refused to rebaseline dirty worktree",
+                )
+
+        await _verify_source()
+        await self._git(
+            "fetch",
+            "--no-tags",
+            remote,
+            f"refs/heads/{branch}",
+        )
+        fetched_sha = (await self._git("rev-parse", "FETCH_HEAD")).strip()
+        if fetched_sha != expected_target_sha:
+            raise FsGitError(
+                ["git", "fetch", remote, f"refs/heads/{branch}"],
+                -1,
+                "fetched baseline did not match authoritative branch SHA: "
+                f"expected {expected_target_sha}, found {fetched_sha}",
+            )
+
+        await _verify_source()
+        await self._git("checkout", "--detach", expected_target_sha)
+
+        detached_branch = await self.git_current_branch()
+        detached_sha = await self.git_head_sha()
+        if (
+            detached_branch != "HEAD"
+            or detached_sha != expected_target_sha
+            or not await self.git_is_clean()
+        ):
+            raise FsGitError(
+                ["checkout", "--detach", expected_target_sha],
+                -1,
+                "worktree did not reach the verified clean baseline: "
+                f"found {detached_branch}@{detached_sha}",
+            )
 
     async def git_create_branch(self, name: str, from_ref: str) -> None:
         """Create branch ``name`` from ``from_ref`` and check it out.

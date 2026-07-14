@@ -64,9 +64,12 @@ class ModelSpec:
 
     ``reasoning_effort``, ``reasoning_summary``, ``context_tier`` are
     provider-specific knobs surfaced by the GitHub Copilot SDK (run #28
-    follow-up: discovered claude-sonnet-4.6 has a tunable reasoning
-    loop while claude-sonnet-4.5 does not — ``reasoning_effort='low'``
+    follow-up: discovered claude-sonnet-5 has a tunable reasoning
+    loop while claude-sonnet-5.5 does not — ``reasoning_effort='low'``
     forces faster turnaround at the cost of less deliberate reasoning).
+    ``max_cumulative_input_tokens`` is a Copilot-specific safeguard that
+    can be pinned per-role from ``process.yaml``; when omitted, the
+    provider uses a model-based default for implementer roles.
     The kernel threads non-None values through to the provider via
     ``AgentCall.model_options``; providers that don't understand a key
     silently ignore it. Operator yaml shape::
@@ -74,15 +77,17 @@ class ModelSpec:
         models:
           implementer:
             provider: copilot
-            model: claude-sonnet-4.6
+            model: claude-sonnet-5
             reasoning_effort: low      # 'low' | 'medium' | 'high' | 'max'
             reasoning_summary: none    # provider-specific
             context_tier: standard     # provider-specific
+            max_cumulative_input_tokens: 300000
     """
 
     provider: str | None = None
     model: str | None = None
     max_tokens: int | None = None
+    max_cumulative_input_tokens: int | None = None
     reasoning_effort: str | None = None
     reasoning_summary: str | None = None
     context_tier: str | None = None
@@ -93,6 +98,7 @@ class ModelSpec:
             self.provider is None
             and self.model is None
             and self.max_tokens is None
+            and self.max_cumulative_input_tokens is None
             and self.reasoning_effort is None
             and self.reasoning_summary is None
             and self.context_tier is None
@@ -114,6 +120,8 @@ class ModelSpec:
             opts["reasoning_summary"] = self.reasoning_summary
         if self.context_tier is not None:
             opts["context_tier"] = self.context_tier
+        if self.max_cumulative_input_tokens is not None:
+            opts["max_cumulative_input_tokens"] = self.max_cumulative_input_tokens
         return opts
 
 
@@ -132,6 +140,7 @@ def _validate_entry(role: str, entry: Any) -> ModelSpec:
     provider = entry.get("provider")
     model = entry.get("model")
     max_tokens = entry.get("max_tokens")
+    max_cumulative_input_tokens = entry.get("max_cumulative_input_tokens")
     reasoning_effort = entry.get("reasoning_effort")
     reasoning_summary = entry.get("reasoning_summary")
     context_tier = entry.get("context_tier")
@@ -155,6 +164,17 @@ def _validate_entry(role: str, entry: Any) -> ModelSpec:
                 f"models.{role}.max_tokens must be a positive integer when set; "
                 f"got {max_tokens}"
             )
+    if max_cumulative_input_tokens is not None:
+        if isinstance(max_cumulative_input_tokens, bool) or not isinstance(max_cumulative_input_tokens, int):
+            raise ValueError(
+                f"models.{role}.max_cumulative_input_tokens must be a positive integer when set; "
+                f"got {max_cumulative_input_tokens!r}"
+            )
+        if max_cumulative_input_tokens <= 0:
+            raise ValueError(
+                f"models.{role}.max_cumulative_input_tokens must be a positive integer when set; "
+                f"got {max_cumulative_input_tokens}"
+            )
     # The three reasoning knobs are all "non-empty string when set" — the
     # provider validates the actual values against its own enum
     # (e.g. Copilot accepts 'low'/'medium'/'high'/'max' for
@@ -174,6 +194,7 @@ def _validate_entry(role: str, entry: Any) -> ModelSpec:
         provider=provider,
         model=model,
         max_tokens=max_tokens,
+        max_cumulative_input_tokens=max_cumulative_input_tokens,
         reasoning_effort=reasoning_effort,
         reasoning_summary=reasoning_summary,
         context_tier=context_tier,

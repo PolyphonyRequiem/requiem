@@ -177,7 +177,7 @@ def test_reasoning_effort_carried_on_model_spec() -> None:
     Run #28 against AB#62759077 showed that even with the routing
     plumbing fixed (operator yaml `models.implementer` → coder
     agent actually runs on sonnet-4.6), the 600s session ceiling
-    still dominated failures. claude-sonnet-4.6 supports
+    still dominated failures. claude-sonnet-5 supports
     `reasoning_effort` ('low'/'medium'/'high'/'max') — pinning to
     'low' should force faster turnaround. The kernel threads this
     into `AgentCall.model_options`; the CopilotProvider reads it.
@@ -186,13 +186,13 @@ def test_reasoning_effort_carried_on_model_spec() -> None:
     cfg = _config({
         "implementer": {
             "provider": "copilot",
-            "model": "claude-sonnet-4.6",
+            "model": "claude-sonnet-5",
             "reasoning_effort": "low",
         },
     })
     resolved = resolve_model_for_role("implementer", cfg)
     assert resolved.provider == "copilot"
-    assert resolved.model == "claude-sonnet-4.6"
+    assert resolved.model == "claude-sonnet-5"
     assert resolved.reasoning_effort == "low"
     assert resolved.reasoning_summary is None
     assert resolved.context_tier is None
@@ -204,7 +204,7 @@ def test_all_three_reasoning_knobs_carried() -> None:
     cfg = _config({
         "implementer": {
             "provider": "copilot",
-            "model": "claude-sonnet-4.6",
+            "model": "claude-sonnet-5",
             "reasoning_effort": "max",
             "reasoning_summary": "concise",
             "context_tier": "extended",
@@ -257,7 +257,7 @@ def test_reasoning_effort_invalid_shape_fails_closed() -> None:
     cfg = _config({
         "implementer": {
             "provider": "copilot",
-            "model": "claude-sonnet-4.6",
+            "model": "claude-sonnet-5",
             "reasoning_effort": 42,
         },
     })

@@ -3,7 +3,7 @@
 Covers:
 
 * Happy path: agent returns 1 file change, tests pass, PR created.
-* Agent returns no_changes → `end_failed`.
+* Agent returns no_changes / blocked plan → `end_needs_human`.
 * Agent returns BadOutput → `end_handoff` (NeedsHuman terminal),
   no auto-retry of the agent.
 * Tests fail first iteration → coder revises → tests pass → PR created.
@@ -37,6 +37,7 @@ from requiem.toolbelt import FakeFileClient, RealGitClient, Toolbelt
 from requiem.workflows.implementation import (
     ImplementationInputs,
     ImplementationResult,
+    DetectedTestCommand,
     TestRunResult,
     build_engine,
     build_workflow,
@@ -301,15 +302,21 @@ class TestValidateRelativePath:
 class TestDetectTestCommand:
     def test_python_via_pyproject(self, tmp_path: Path) -> None:
         (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
-        assert detect_test_command(tmp_path) == "pytest -q"
+        assert detect_test_command(tmp_path) == DetectedTestCommand("pytest -q", tmp_path)
 
     def test_node_via_package_json(self, tmp_path: Path) -> None:
         (tmp_path / "package.json").write_text("{}")
-        assert detect_test_command(tmp_path) == "npm test"
+        assert detect_test_command(tmp_path) == DetectedTestCommand("npm test", tmp_path)
 
     def test_dotnet_via_csproj(self, tmp_path: Path) -> None:
         (tmp_path / "App.csproj").write_text("<Project/>")
-        assert detect_test_command(tmp_path) == "dotnet test --no-build"
+        assert detect_test_command(tmp_path) == DetectedTestCommand("dotnet test --no-build", tmp_path)
+
+    def test_nested_project_uses_subdir_cwd(self, tmp_path: Path) -> None:
+        nested = tmp_path / "src" / "service"
+        nested.mkdir(parents=True)
+        (nested / "package.json").write_text("{}")
+        assert detect_test_command(tmp_path) == DetectedTestCommand("npm test", nested)
 
     def test_none_for_unknown(self, tmp_path: Path) -> None:
         assert detect_test_command(tmp_path) is None
@@ -459,7 +466,7 @@ async def test_root_yields_impl_topology_branch(repo_path: Path, tmp_path: Path)
 # ---- no changes ----
 
 
-async def test_no_changes_goes_to_end_failed(repo_path: Path, tmp_path: Path) -> None:
+async def test_no_changes_goes_to_end_needs_human(repo_path: Path, tmp_path: Path) -> None:
     twig = FakeTwig(item=_make_item())
     gh = FakeGh()
     provider = FakeProvider(scripts={
@@ -474,8 +481,8 @@ async def test_no_changes_goes_to_end_failed(repo_path: Path, tmp_path: Path) ->
 
     result = await engine.run("nochanges")
     assert isinstance(result, Completed)
-    assert result.disposition == "failed"
-    assert result.final_node == "end_failed"
+    assert result.disposition == "needs_human"
+    assert result.final_node == "end_needs_human"
     # Critically: no PR was opened.
     assert gh.created_calls == []
     # And no spurious twig comment.
@@ -485,10 +492,10 @@ async def test_no_changes_goes_to_end_failed(repo_path: Path, tmp_path: Path) ->
 # ---- bad output ----
 
 
-async def test_bad_output_routes_to_handoff_no_retry(repo_path: Path, tmp_path: Path) -> None:
+async def test_bad_output_retries_once_then_succeeds(repo_path: Path, tmp_path: Path) -> None:
+    _make_pushable(repo_path)
     twig = FakeTwig(item=_make_item())
-    gh = FakeGh()
-    # Two BadOutputs would be needed if we auto-retried; we don't.
+    gh = FakeGh(pr_number=99)
     provider = FakeProvider(scripts={
         "coder": [
             BadOutput(
@@ -496,6 +503,7 @@ async def test_bad_output_routes_to_handoff_no_retry(repo_path: Path, tmp_path: 
                 validation_errors=("missing file_changes",),
                 raw_output="{}",
             ),
+            _coder_creates("MARKER.md"),
         ],
         "coder_revision": [],
     })
@@ -506,12 +514,10 @@ async def test_bad_output_routes_to_handoff_no_retry(repo_path: Path, tmp_path: 
     )
     result = await engine.run("badout")
     assert isinstance(result, Completed)
-    # bad_output is a SURRENDER → end_needs_human (disposition needs_human), not
-    # the success-handoff end_handoff and not end_failed (ADR-0013 B2).
-    assert result.final_node == "end_needs_human"
-    assert result.disposition == "needs_human"
-    # FakeProvider records call count; bad_output was returned once.
-    assert len(provider.calls) == 1
+    assert result.final_node == "end_handoff"
+    assert result.disposition == "completed"
+    assert len(provider.calls) == 2
+    assert (repo_path / "MARKER.md").exists()
 
 
 # ---- run-#30 follow-up: defensive worktree cleanup on coder failure --
@@ -1308,7 +1314,7 @@ def test_implementation_engine_receives_process_config():
     ``process_config=`` and the kernel always fell back to provider
     defaults — silently ignoring operator-supplied ``models:`` in
     process.yaml. Caught in run #28 against AB#62759077 (the
-    ``models.implementer: claude-sonnet-4.6`` block had zero effect)."""
+    ``models.implementer: claude-sonnet-5`` block had zero effect)."""
     import tempfile
     from pathlib import Path
     from requiem.workflows.implementation import (
@@ -1323,7 +1329,7 @@ def test_implementation_engine_receives_process_config():
         implementable_types=frozenset(),
         types={},
         roles={},
-        models={"implementer": {"provider": "copilot", "model": "claude-sonnet-4.6"}},
+        models={"implementer": {"provider": "copilot", "model": "claude-sonnet-5"}},
         source=None, sha256=None,
     )
 

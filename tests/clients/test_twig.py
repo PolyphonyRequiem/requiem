@@ -211,6 +211,10 @@ class TestShow:
         assert args[0] == "twig"
         assert list(args[1:]) == ["show", "7", "--output", "json"]
 
+    def test_timeout_uses_env_override(self, monkeypatch):
+        monkeypatch.setenv("REQUIEM_TWIG_TIMEOUT_S", "75")
+        assert TwigClient()._timeout_s == 75.0
+
     def test_show_no_parent_yields_none(self):
         payload = json.loads(_ITEM_JSON)
         payload["parentId"] = None
@@ -331,6 +335,49 @@ class TestListChildren:
         with patch(_PATCH_TARGET, fake):
             children = asyncio.run(TwigClient().list_children_async(1234))
         assert children == []
+
+
+class TestAppendDescription:
+    def test_append_description_updates_then_reads_back(self):
+        calls: list[list[str]] = []
+
+        async def factory(*args, **kwargs):
+            calls.append(list(args))
+            if args[1] == "update":
+                return _FakeProc(b'{"ok": true}', b"", 0)
+            payload = json.loads(_ITEM_JSON)
+            payload["fields"] = {
+                "System.Description": (
+                    "<p>Existing</p><p>Requiem-Lineage-v1: "
+                    "scenario_id=1200 plan_id=plan-1200 synth_id=1234</p>"
+                )
+            }
+            return _FakeProc(json.dumps(payload).encode(), b"", 0)
+
+        with patch(_PATCH_TARGET, factory):
+            item = asyncio.run(
+                TwigClient().append_description_async(
+                    1234,
+                    "Requiem-Lineage-v1: "
+                    "scenario_id=1200 plan_id=plan-1200 synth_id=1234",
+                )
+            )
+
+        assert item.id == 1234
+        assert calls[0][1:] == [
+            "update",
+            "System.Description",
+            "Requiem-Lineage-v1: "
+            "scenario_id=1200 plan_id=plan-1200 synth_id=1234",
+            "--id",
+            "1234",
+            "--append",
+            "--format",
+            "markdown",
+            "--output",
+            "json",
+        ]
+        assert calls[1][1:] == ["show", "1234", "--output", "json"]
 
 
 # ---- create_child (Wave 6 / Liszt) -------------------------------------

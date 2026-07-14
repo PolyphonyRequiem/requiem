@@ -36,7 +36,19 @@ def _pr(number: int, head: str, base: str = "main") -> RepoPullRequest:
 
 class RecordingAdo(FakeAdoClient):
     def __init__(self, *args, events: list[str], **kwargs):
-        super().__init__(*args, **kwargs)
+        default_branches = dict(kwargs.pop("default_branches", {}) or {})
+        default_branches.setdefault(REPO, "main")
+        refs = dict(kwargs.pop("refs", {}) or {})
+        refs.setdefault(
+            (REPO, default_branches[REPO]),
+            "main-sha",
+        )
+        super().__init__(
+            *args,
+            default_branches=default_branches,
+            refs=refs,
+            **kwargs,
+        )
         self.events = events
 
     async def abandon_pr(
@@ -68,11 +80,19 @@ class FakeGit:
         worktrees: list[dict[str, str]] | None = None,
         remote_url: str = REMOTE_URL,
         events: list[str] | None = None,
+        repo_root: Path | None = None,
+        current_branch: str = "main",
+        current_sha: str = "main-sha",
+        clean: bool = True,
     ) -> None:
         self.branches = dict(branches or {})
         self.worktrees = list(worktrees or [])
         self.remote_url = remote_url
         self.events = events if events is not None else []
+        self.repo_root = Path(repo_root).resolve() if repo_root else None
+        self.current_branch = current_branch
+        self.current_sha = current_sha
+        self.clean = clean
 
     async def git_remote_url(self, remote: str = "origin") -> str:
         assert remote == "origin"
@@ -83,6 +103,72 @@ class FakeGit:
 
     async def git_worktree_list(self) -> list[dict[str, str]]:
         return list(self.worktrees)
+
+    async def git_current_branch(self) -> str:
+        return self.current_branch
+
+    async def git_head_sha(self) -> str:
+        return self.current_sha
+
+    async def git_is_clean(self) -> bool:
+        return self.clean
+
+    async def git_rebaseline_head(
+        self,
+        *,
+        remote: str,
+        branch: str,
+        expected_current_branch: str,
+        expected_current_sha: str,
+        expected_target_sha: str,
+    ) -> None:
+        if remote != "origin":
+            raise AdoUnknownError(f"unexpected remote {remote}")
+        if not self.clean:
+            raise AdoUnknownError("selected worktree is dirty")
+        if (
+            self.current_branch != expected_current_branch
+            or self.current_sha != expected_current_sha
+        ):
+            raise AdoUnknownError("selected worktree HEAD drift")
+        self.events.append(
+            "rebaseline:"
+            f"{expected_current_branch}@{expected_current_sha}"
+            f"->{remote}/{branch}@{expected_target_sha}"
+        )
+        self.current_branch = "HEAD"
+        self.current_sha = expected_target_sha
+        if self.repo_root is not None:
+            for worktree in self.worktrees:
+                if Path(worktree["worktree"]).resolve() == self.repo_root:
+                    worktree.pop("branch", None)
+                    worktree["HEAD"] = expected_target_sha
+                    break
+
+    async def git_detach_head(
+        self,
+        *,
+        expected_branch: str,
+        expected_sha: str,
+    ) -> None:
+        expected_ref = f"refs/heads/{expected_branch}"
+        if self.repo_root is None:
+            raise AdoUnknownError("fake git has no selected worktree")
+        for worktree in self.worktrees:
+            if Path(worktree["worktree"]).resolve() != self.repo_root:
+                continue
+            if worktree.get("branch") != expected_ref:
+                raise AdoUnknownError(
+                    f"current worktree branch drift for {expected_branch}"
+                )
+            if self.branches.get(expected_branch) != expected_sha:
+                raise AdoUnknownError(
+                    f"current worktree SHA drift for {expected_branch}"
+                )
+            self.events.append(f"detach:{expected_branch}")
+            del worktree["branch"]
+            return
+        raise AdoUnknownError("current worktree is not registered")
 
     async def git_delete_branch_ref(
         self, name: str, *, expected_sha: str
@@ -197,6 +283,7 @@ async def test_apply_orders_mutations_and_verifies_zero_state(
 
     assert result.status == "completed"
     assert events == [
+        "rebaseline:main@main-sha->origin/main@main-sha",
         "abandon:1",
         "abandon:2",
         "remote:impl/42-7",
@@ -214,6 +301,7 @@ async def test_apply_orders_mutations_and_verifies_zero_state(
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     assert payload["status"] == "completed"
     assert [action["kind"] for action in payload["actions"]] == [
+        "rebaseline_selected_worktree",
         "abandon_pr",
         "abandon_pr",
         "delete_remote_ref",
@@ -223,6 +311,157 @@ async def test_apply_orders_mutations_and_verifies_zero_state(
         "delete_local_ref",
         "clean_local_state",
     ]
+
+
+async def test_apply_vacates_selected_cleanup_worktree_before_mutation(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    branch = "impl/42-7"
+    ado = RecordingAdo(
+        events=events,
+        refs={(REPO, branch): "impl-sha"},
+        open_prs=[_pr(1, branch, "feature/42")],
+    )
+    git = FakeGit(
+        branches={branch: "impl-sha"},
+        worktrees=[{
+            "worktree": tmp_path.as_posix(),
+            "branch": f"refs/heads/{branch}",
+        }],
+        events=events,
+        repo_root=tmp_path,
+        current_branch=branch,
+        current_sha="impl-sha",
+    )
+    manifest = tmp_path / "cleanup.json"
+
+    result = await run_pre_run_cleanup(
+        repo=REPO,
+        repo_path=tmp_path,
+        root_item=42,
+        log_dir=tmp_path / "runs",
+        repo_client=ado,
+        git=git,
+        apply=True,
+        manifest_path=manifest,
+        lease_check=lambda: None,
+        lease_identity={"token": 1, "holder": "test"},
+        local_state_cleaner=lambda *_: events.append("state"),
+    )
+
+    assert result.status == "completed"
+    assert events == [
+        f"rebaseline:{branch}@impl-sha->origin/main@main-sha",
+        "abandon:1",
+        f"remote:{branch}",
+        f"local:{branch}",
+        "state",
+    ]
+    assert result.after is not None
+    assert result.after.checked_out == ()
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    assert payload["actions"][0] == {
+        "kind": "rebaseline_selected_worktree",
+        "worktree": str(tmp_path.resolve()),
+        "source_branch": branch,
+        "source_sha": "impl-sha",
+        "target_branch": "main",
+        "target_sha": "main-sha",
+    }
+
+
+async def test_apply_rebaselines_clean_detached_selected_worktree(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    stale_sha = "stale-leaf-sha"
+    base_sha = "verified-main-sha"
+    ado = RecordingAdo(
+        events=events,
+        default_branches={REPO: "main"},
+        refs={(REPO, "main"): base_sha},
+    )
+    git = FakeGit(
+        branches={"main": base_sha},
+        worktrees=[{
+            "worktree": tmp_path.as_posix(),
+            "HEAD": stale_sha,
+        }],
+        events=events,
+        repo_root=tmp_path,
+        current_branch="HEAD",
+        current_sha=stale_sha,
+    )
+    manifest = tmp_path / "cleanup.json"
+
+    result = await run_pre_run_cleanup(
+        repo=REPO,
+        repo_path=tmp_path,
+        root_item=42,
+        log_dir=tmp_path / "runs",
+        repo_client=ado,
+        git=git,
+        apply=True,
+        manifest_path=manifest,
+        lease_check=lambda: None,
+        lease_identity={"token": 1, "holder": "test"},
+        local_state_cleaner=lambda *_: events.append("state"),
+    )
+
+    assert result.status == "completed"
+    assert events == [
+        f"rebaseline:HEAD@{stale_sha}->origin/main@{base_sha}",
+        "state",
+    ]
+    assert git.current_branch == "HEAD"
+    assert git.current_sha == base_sha
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    assert payload["actions"][0] == {
+        "kind": "rebaseline_selected_worktree",
+        "worktree": str(tmp_path.resolve()),
+        "source_branch": "HEAD",
+        "source_sha": stale_sha,
+        "target_branch": "main",
+        "target_sha": base_sha,
+    }
+    assert payload["schema_version"] == 2
+
+
+async def test_apply_refuses_dirty_selected_worktree_before_mutation(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    manifest = tmp_path / "cleanup.json"
+
+    with pytest.raises(CleanupSafetyError, match="worktree is dirty"):
+        await run_pre_run_cleanup(
+            repo=REPO,
+            repo_path=tmp_path,
+            root_item=42,
+            log_dir=tmp_path / "runs",
+            repo_client=RecordingAdo(events=events),
+            git=FakeGit(
+                events=events,
+                current_branch="HEAD",
+                current_sha="stale-leaf-sha",
+                clean=False,
+            ),
+            apply=True,
+            manifest_path=manifest,
+            lease_check=lambda: None,
+            lease_identity={"token": 1, "holder": "test"},
+            local_state_cleaner=lambda *_: events.append("state"),
+        )
+
+    assert events == []
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    assert payload["before"]["selected_head"] == {
+        "branch": "HEAD",
+        "sha": "stale-leaf-sha",
+        "clean": False,
+    }
 
 
 async def test_apply_blocks_checked_out_candidate_before_remote_mutation(
@@ -263,6 +502,49 @@ async def test_apply_blocks_checked_out_candidate_before_remote_mutation(
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     assert payload["status"] == "failed"
     assert "checked out" in payload["error"]
+
+
+async def test_apply_does_not_vacate_when_another_worktree_is_blocking(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    selected_branch = "impl/42-7"
+    blocked_branch = "feature/42"
+    git = FakeGit(
+        branches={
+            selected_branch: "impl-sha",
+            blocked_branch: "feature-sha",
+        },
+        worktrees=[
+            {
+                "worktree": tmp_path.as_posix(),
+                "branch": f"refs/heads/{selected_branch}",
+            },
+            {
+                "worktree": (tmp_path / "other").as_posix(),
+                "branch": f"refs/heads/{blocked_branch}",
+            },
+        ],
+        events=events,
+        repo_root=tmp_path,
+    )
+
+    with pytest.raises(CleanupSafetyError, match="checked out"):
+        await run_pre_run_cleanup(
+            repo=REPO,
+            repo_path=tmp_path,
+            root_item=42,
+            log_dir=tmp_path / "runs",
+            repo_client=FakeAdoClient(),
+            git=git,
+            apply=True,
+            manifest_path=tmp_path / "cleanup.json",
+            lease_check=lambda: None,
+            lease_identity={"token": 1, "holder": "test"},
+            local_state_cleaner=lambda *_: None,
+        )
+
+    assert events == []
 
 
 async def test_apply_fails_on_state_drift_before_mutation(

@@ -602,6 +602,7 @@ class Engine:
                     spec=spec,
                     user_message=prompt,
                     retry_key=f"{ctx.run_id}:{ctx.node_id}#{ctx.attempt}",
+                    model_options=spec.model_options,
                 )
                 return await self._invoke_with_resolved_model(call, ctx)
             if isinstance(node, TeamNode):
@@ -677,6 +678,7 @@ class Engine:
                 spec=spec,
                 user_message=prompt,
                 retry_key=f"{ctx.run_id}:{node.node_id}:{branch.agent}",
+                model_options=spec.model_options,
             )
             # Team branches run atomically (the team's verb_completed is
             # one shot — a kill mid-team restarts the whole team), so we

@@ -11,6 +11,16 @@ from typing import Sequence
 
 from requiem.lease import FencedRootLease, LeaseError, LeaseLostError
 from requiem.pre_run_cleanup import default_manifest_path
+from requiem.sleep_inhibition import (
+    SleepInhibitionError,
+    create_system_sleep_inhibitor,
+)
+
+
+_EXPLICIT_SLEEP_WARNING = (
+    "requiem-launch: warning: lid-close, power-button, or user-initiated sleep "
+    "cancels this fenced run"
+)
 
 
 def _cleanup_program() -> list[str]:
@@ -85,64 +95,75 @@ def run_launcher(args: argparse.Namespace) -> int:
         if args.manifest
         else default_manifest_path(Path(args.log_dir).resolve(), args.item).resolve()
     )
-    lease = FencedRootLease(
-        lease_dir=Path(args.lease_dir),
-        repo=args.ado_repo,
-        root_item=args.item,
-        ttl_seconds=args.lease_ttl,
-        heartbeat_seconds=args.lease_heartbeat,
-        acquire_timeout_seconds=args.lease_timeout,
-    )
-
-    with lease:
-        cleanup = subprocess.run(
-            build_cleanup_command(args, lease, manifest_path=manifest_path),
-            cwd=Path(args.repo_path).resolve(),
-            check=False,
+    with create_system_sleep_inhibitor():
+        print(_EXPLICIT_SLEEP_WARNING, file=sys.stderr)
+        lease = FencedRootLease(
+            lease_dir=Path(args.lease_dir),
+            repo=args.ado_repo,
+            root_item=args.item,
+            ttl_seconds=args.lease_ttl,
+            heartbeat_seconds=args.lease_heartbeat,
+            acquire_timeout_seconds=args.lease_timeout,
         )
-        if cleanup.returncode != 0:
-            return int(cleanup.returncode or 1)
-        lease.assert_current()
 
-        identity = lease.identity
-        env = dict(os.environ)
-        env.update({
-            "REQUIEM_LEASE_RECORD": str(identity.record_path),
-            "REQUIEM_LEASE_TOKEN": str(identity.token),
-            "REQUIEM_LEASE_HOLDER": identity.holder,
-            "REQUIEM_LEASE_REPO": identity.repo,
-            "REQUIEM_LEASE_ROOT_ITEM": str(identity.root_item),
-            "REQUIEM_CLEANUP_MANIFEST": str(manifest_path),
-        })
-        child = subprocess.Popen(
-            command,
-            cwd=scenario_cwd,
-            env=env,
-        )
-        try:
-            while child.poll() is None:
-                time.sleep(0.25)
-                lease.assert_current()
-        except (KeyboardInterrupt, LeaseLostError):
-            _terminate(child)
-            if sys.exc_info()[0] is KeyboardInterrupt:
-                return 130
-            raise
-        lease.assert_current()
-        return int(child.returncode or 0)
+        with lease:
+            cleanup = subprocess.run(
+                build_cleanup_command(args, lease, manifest_path=manifest_path),
+                cwd=Path(args.repo_path).resolve(),
+                check=False,
+            )
+            if cleanup.returncode != 0:
+                return int(cleanup.returncode or 1)
+            lease.assert_current()
+
+            identity = lease.identity
+            env = dict(os.environ)
+            env.update({
+                "REQUIEM_LEASE_RECORD": str(identity.record_path),
+                "REQUIEM_LEASE_TOKEN": str(identity.token),
+                "REQUIEM_LEASE_HOLDER": identity.holder,
+                "REQUIEM_LEASE_REPO": identity.repo,
+                "REQUIEM_LEASE_ROOT_ITEM": str(identity.root_item),
+                "REQUIEM_CLEANUP_MANIFEST": str(manifest_path),
+            })
+            child = subprocess.Popen(
+                command,
+                cwd=scenario_cwd,
+                env=env,
+            )
+            try:
+                while child.poll() is None:
+                    time.sleep(0.25)
+                    lease.assert_current()
+            except (KeyboardInterrupt, LeaseLostError):
+                _terminate(child)
+                if sys.exc_info()[0] is KeyboardInterrupt:
+                    return 130
+                raise
+            lease.assert_current()
+            return int(child.returncode or 0)
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="requiem-launch",
         description=(
-            "Acquire a shared fenced root lease, apply pre-run cleanup, then "
-            "hold the lease until the supplied Scenario process exits."
+            "Inhibit automatic system sleep, acquire a shared fenced root "
+            "lease, apply pre-run cleanup, then hold both until the supplied "
+            "Scenario process exits."
         ),
     )
     parser.add_argument("--item", type=int, required=True)
     parser.add_argument("--ado-repo", required=True)
-    parser.add_argument("--repo-path", type=Path, required=True)
+    parser.add_argument(
+        "--repo-path",
+        type=Path,
+        required=True,
+        help=(
+            "Selected checkout for fenced cleanup and clean, verified "
+            "default-branch rebaselining."
+        ),
+    )
     parser.add_argument(
         "--scenario-cwd",
         type=Path,
@@ -173,7 +194,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
         return run_launcher(args)
-    except (LeaseError, ValueError) as error:
+    except (LeaseError, SleepInhibitionError, ValueError) as error:
         print(f"requiem-launch: {type(error).__name__}: {error}", file=sys.stderr)
         return 1
 

@@ -24,13 +24,15 @@ import pytest
 from requiem.agent import FakeProvider
 from requiem.clients.twig import TwigItem
 from requiem.kernel import Completed, Failed
-from requiem.outcomes import BadOutput
+from requiem.outcomes import BadOutput, RetryableFailure
+from requiem.plan_lineage import format_commit_marker
 from requiem.persistence import replay
 from requiem.workflows.planning import (
     FakeTwigClient,
     ITER_CAP,
     PlanResult,
     VALID_ESCALATION_POLICIES,
+    _pin_validation_errors,
     build_engine,
     build_workflow,
     completed_from_log,
@@ -91,6 +93,53 @@ def _leaf_planner_output() -> dict:
         "estimated_complexity": "small",
         "rationale": "The change is localised to one module.",
     }
+
+
+def _planner_token_exhaustion(
+    retry_key: str = "planner#1",
+) -> RetryableFailure:
+    error = (
+        "network_timeout: session input tokens (90578) exceeded "
+        "max_cumulative_input_tokens=80000"
+    )
+    return RetryableFailure(
+        retry_key=retry_key,
+        error_kind="network_timeout",
+        message=error,
+        receipts=({
+            "kind": "llm_call",
+            "model": "claude-sonnet-5",
+            "input_tokens": 90578,
+            "output_tokens": 152,
+            "latency_ms": 240096,
+            "request_id": "run-47",
+            "error": error,
+        },),
+    )
+
+
+def _reviewer_request_body_timeout(
+    retry_key: str = "reviewer#1",
+) -> RetryableFailure:
+    error = (
+        "copilot session error: CAPIError: 408 "
+        '{"error":{"message":"Timed out reading request body. Try again, '
+        'or use a smaller request size.","code":"user_request_timeout"}}'
+    )
+    return RetryableFailure(
+        retry_key=retry_key,
+        error_kind="provider_unavailable",
+        message=error,
+        receipts=({
+            "kind": "llm_call",
+            "model": "claude-sonnet-5",
+            "input_tokens": 37732,
+            "output_tokens": 342,
+            "latency_ms": 378164,
+            "request_id": "run-48b-reviewer",
+            "error": error,
+        },),
+    )
 
 
 def _decomposable_planner_output() -> dict:
@@ -163,6 +212,426 @@ async def test_happy_path_leaf(log_dir: Path):
     assert f"AB#{ITEM_ID}" in card
     assert "leaf" in card
     assert "Refactor outcome dispatch" in card
+
+
+async def test_fetch_item_inventories_scenario_parentage_and_lineage(
+    log_dir: Path,
+):
+    twig = _twig()
+    direct_id = 7001
+    nested_id = 7002
+    twig.items[direct_id] = TwigItem(
+        id=direct_id,
+        title="Existing direct child",
+        state="Active",
+        area_path="Polyphony\\Engine",
+        work_item_type="Task",
+        parent_id=ITEM_ID,
+        raw={
+            "description": format_commit_marker(
+                f"plan-{ITEM_ID}-prior", ITEM_ID * 100 + 1
+            )
+        },
+    )
+    twig.items[nested_id] = TwigItem(
+        id=nested_id,
+        title="Unmarked nested child",
+        state="Active",
+        area_path="Polyphony\\Engine",
+        work_item_type="Task",
+        parent_id=direct_id,
+        raw={},
+    )
+    provider = FakeProvider(
+        scripts={
+            "planner": [_leaf_planner_output()],
+            "plan_reviewer": [{"verdict": "approve", "feedback": "LGTM."}],
+        }
+    )
+    engine = build_engine(
+        log_dir, item_id=ITEM_ID, twig=twig, provider=provider
+    )
+
+    await engine.run("inventory")
+
+    completed = completed_from_log(engine.log_path("inventory"))
+    fetched = completed["fetch_item"]["value"]
+    assert fetched["existing_work_complete"] is True
+    by_id = {
+        entry["item_id"]: entry for entry in fetched["existing_work"]
+    }
+    assert by_id[direct_id]["parent_id"] == ITEM_ID
+    assert by_id[direct_id]["same_scenario_lineage"] is True
+    assert by_id[nested_id]["path"] == [ITEM_ID, direct_id, nested_id]
+    assert by_id[nested_id]["same_scenario_lineage"] is False
+
+
+async def test_invalid_overlap_pin_is_revised_into_aligned_approved_tree(
+    log_dir: Path,
+):
+    existing_id = 7777
+    twig = _twig()
+    twig.items[existing_id] = TwigItem(
+        id=existing_id,
+        title="Existing observability",
+        state="Active",
+        area_path="Polyphony\\Engine",
+        work_item_type="Task",
+        parent_id=ITEM_ID,
+        raw={
+            "description": format_commit_marker(
+                f"plan-{ITEM_ID}-prior", ITEM_ID * 100 + 1
+            )
+        },
+    )
+    invalid = {
+        **_decomposable_planner_output(),
+        "children": [
+            {
+                "title": "Wrong title",
+                "description": "overlap",
+                "work_item_type": "Task",
+                "item_id": existing_id,
+            }
+        ],
+    }
+    reconciled = {
+        **_decomposable_planner_output(),
+        "children": [
+            {
+                "title": "Existing observability",
+                "description": "overlap",
+                "work_item_type": "Task",
+                "item_id": existing_id,
+            }
+        ],
+    }
+    provider = FakeProvider(
+        scripts={
+            "planner": [invalid, reconciled, _leaf_planner_output()],
+            "plan_reviewer": [
+                {"verdict": "approve", "feedback": "Exact reuse is sound."},
+                {"verdict": "approve", "feedback": "Atomic child."},
+            ],
+        }
+    )
+    engine = build_engine(
+        log_dir, item_id=ITEM_ID, twig=twig, provider=provider
+    )
+
+    result = await engine.run("pin-reconcile")
+
+    assert isinstance(result, Completed), result
+    assert result.final_node == "end"
+    completed = completed_from_log(engine.log_path("pin-reconcile"))
+    assert completed["pin_validator_1"]["error_kind"] == "pin_reconcile"
+    assert completed["pin_validator_2"]["kind"] == "success"
+    tree = json.loads(
+        (log_dir / "pin-reconcile.plan.tree.json").read_text(encoding="utf-8")
+    )
+    assert tree["verdict"] == "approved"
+    assert tree["proposals"][0]["item_id"] == existing_id
+    assert tree["children"][0]["item_id"] == existing_id
+    assert tree["children"][0]["final_verdict"] == "approved"
+
+
+async def test_nested_omitted_exact_durable_pin_is_revised_before_review(
+    log_dir: Path,
+):
+    deliverable_id = 7001
+    task_ids = (7101, 7102, 7103)
+    task_titles = ("Existing task one", "Existing task two", "Existing task three")
+    twig = _twig()
+    twig.items[deliverable_id] = TwigItem(
+        id=deliverable_id,
+        title="Existing deliverable",
+        state="Active",
+        area_path="Polyphony\\Engine",
+        work_item_type="Feature",
+        parent_id=ITEM_ID,
+        raw={
+            "description": format_commit_marker(
+                f"plan-{ITEM_ID}-prior", ITEM_ID * 100 + 1
+            )
+        },
+    )
+    for index, (task_id, title) in enumerate(
+        zip(task_ids, task_titles, strict=True),
+        start=1,
+    ):
+        twig.items[task_id] = TwigItem(
+            id=task_id,
+            title=title,
+            state="Active",
+            area_path="Polyphony\\Engine",
+            work_item_type="Task",
+            parent_id=deliverable_id,
+            raw={
+                "description": format_commit_marker(
+                    f"plan-{ITEM_ID}-prior",
+                    deliverable_id * 100 + index,
+                )
+            },
+        )
+
+    root_plan = {
+        "summary": "Reuse the existing deliverable.",
+        "decomposable": True,
+        "children": [
+            {
+                "title": "Existing deliverable",
+                "description": "Existing durable work.",
+                "work_item_type": "Feature",
+                "item_id": deliverable_id,
+            }
+        ],
+        "estimated_complexity": "medium",
+        "rationale": "The exact durable child already exists.",
+    }
+
+    def nested_plan(*, include_all_pins: bool) -> dict:
+        children = [
+            {
+                "title": title,
+                "description": f"Reuse {title}.",
+                "work_item_type": "Task",
+                "item_id": task_id,
+            }
+            for task_id, title in zip(task_ids, task_titles, strict=True)
+        ]
+        if not include_all_pins:
+            children[1].pop("item_id")
+        return {
+            "summary": "Reuse all three existing tasks.",
+            "decomposable": True,
+            "children": children,
+            "estimated_complexity": "medium",
+            "rationale": "Each task is an exact durable child.",
+        }
+
+    provider = FakeProvider(
+        scripts={
+            "planner": [
+                root_plan,
+                nested_plan(include_all_pins=False),
+                nested_plan(include_all_pins=True),
+                _leaf_planner_output(),
+                _leaf_planner_output(),
+                _leaf_planner_output(),
+            ],
+            "plan_reviewer": [
+                {"verdict": "approve", "feedback": "Reuse the deliverable."},
+                {"verdict": "approve", "feedback": "All tasks are reconciled."},
+                {"verdict": "approve", "feedback": "Atomic task."},
+                {"verdict": "approve", "feedback": "Atomic task."},
+                {"verdict": "approve", "feedback": "Atomic task."},
+            ],
+        }
+    )
+    engine = build_engine(
+        log_dir,
+        item_id=ITEM_ID,
+        twig=twig,
+        provider=provider,
+    )
+
+    result = await engine.run("nested-pin-reconcile")
+
+    assert isinstance(result, Completed), result
+    child_log = log_dir / "nested-pin-reconcile__child_1.events.jsonl"
+    child_completed = completed_from_log(child_log)
+    assert child_completed["pin_validator_1"]["error_kind"] == "pin_reconcile"
+    assert f"must pin AB#{task_ids[1]}" in child_completed[
+        "pin_validator_1"
+    ]["details"]["feedback"]
+    assert "reviewer_1" not in child_completed
+    assert child_completed["pin_validator_2"]["kind"] == "success"
+
+    tree = json.loads(
+        (log_dir / "nested-pin-reconcile.plan.tree.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    nested = tree["children"][0]
+    assert [proposal["item_id"] for proposal in nested["proposals"]] == list(
+        task_ids
+    )
+    assert [child["item_id"] for child in nested["children"]] == list(task_ids)
+
+
+@pytest.mark.parametrize(
+    ("existing_work_complete", "inventory", "expected_fragment"),
+    [
+        (False, [], "inventory is incomplete"),
+        (
+            True,
+            [
+                {
+                    "item_id": 8001,
+                    "title": "Exact task",
+                    "work_item_type": "Task",
+                    "parent_id": ITEM_ID,
+                    "same_scenario_lineage": False,
+                }
+            ],
+            "lacks durable Requiem lineage",
+        ),
+        (
+            True,
+            [
+                {
+                    "item_id": 8001,
+                    "title": "Exact task",
+                    "work_item_type": "Task",
+                    "parent_id": ITEM_ID,
+                    "same_scenario_lineage": True,
+                },
+                {
+                    "item_id": 8002,
+                    "title": "Exact task",
+                    "work_item_type": "Task",
+                    "parent_id": ITEM_ID,
+                    "same_scenario_lineage": True,
+                },
+            ],
+            "reuse is ambiguous",
+        ),
+        (
+            True,
+            [
+                {
+                    "item_id": 8001,
+                    "title": "Exact task",
+                    "work_item_type": "Task",
+                    "parent_id": ITEM_ID + 1,
+                    "same_scenario_lineage": True,
+                }
+            ],
+            "silently reparent or duplicate",
+        ),
+    ],
+)
+def test_unpinned_existing_work_fails_closed(
+    existing_work_complete: bool,
+    inventory: list[dict],
+    expected_fragment: str,
+):
+    planner = {
+        "children": [
+            {
+                "title": "Exact task",
+                "description": "Proposed work.",
+                "work_item_type": "Task",
+            }
+        ]
+    }
+    item = {
+        "item_id": ITEM_ID,
+        "scenario_item_id": ITEM_ID,
+        "existing_work": inventory,
+        "existing_work_complete": existing_work_complete,
+    }
+
+    errors = _pin_validation_errors(
+        planner,
+        item,
+        ancestor_item_ids=(),
+    )
+
+    assert errors
+    assert expected_fragment in errors[0]
+
+
+def test_unpinned_genuinely_new_work_passes_reconciliation():
+    errors = _pin_validation_errors(
+        {
+            "children": [
+                {
+                    "title": "New task",
+                    "description": "No exact existing work.",
+                    "work_item_type": "Task",
+                }
+            ]
+        },
+        {
+            "item_id": ITEM_ID,
+            "scenario_item_id": ITEM_ID,
+            "existing_work": [
+                {
+                    "item_id": 8001,
+                    "title": "Different task",
+                    "work_item_type": "Task",
+                    "parent_id": ITEM_ID,
+                    "same_scenario_lineage": True,
+                }
+            ],
+            "existing_work_complete": True,
+        },
+        ancestor_item_ids=(),
+    )
+
+    assert errors == []
+
+
+async def test_unresolved_overlap_pin_routes_to_lineage_gate(log_dir: Path):
+    existing_id = 8888
+    twig = _twig()
+    for candidate_id in (existing_id, existing_id + 1):
+        twig.items[candidate_id] = TwigItem(
+            id=candidate_id,
+            title="Ambiguous overlap",
+            state="Active",
+            area_path="Polyphony\\Engine",
+            work_item_type="Task",
+            parent_id=ITEM_ID,
+            raw={
+                "description": format_commit_marker(
+                    f"plan-{ITEM_ID}-prior",
+                    ITEM_ID * 100 + candidate_id - existing_id + 1,
+                )
+            },
+        )
+    unsafe = {
+        **_decomposable_planner_output(),
+        "children": [
+            {
+                "title": "Ambiguous overlap",
+                "description": "cannot prove ownership",
+                "work_item_type": "Task",
+                "item_id": existing_id,
+            }
+        ],
+    }
+    provider = FakeProvider(
+        scripts={
+            "planner": [unsafe] * ITER_CAP,
+            "plan_reviewer": [],
+        }
+    )
+    engine = build_engine(
+        log_dir,
+        item_id=ITEM_ID,
+        twig=twig,
+        provider=provider,
+        gate_handler=_proceed_handler,
+    )
+
+    result = await engine.run("pin-unresolved")
+
+    assert isinstance(result, Completed), result
+    assert result.final_node == "end_needs_human"
+    completed = completed_from_log(engine.log_path("pin-unresolved"))
+    assert f"pin_validator_{ITER_CAP}" in completed
+    assert all(
+        f"reviewer_{iteration}" not in completed
+        for iteration in range(1, ITER_CAP + 1)
+    )
+    events = list(replay(engine.log_path("pin-unresolved")))
+    assert any(
+        event.get("kind") == "gate_opened"
+        and event.get("node_id") == "lineage_gate"
+        for event in events
+    )
 
 
 async def test_decomposable_three_children(log_dir: Path):
@@ -693,6 +1162,259 @@ async def test_planner_bad_output_routes_to_human_no_retry(log_dir: Path):
     )
 
 
+# ---- bounded planner token recovery ------------------------------------
+
+
+async def test_recursive_planner_token_exhaustion_uses_one_evidence_only_retry(
+    log_dir: Path,
+):
+    root_plan = {
+        **_decomposable_planner_output(),
+        "summary": "One deliverable needs recursive planning.",
+        "children": [{
+            "title": "Preferred + fallback VMSS SKU config schema",
+            "description": (
+                "Define the preferred SKU, ordered fallbacks, and hard "
+                "eligibility constraints using the existing override layering."
+            ),
+            "work_item_type": "Deliverable",
+        }],
+    }
+    provider = FakeProvider(
+        scripts={
+            "planner": [root_plan, _planner_token_exhaustion()],
+            "bounded_planner": [{
+                **_leaf_planner_output(),
+                "summary": "A single bounded schema change.",
+            }],
+            "plan_reviewer": [
+                {"verdict": "approve", "feedback": "Root is sound."},
+                {"verdict": "approve", "feedback": "Recovered child is sound."},
+            ],
+        }
+    )
+    engine = build_engine(
+        log_dir,
+        item_id=ITEM_ID,
+        twig=_twig(),
+        provider=provider,
+    )
+
+    result = await engine.run("recursive-token-recovery")
+
+    assert isinstance(result, Completed), result
+    assert result.final_node == "end"
+    plan = project_plan_result(completed_from_log(engine.log_path(result.run_id)))
+    assert plan is not None
+    assert plan.final_verdict == "approved"
+    assert len(plan.children) == 1
+    assert plan.children[0].summary == "A single bounded schema change."
+
+    bounded_calls = [
+        call for call in provider.calls if call["agent"] == "bounded_planner"
+    ]
+    assert len(bounded_calls) == 1
+    assert bounded_calls[0]["model_options"] == {"disable_repo_tools": True}
+    assert "single bounded recovery attempt" in bounded_calls[0]["user_message"]
+    assert "Do not call tools" in bounded_calls[0]["user_message"]
+    assert "Preferred + fallback VMSS SKU config schema" in (
+        bounded_calls[0]["user_message"]
+    )
+
+    child_completed = completed_from_log(
+        log_dir / "recursive-token-recovery__child_1.events.jsonl"
+    )
+    recovery = child_completed["recover_planner_token_exhaustion_1"]
+    assert recovery["kind"] == "success"
+    assert recovery["value"]["trigger"]["input_tokens"] == 90578
+    assert child_completed["planner_recovery_1"]["kind"] == "success"
+
+
+async def test_non_token_planner_failure_does_not_use_bounded_retry(
+    log_dir: Path,
+):
+    provider = FakeProvider(
+        scripts={
+            "planner": [RetryableFailure(
+                retry_key="planner#1",
+                error_kind="provider_unavailable",
+                message="temporary upstream outage",
+            )],
+            "bounded_planner": [],
+            "plan_reviewer": [],
+        }
+    )
+    engine = build_engine(log_dir, item_id=ITEM_ID, twig=_twig(), provider=provider)
+
+    result = await engine.run("planner-runtime-failure")
+
+    assert isinstance(result, Completed), result
+    assert result.final_node == "fail_end_crash"
+    completed = completed_from_log(engine.log_path(result.run_id))
+    assert (
+        completed["recover_planner_token_exhaustion_1"]["error_kind"]
+        == "planner.runtime_failure"
+    )
+    assert all(call["agent"] != "bounded_planner" for call in provider.calls)
+
+
+async def test_bounded_planner_failure_is_not_retried_again(log_dir: Path):
+    provider = FakeProvider(
+        scripts={
+            "planner": [_planner_token_exhaustion("primary#1")],
+            "bounded_planner": [_planner_token_exhaustion("bounded#1")],
+            "plan_reviewer": [],
+        }
+    )
+    engine = build_engine(log_dir, item_id=ITEM_ID, twig=_twig(), provider=provider)
+
+    result = await engine.run("planner-bounded-failure")
+
+    assert isinstance(result, Completed), result
+    assert result.final_node == "fail_end_crash"
+    completed = completed_from_log(engine.log_path(result.run_id))
+    assert (
+        completed["finalize_planner_recovery_failure_1"]["error_kind"]
+        == "planner.bounded_retry_failed"
+    )
+    bounded_calls = [
+        call for call in provider.calls if call["agent"] == "bounded_planner"
+    ]
+    assert len(bounded_calls) == 1
+
+
+# ---- bounded reviewer request-body recovery ----------------------------
+
+
+async def test_recursive_reviewer_request_timeout_uses_one_evidence_only_retry(
+    log_dir: Path,
+):
+    root_plan = {
+        **_decomposable_planner_output(),
+        "summary": "One deliverable needs recursive planning.",
+        "children": [{
+            "title": "Typed picked-SKU fallback consumption",
+            "description": (
+                "Plan the typed fallback-chain consumption across the Cluster "
+                "Bicep and Ev2 wiring."
+            ),
+            "work_item_type": "Deliverable",
+        }],
+    }
+    child_plan = {
+        **_leaf_planner_output(),
+        "summary": "The typed fallback consumption is one bounded implementation.",
+    }
+    provider = FakeProvider(
+        scripts={
+            "planner": [root_plan, child_plan],
+            "plan_reviewer": [
+                {"verdict": "approve", "feedback": "Root is sound."},
+                _reviewer_request_body_timeout(),
+            ],
+            "bounded_plan_reviewer": [{
+                "verdict": "approve",
+                "feedback": "The complete evidence supports this child plan.",
+            }],
+        }
+    )
+    engine = build_engine(
+        log_dir,
+        item_id=ITEM_ID,
+        twig=_twig(),
+        provider=provider,
+    )
+
+    result = await engine.run("recursive-reviewer-recovery")
+
+    assert isinstance(result, Completed), result
+    assert result.final_node == "end"
+    plan = project_plan_result(completed_from_log(engine.log_path(result.run_id)))
+    assert plan is not None
+    assert plan.final_verdict == "approved"
+    assert len(plan.children) == 1
+    assert plan.children[0].final_verdict == "approved"
+
+    bounded_calls = [
+        call for call in provider.calls
+        if call["agent"] == "bounded_plan_reviewer"
+    ]
+    assert len(bounded_calls) == 1
+    assert bounded_calls[0]["model_options"] == {"disable_repo_tools": True}
+    assert "single bounded recovery attempt" in bounded_calls[0]["user_message"]
+    assert "Do not call tools" in bounded_calls[0]["user_message"]
+    assert "Typed picked-SKU fallback consumption" in (
+        bounded_calls[0]["user_message"]
+    )
+
+    child_completed = completed_from_log(
+        log_dir / "recursive-reviewer-recovery__child_1.events.jsonl"
+    )
+    recovery = child_completed["recover_reviewer_request_body_timeout_1"]
+    assert recovery["kind"] == "success"
+    assert recovery["value"]["trigger"]["input_tokens"] == 37732
+    assert child_completed["reviewer_recovery_1"]["kind"] == "success"
+    assert child_completed["router_1"]["kind"] == "success"
+
+
+async def test_non_request_body_reviewer_failure_does_not_use_bounded_retry(
+    log_dir: Path,
+):
+    provider = FakeProvider(
+        scripts={
+            "planner": [_leaf_planner_output()],
+            "plan_reviewer": [RetryableFailure(
+                retry_key="reviewer#1",
+                error_kind="provider_unavailable",
+                message="temporary upstream outage",
+            )],
+            "bounded_plan_reviewer": [],
+        }
+    )
+    engine = build_engine(log_dir, item_id=ITEM_ID, twig=_twig(), provider=provider)
+
+    result = await engine.run("reviewer-runtime-failure")
+
+    assert isinstance(result, Completed), result
+    assert result.final_node == "fail_end_crash"
+    completed = completed_from_log(engine.log_path(result.run_id))
+    assert (
+        completed["recover_reviewer_request_body_timeout_1"]["error_kind"]
+        == "reviewer.runtime_failure"
+    )
+    assert all(
+        call["agent"] != "bounded_plan_reviewer" for call in provider.calls
+    )
+
+
+async def test_bounded_reviewer_failure_is_not_retried_again(log_dir: Path):
+    provider = FakeProvider(
+        scripts={
+            "planner": [_leaf_planner_output()],
+            "plan_reviewer": [_reviewer_request_body_timeout("primary#1")],
+            "bounded_plan_reviewer": [
+                _reviewer_request_body_timeout("bounded#1")
+            ],
+        }
+    )
+    engine = build_engine(log_dir, item_id=ITEM_ID, twig=_twig(), provider=provider)
+
+    result = await engine.run("reviewer-bounded-failure")
+
+    assert isinstance(result, Completed), result
+    assert result.final_node == "fail_end_crash"
+    completed = completed_from_log(engine.log_path(result.run_id))
+    assert (
+        completed["finalize_reviewer_recovery_failure_1"]["error_kind"]
+        == "reviewer.bounded_retry_failed"
+    )
+    bounded_calls = [
+        call for call in provider.calls
+        if call["agent"] == "bounded_plan_reviewer"
+    ]
+    assert len(bounded_calls) == 1
+
+
 # ---- depth guard -------------------------------------------------------
 
 
@@ -817,6 +1539,113 @@ async def test_inv_restart_resume_to_same_terminal(log_dir: Path):
     assert md.exists()
 
 
+async def test_planner_recovery_resume_does_not_repeat_bounded_call(
+    log_dir: Path,
+):
+    run_id = "planner-recovery-restart"
+    provider1 = FakeProvider(
+        scripts={
+            "planner": [_planner_token_exhaustion()],
+            "bounded_planner": [_leaf_planner_output()],
+            "plan_reviewer": [{"verdict": "approve", "feedback": "ok"}],
+        }
+    )
+    engine1 = build_engine(
+        log_dir, item_id=ITEM_ID, twig=_twig(), provider=provider1
+    )
+    result1 = await engine1.run(run_id)
+    assert isinstance(result1, Completed), result1
+
+    log_path = engine1.log_path(run_id)
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    keep: list[str] = []
+    for raw in lines:
+        keep.append(raw)
+        ev = json.loads(raw)
+        if (
+            ev["kind"] == "verb_completed"
+            and ev.get("node_id") == "planner_recovery_1"
+        ):
+            break
+    else:
+        pytest.fail("never saw planner_recovery_1 verb_completed; cannot truncate")
+    log_path.write_text("\n".join(keep) + "\n", encoding="utf-8")
+    for path in log_dir.glob(f"{run_id}.plan.*"):
+        path.unlink()
+
+    provider2 = FakeProvider(
+        scripts={
+            "planner": [],
+            "bounded_planner": [],
+            "plan_reviewer": [{"verdict": "approve", "feedback": "ok"}],
+        }
+    )
+    engine2 = build_engine(
+        log_dir, item_id=ITEM_ID, twig=_twig(), provider=provider2
+    )
+
+    result2 = await engine2.run(run_id)
+
+    assert isinstance(result2, Completed), result2
+    assert result2.final_node == result1.final_node
+    assert [call["agent"] for call in provider2.calls] == ["plan_reviewer"]
+
+
+async def test_reviewer_recovery_resume_does_not_repeat_bounded_call(
+    log_dir: Path,
+):
+    run_id = "reviewer-recovery-restart"
+    provider1 = FakeProvider(
+        scripts={
+            "planner": [_leaf_planner_output()],
+            "plan_reviewer": [_reviewer_request_body_timeout()],
+            "bounded_plan_reviewer": [{
+                "verdict": "approve",
+                "feedback": "Complete evidence supports approval.",
+            }],
+        }
+    )
+    engine1 = build_engine(
+        log_dir, item_id=ITEM_ID, twig=_twig(), provider=provider1
+    )
+    result1 = await engine1.run(run_id)
+    assert isinstance(result1, Completed), result1
+
+    log_path = engine1.log_path(run_id)
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    keep: list[str] = []
+    for raw in lines:
+        keep.append(raw)
+        ev = json.loads(raw)
+        if (
+            ev["kind"] == "verb_completed"
+            and ev.get("node_id") == "reviewer_recovery_1"
+        ):
+            break
+    else:
+        pytest.fail("never saw reviewer_recovery_1 verb_completed; cannot truncate")
+    log_path.write_text("\n".join(keep) + "\n", encoding="utf-8")
+    for path in log_dir.glob(f"{run_id}.plan.*"):
+        path.unlink()
+
+    provider2 = FakeProvider(
+        scripts={
+            "planner": [],
+            "plan_reviewer": [],
+            "bounded_plan_reviewer": [],
+        }
+    )
+    engine2 = build_engine(
+        log_dir, item_id=ITEM_ID, twig=_twig(), provider=provider2
+    )
+
+    result2 = await engine2.run(run_id)
+
+    assert isinstance(result2, Completed), result2
+    assert result2.final_node == result1.final_node
+    assert provider2.calls == []
+
+
 # ---- workflow topology smoke ------------------------------------------
 
 
@@ -829,10 +1658,17 @@ def test_workflow_topology_validates():
     assert errs == [], errs
 
     node_ids = {n.node_id for n in wf.nodes}
-    # Three planner/reviewer/router triples.
+    # Planner/pin-validator/reviewer/router chains.
     for i in range(1, ITER_CAP + 1):
         assert f"planner_{i}" in node_ids
+        assert f"recover_planner_token_exhaustion_{i}" in node_ids
+        assert f"planner_recovery_{i}" in node_ids
+        assert f"finalize_planner_recovery_failure_{i}" in node_ids
+        assert f"pin_validator_{i}" in node_ids
         assert f"reviewer_{i}" in node_ids
+        assert f"recover_reviewer_request_body_timeout_{i}" in node_ids
+        assert f"reviewer_recovery_{i}" in node_ids
+        assert f"finalize_reviewer_recovery_failure_{i}" in node_ids
         assert f"router_{i}" in node_ids
     # Recursion-shaped scaffolding for the not-yet-shipped sub-workflow.
     assert {"record_plan", "record_needs_human", "branch_decomposable"} <= node_ids
@@ -1102,7 +1938,8 @@ async def test_escalation_writes_sidecar_with_reviewer_feedback(log_dir: Path):
     assert f"iteration {ITER_CAP}" in body
     # Must include the "what to do next" guidance.
     assert "What to do next" in body
-    assert "--on-escalate=accept-last" in body
+    assert "approved, structurally aligned" in body
+    assert "cannot seed ADO work or enter fanout" in body
 
 
 async def test_escalation_sidecar_listed_in_plan_record(log_dir: Path):

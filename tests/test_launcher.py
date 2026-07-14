@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import argparse
 import subprocess
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from requiem.launcher import build_cleanup_command, run_launcher
 from requiem.lease import LeaseIdentity
+from requiem.sleep_inhibition import SleepInhibitionError
 
 
 def _args(tmp_path: Path, command: list[str]) -> argparse.Namespace:
@@ -52,6 +56,14 @@ class FakeLease:
 
     def assert_current(self) -> None:
         self.assertions += 1
+
+
+@pytest.fixture(autouse=True)
+def _stub_sleep_inhibitor(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "requiem.launcher.create_system_sleep_inhibitor",
+        nullcontext,
+    )
 
 
 def test_cleanup_command_carries_apply_and_fencing_identity(
@@ -162,3 +174,89 @@ def test_launcher_defaults_scenario_cwd_to_callers_directory(
         assert run_launcher(args) == 0
 
     assert popen.call_args.kwargs["cwd"] == caller_cwd.resolve()
+
+
+def test_sleep_inhibition_wraps_entire_lease_lifetime(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    args = _args(tmp_path, ["--", "python", "run.py"])
+    events: list[str] = []
+
+    class RecordingInhibitor:
+        def __enter__(self):
+            events.append("inhibitor-acquired")
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            events.append("inhibitor-released")
+
+    class RecordingLease(FakeLease):
+        def __enter__(self):
+            events.append("lease-acquired")
+            return super().__enter__()
+
+        def __exit__(self, exc_type, exc, traceback):
+            events.append("lease-released")
+            return super().__exit__(exc_type, exc, traceback)
+
+    child = SimpleNamespace(returncode=0)
+    child.poll = lambda: 0
+
+    def run_cleanup(*args, **kwargs):
+        events.append("cleanup")
+        return subprocess.CompletedProcess([], 0)
+
+    def launch_scenario(*args, **kwargs):
+        events.append("scenario")
+        return child
+
+    with (
+        patch(
+            "requiem.launcher.create_system_sleep_inhibitor",
+            return_value=RecordingInhibitor(),
+        ),
+        patch("requiem.launcher.FencedRootLease", RecordingLease),
+        patch("requiem.launcher.subprocess.run", side_effect=run_cleanup),
+        patch("requiem.launcher.subprocess.Popen", side_effect=launch_scenario),
+    ):
+        assert run_launcher(args) == 0
+
+    assert events == [
+        "inhibitor-acquired",
+        "lease-acquired",
+        "cleanup",
+        "scenario",
+        "lease-released",
+        "inhibitor-released",
+    ]
+    assert "lid-close, power-button, or user-initiated sleep" in capsys.readouterr().err
+
+
+def test_sleep_inhibition_failure_prevents_lease_and_cleanup(
+    tmp_path: Path,
+) -> None:
+    args = _args(tmp_path, ["--", "python", "run.py"])
+
+    class FailingInhibitor:
+        def __enter__(self):
+            raise SleepInhibitionError("cannot inhibit sleep")
+
+        def __exit__(self, exc_type, exc, traceback):
+            return None
+
+    with (
+        patch(
+            "requiem.launcher.create_system_sleep_inhibitor",
+            return_value=FailingInhibitor(),
+        ),
+        patch("requiem.launcher.FencedRootLease") as lease,
+        patch("requiem.launcher.subprocess.run") as cleanup,
+        patch("requiem.launcher.subprocess.Popen") as popen,
+        pytest.raises(SleepInhibitionError, match="cannot inhibit sleep"),
+    ):
+        run_launcher(args)
+
+    lease.assert_not_called()
+    cleanup.assert_not_called()
+    popen.assert_not_called()

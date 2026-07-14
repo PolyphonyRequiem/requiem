@@ -8,6 +8,7 @@ no live ADO/GitHub is needed.
 """
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -139,6 +140,71 @@ async def test_no_leaf_source_fails_closed(repo: Path, tmp_path: Path):
     assert result.final_node == "end_failed"
     res = _result(engine, "noleaf", result.final_node)
     assert res.verdict == "no_leaves"
+
+
+async def test_misaligned_plan_fails_before_dispatch_mutates_repo(
+    repo: Path,
+    tmp_path: Path,
+):
+    tree_path = tmp_path / "plan.tree.json"
+    committed_path = tmp_path / "plan.committed.json"
+    tree_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "plan_id": f"plan-{ROOT}-test",
+                "item_id": ROOT,
+                "decomposable": True,
+                "verdict": "approved",
+                "proposals": [
+                    {
+                        "title": "Leaf",
+                        "description": "body",
+                        "work_item_type": "Task",
+                    }
+                ],
+                "children": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    committed_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "plan_id": f"plan-{ROOT}-test",
+                "root_item_id": ROOT,
+                "dry_run": False,
+                "id_map": {str(ROOT * 100 + 1): 9001},
+            }
+        ),
+        encoding="utf-8",
+    )
+    inputs = fanout.FanoutInputs(
+        root_item_id=ROOT,
+        repo=REPO,
+        repo_path=repo,
+        log_dir=tmp_path,
+        dry_run=False,
+        plan_tree_path=tree_path,
+        committed_path=committed_path,
+    )
+    engine = fanout.build_engine(
+        tmp_path,
+        inputs=inputs,
+        toolbelt=_toolbelt(repo),
+        provider=_happy_provider(),
+    )
+
+    result = await engine.run("misaligned")
+
+    assert isinstance(result, Completed)
+    assert result.final_node == "end_failed"
+    completed = completed_from_log(engine.log_path("misaligned"))
+    assert completed["resolve_leaves"]["error_kind"] == "fanout.plan.misaligned"
+    assert "dispatch_leaves" not in completed
+    assert list(tmp_path.glob(f"fanout-{ROOT}__leaf-*.events.jsonl")) == []
+    assert not (repo / "MARKER.md").exists()
 
 
 # ---- happy path: all leaves land ----------------------------------------

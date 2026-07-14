@@ -228,6 +228,11 @@ def test_parser_accepts_every_subcommand():
     parser.parse_args(["list-runs"])
     parser.parse_args(["cancel", "r"])
     parser.parse_args([
+        "migrate-plan-lineage",
+        "--item", "42",
+        "--manifest", "commit-42.plan.committed.json",
+    ])
+    parser.parse_args([
         "pre-run-cleanup",
         "--item", "42",
         "--ado-repo", "org/project/repo",

@@ -5,7 +5,7 @@ import argparse
 import asyncio
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Protocol
@@ -36,6 +36,13 @@ class CheckedOutBranch:
 
 
 @dataclass(frozen=True, slots=True)
+class SelectedWorktreeHead:
+    branch: str
+    sha: str
+    clean: bool
+
+
+@dataclass(frozen=True, slots=True)
 class CleanupPullRequest:
     number: int
     head: str
@@ -50,6 +57,7 @@ class CleanupSnapshot:
     remote_refs: tuple[AdoBranchRef, ...]
     local_refs: tuple[AdoBranchRef, ...]
     checked_out: tuple[CheckedOutBranch, ...]
+    selected_head: SelectedWorktreeHead
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +69,10 @@ class CleanupResult:
 
 
 class CleanupRepoClient(Protocol):
+    async def branch_sha(self, repo: str, branch: str) -> str: ...
+
+    async def default_branch(self, repo: str) -> str: ...
+
     async def list_branch_refs(
         self, repo: str, *, prefix: str, limit: int = 1000
     ) -> list[AdoBranchRef]: ...
@@ -86,6 +98,22 @@ class CleanupGitClient(Protocol):
     async def git_local_branches(self) -> dict[str, str]: ...
 
     async def git_worktree_list(self) -> list[dict[str, str]]: ...
+
+    async def git_current_branch(self) -> str: ...
+
+    async def git_head_sha(self) -> str: ...
+
+    async def git_is_clean(self) -> bool: ...
+
+    async def git_rebaseline_head(
+        self,
+        *,
+        remote: str,
+        branch: str,
+        expected_current_branch: str,
+        expected_current_sha: str,
+        expected_target_sha: str,
+    ) -> None: ...
 
     async def git_delete_branch_ref(
         self, name: str, *, expected_sha: str
@@ -117,6 +145,13 @@ def _owned_branch(name: str, root: str) -> bool:
 def _bare_worktree_branch(value: str) -> str:
     prefix = "refs/heads/"
     return value[len(prefix):] if value.startswith(prefix) else value
+
+
+def _is_selected_worktree(entry: CheckedOutBranch, repo_path: Path) -> bool:
+    try:
+        return Path(entry.worktree).resolve() == repo_path
+    except (OSError, RuntimeError):
+        return False
 
 
 def _normalise_ado_identity(repo: str) -> tuple[str, str, str]:
@@ -172,6 +207,7 @@ def _snapshot_json(snapshot: CleanupSnapshot) -> dict[str, object]:
         "remote_refs": [asdict(ref) for ref in snapshot.remote_refs],
         "local_refs": [asdict(ref) for ref in snapshot.local_refs],
         "checked_out": [asdict(entry) for entry in snapshot.checked_out],
+        "selected_head": asdict(snapshot.selected_head),
     }
 
 
@@ -210,6 +246,9 @@ async def _discover(
         local_branches,
         worktrees,
         remote_url,
+        current_branch,
+        current_sha,
+        clean,
     ) = await asyncio.gather(
         repo_client.list_branch_refs(repo, prefix=feature, limit=limit),
         repo_client.list_branch_refs(repo, prefix=impl_prefix, limit=limit),
@@ -217,6 +256,9 @@ async def _discover(
         git.git_local_branches(),
         git.git_worktree_list(),
         git.git_remote_url(remote),
+        git.git_current_branch(),
+        git.git_head_sha(),
+        git.git_is_clean(),
     )
     _verify_remote_identity(remote_url, repo)
 
@@ -269,6 +311,11 @@ async def _discover(
             checked_out,
             key=lambda entry: (entry.name, entry.worktree),
         )),
+        selected_head=SelectedWorktreeHead(
+            branch=current_branch,
+            sha=current_sha,
+            clean=clean,
+        ),
     )
 
 
@@ -341,7 +388,7 @@ async def run_pre_run_cleanup(
         git=git,
     )
     manifest: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "planned",
         "created_at": _now().isoformat(),
         "repo": repo,
@@ -372,13 +419,48 @@ async def run_pre_run_cleanup(
     assert isinstance(actions, list)
     try:
         lease_check()
-        if before.checked_out:
+        selected = tuple(
+            entry for entry in before.checked_out
+            if _is_selected_worktree(entry, repo_path)
+        )
+        blocked = tuple(
+            entry for entry in before.checked_out
+            if not _is_selected_worktree(entry, repo_path)
+        )
+        if len(selected) > 1:
+            raise CleanupSafetyError(
+                "selected cleanup path appears more than once in git worktrees"
+            )
+        if selected and selected[0].prunable:
+            raise CleanupSafetyError(
+                "selected cleanup worktree is marked prunable"
+            )
+        if blocked:
             locations = ", ".join(
-                f"{entry.name} at {entry.worktree}" for entry in before.checked_out
+                f"{entry.name} at {entry.worktree}" for entry in blocked
             )
             raise CleanupSafetyError(
                 f"candidate branches are checked out in worktrees: {locations}"
             )
+        if not before.selected_head.clean:
+            raise CleanupSafetyError(
+                "selected cleanup worktree is dirty; refusing to change its "
+                "baseline"
+            )
+
+        selected_ref = None
+        if selected:
+            selected_ref = next(
+                (
+                    ref for ref in before.local_refs
+                    if ref.name == selected[0].name
+                ),
+                None,
+            )
+            if selected_ref is None:
+                raise CleanupSafetyError(
+                    "selected cleanup worktree branch has no matching local ref"
+                )
 
         revalidated = await _discover(
             repo=repo,
@@ -395,6 +477,51 @@ async def run_pre_run_cleanup(
             )
         manifest["status"] = "applying"
         _write_manifest(path, manifest)
+
+        lease_check()
+        baseline_branch = await repo_client.default_branch(repo)
+        baseline_sha = await repo_client.branch_sha(repo, baseline_branch)
+        lease_check()
+        await git.git_rebaseline_head(
+            remote=remote,
+            branch=baseline_branch,
+            expected_current_branch=before.selected_head.branch,
+            expected_current_sha=before.selected_head.sha,
+            expected_target_sha=baseline_sha,
+        )
+        baseline_head = SelectedWorktreeHead(
+            branch="HEAD",
+            sha=baseline_sha,
+            clean=True,
+        )
+        actions.append({
+            "kind": "rebaseline_selected_worktree",
+            "worktree": str(repo_path),
+            "source_branch": before.selected_head.branch,
+            "source_sha": before.selected_head.sha,
+            "target_branch": baseline_branch,
+            "target_sha": baseline_sha,
+        })
+        _write_manifest(path, manifest)
+
+        after_rebaseline = await _discover(
+            repo=repo,
+            root=root,
+            remote=remote,
+            limit=limit,
+            repo_client=repo_client,
+            git=git,
+        )
+        lease_check()
+        expected_after_rebaseline = replace(
+            before,
+            checked_out=(),
+            selected_head=baseline_head,
+        )
+        if after_rebaseline != expected_after_rebaseline:
+            raise CleanupDriftError(
+                "observed state changed while rebaselining the selected worktree"
+            )
 
         for pr in before.active_prs:
             lease_check()
@@ -503,6 +630,11 @@ async def run_pre_run_cleanup(
         )
         lease_check()
         _assert_zero(after)
+        if after.selected_head != baseline_head:
+            raise CleanupDriftError(
+                "selected worktree moved away from the verified baseline "
+                "during cleanup"
+            )
         manifest["status"] = "completed"
         manifest["completed_at"] = _now().isoformat()
         manifest["after"] = _snapshot_json(after)

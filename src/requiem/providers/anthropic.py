@@ -57,7 +57,7 @@ from requiem.providers._common import (
 )
 
 
-DEFAULT_ANTHROPIC_MODEL: Final[str] = "claude-sonnet-4.6"
+DEFAULT_ANTHROPIC_MODEL: Final[str] = "claude-sonnet-5"
 DEFAULT_MAX_TOKENS: Final[int] = 4096
 _RATE_LIMIT_AFTER_S: Final[int] = 60
 _SERVER_ERROR_AFTER_S: Final[int] = 30

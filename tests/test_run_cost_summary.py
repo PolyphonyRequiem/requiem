@@ -102,14 +102,14 @@ def test_per_role_and_per_model_aggregate_correctly_across_three_roles() -> None
         _verb_completed("planner_1", receipts=[
             _receipt("claude-opus-4.7", input_tokens=4500, output_tokens=2100, latency_ms=32000),
         ]),
-        # reviewer: 2 calls, claude-sonnet-4
-        _agent_call_started("reviewer_1", "reviewer", "anthropic", "claude-sonnet-4"),
+        # reviewer: 2 calls, claude-sonnet-5
+        _agent_call_started("reviewer_1", "reviewer", "anthropic", "claude-sonnet-5"),
         _verb_completed("reviewer_1", receipts=[
-            _receipt("claude-sonnet-4", input_tokens=2600, output_tokens=900, latency_ms=14000),
+            _receipt("claude-sonnet-5", input_tokens=2600, output_tokens=900, latency_ms=14000),
         ]),
-        _agent_call_started("reviewer_2", "reviewer", "anthropic", "claude-sonnet-4"),
+        _agent_call_started("reviewer_2", "reviewer", "anthropic", "claude-sonnet-5"),
         _verb_completed("reviewer_2", receipts=[
-            _receipt("claude-sonnet-4", input_tokens=2600, output_tokens=900, latency_ms=14000),
+            _receipt("claude-sonnet-5", input_tokens=2600, output_tokens=900, latency_ms=14000),
         ]),
         # closer: 1 call, gpt-4o-mini
         _agent_call_started("closer_1", "closer", "openai", "gpt-4o-mini"),

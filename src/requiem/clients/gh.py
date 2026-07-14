@@ -491,6 +491,7 @@ class GhClient:
             checks_state=checks_state,
             conflicts=(mergeable is False or mergeable_state == "dirty"),
             policies_satisfied=(mergeable_state == "clean"),
+            head_sha=str(head_sha) if isinstance(head_sha, str) and head_sha else None,
         )
 
     async def pr_complete(
@@ -501,6 +502,7 @@ class GhClient:
         strategy: RepoMergeStrategy,
         expected_head: str | None = None,
         expected_base: str | None = None,
+        expected_head_sha: str | None = None,
     ) -> RepoCompleteResult:
         """Merge a PR after re-validating its live head/base branches."""
         live = await self.pr_view(repo, number)
@@ -532,10 +534,31 @@ class GhClient:
                 merge_sha=merge_sha,
                 strategy=strategy,
             )
+        live_head = live.raw.get("head") if isinstance(live.raw, dict) else None
+        live_head_sha = (
+            str(live_head.get("sha"))
+            if isinstance(live_head, dict) and live_head.get("sha")
+            else None
+        )
+        if (
+            expected_head_sha is not None
+            and live_head_sha is not None
+            and live_head_sha != expected_head_sha
+        ):
+            raise GhUnknownError(
+                f"refusing to merge PR #{number}: live head SHA "
+                f"{live_head_sha!r} != validated {expected_head_sha!r}",
+                exit_code=0,
+                stderr="head SHA precondition failed",
+                argv=(self._binary, "pr", "view", str(number)),
+            )
+        body = {"merge_method": strategy}
+        if expected_head_sha is not None:
+            body["sha"] = expected_head_sha
         payload = await self.api(
             f"repos/{repo}/pulls/{number}/merge",
             method="PUT",
-            body={"merge_method": strategy},
+            body=body,
         )
         return RepoCompleteResult(
             number=number,

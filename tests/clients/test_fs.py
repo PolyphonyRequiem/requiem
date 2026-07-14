@@ -291,6 +291,137 @@ async def test_git_delete_branch_ref_rejects_sha_drift(
     assert "impl/42-7" in await fs.git_local_branches()
 
 
+async def test_git_detach_head_preserves_worktree_contents(
+    fs: FilesystemClient, repo: Path
+) -> None:
+    branch = "impl/42-7"
+    _git(repo, "checkout", "-q", "-b", branch)
+    expected_sha = _git(repo, "rev-parse", "HEAD").strip()
+    (repo / "seed.txt").write_text("modified\n", encoding="utf-8")
+    (repo / "untracked.txt").write_text("preserve\n", encoding="utf-8")
+
+    await fs.git_detach_head(
+        expected_branch=branch,
+        expected_sha=expected_sha,
+    )
+
+    assert await fs.git_current_branch() == "HEAD"
+    assert _git(repo, "rev-parse", "HEAD").strip() == expected_sha
+    assert (repo / "seed.txt").read_text(encoding="utf-8") == "modified\n"
+    assert (repo / "untracked.txt").read_text(encoding="utf-8") == "preserve\n"
+    assert (await fs.git_local_branches())[branch] == expected_sha
+
+
+async def test_git_detach_head_rejects_branch_drift(
+    fs: FilesystemClient, repo: Path
+) -> None:
+    expected_sha = _git(repo, "rev-parse", "HEAD").strip()
+
+    with pytest.raises(FsGitError, match="refused to detach changed HEAD"):
+        await fs.git_detach_head(
+            expected_branch="impl/42-7",
+            expected_sha=expected_sha,
+        )
+
+    assert await fs.git_current_branch() == "main"
+
+
+async def test_git_rebaseline_head_replaces_stale_context_with_remote_tree(
+    fs: FilesystemClient, repo: Path
+) -> None:
+    remote = repo.parent / f"{repo.name}-remote.git"
+    _git(repo.parent, "clone", "-q", "--bare", str(repo), str(remote))
+    _git(repo, "remote", "add", "origin", str(remote))
+    base_sha = _git(repo, "rev-parse", "main").strip()
+
+    branch = "impl/42-7"
+    _git(repo, "checkout", "-q", "-b", branch)
+    pack = repo / ".requiem"
+    pack.mkdir()
+    (pack / "AGENTS.md").write_text("stale leaf context\n", encoding="utf-8")
+    _git(repo, "add", ".requiem/AGENTS.md")
+    _git(repo, "commit", "-q", "-m", "stale leaf")
+    stale_sha = _git(repo, "rev-parse", "HEAD").strip()
+
+    await fs.git_rebaseline_head(
+        remote="origin",
+        branch="main",
+        expected_current_branch=branch,
+        expected_current_sha=stale_sha,
+        expected_target_sha=base_sha,
+    )
+
+    assert await fs.git_current_branch() == "HEAD"
+    assert await fs.git_head_sha() == base_sha
+    assert not (repo / ".requiem" / "AGENTS.md").exists()
+    assert (await fs.git_local_branches())[branch] == stale_sha
+    assert await fs.git_is_clean()
+
+
+async def test_git_rebaseline_head_rejects_dirty_worktree_without_discard(
+    fs: FilesystemClient, repo: Path
+) -> None:
+    remote = repo.parent / f"{repo.name}-remote.git"
+    _git(repo.parent, "clone", "-q", "--bare", str(repo), str(remote))
+    _git(repo, "remote", "add", "origin", str(remote))
+    base_sha = _git(repo, "rev-parse", "main").strip()
+    (repo / "seed.txt").write_text("operator change\n", encoding="utf-8")
+
+    with pytest.raises(FsGitError, match="dirty worktree"):
+        await fs.git_rebaseline_head(
+            remote="origin",
+            branch="main",
+            expected_current_branch="main",
+            expected_current_sha=base_sha,
+            expected_target_sha=base_sha,
+        )
+
+    assert await fs.git_current_branch() == "main"
+    assert await fs.git_head_sha() == base_sha
+    assert (repo / "seed.txt").read_text(encoding="utf-8") == "operator change\n"
+
+
+async def test_git_rebaseline_head_rejects_source_head_drift(
+    fs: FilesystemClient, repo: Path
+) -> None:
+    base_sha = _git(repo, "rev-parse", "main").strip()
+
+    with pytest.raises(FsGitError, match="changed HEAD"):
+        await fs.git_rebaseline_head(
+            remote="origin",
+            branch="main",
+            expected_current_branch="main",
+            expected_current_sha="0" * 40,
+            expected_target_sha=base_sha,
+        )
+
+    assert await fs.git_current_branch() == "main"
+    assert await fs.git_head_sha() == base_sha
+    assert await fs.git_is_clean()
+
+
+async def test_git_rebaseline_head_rejects_fetched_target_mismatch(
+    fs: FilesystemClient, repo: Path
+) -> None:
+    remote = repo.parent / f"{repo.name}-remote.git"
+    _git(repo.parent, "clone", "-q", "--bare", str(repo), str(remote))
+    _git(repo, "remote", "add", "origin", str(remote))
+    base_sha = _git(repo, "rev-parse", "main").strip()
+
+    with pytest.raises(FsGitError, match="authoritative branch SHA"):
+        await fs.git_rebaseline_head(
+            remote="origin",
+            branch="main",
+            expected_current_branch="main",
+            expected_current_sha=base_sha,
+            expected_target_sha="f" * 40,
+        )
+
+    assert await fs.git_current_branch() == "main"
+    assert await fs.git_head_sha() == base_sha
+    assert await fs.git_is_clean()
+
+
 # ---- worktree cleanup primitives (run-#30 follow-up) ----------------
 #
 # The implementation workflow needs to scrub a poisoned worktree on

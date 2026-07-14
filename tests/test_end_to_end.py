@@ -26,14 +26,14 @@ def _write_log(log_dir: Path, run_id: str, events: list[tuple[str, dict]]) -> No
 
 
 def _record_plan(*, decomposable: bool, verdict: str = "approved",
-                 item_id: int = 500) -> dict:
+                 item_id: int = 500, plan_artifact: str | None = None) -> dict:
     return {
         "kind": "success",
         "value": {
             "item_id": item_id, "item_title": f"item {item_id}",
             "summary": "do the thing", "decomposable": decomposable,
             "final_verdict": verdict,
-            "plan_artifact": f"/logs/plan-{item_id}.plan.tree.json",
+            "plan_artifact": plan_artifact or f"/logs/plan-{item_id}.plan.tree.json",
         },
     }
 
@@ -72,9 +72,43 @@ def _factories(calls: _Calls, *, decomposable: bool, plan_verdict: str = "approv
 
         class _E:
             async def run(self, run_id):
+                artifact = log_dir / f"plan-{item_id}.plan.tree.json"
+                if decomposable and plan_verdict == "approved":
+                    artifact.write_text(
+                        json.dumps(
+                            {
+                                "schema_version": 2,
+                                "plan_id": f"plan-{item_id}-test",
+                                "item_id": item_id,
+                                "decomposable": True,
+                                "verdict": "approved",
+                                "proposals": [
+                                    {
+                                        "title": "Leaf",
+                                        "description": "body",
+                                        "work_item_type": "Task",
+                                    }
+                                ],
+                                "children": [
+                                    {
+                                        "item_id": item_id * 100 + 1,
+                                        "plan_id": "leaf",
+                                        "decomposable": False,
+                                        "summary": "body",
+                                        "review_iterations": 1,
+                                        "final_verdict": "approved",
+                                        "proposals": [],
+                                        "children": [],
+                                    }
+                                ],
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
                 _write_log(log_dir, run_id, [
                     (node, _record_plan(decomposable=decomposable,
-                                        verdict=plan_verdict, item_id=item_id)),
+                                        verdict=plan_verdict, item_id=item_id,
+                                        plan_artifact=str(artifact))),
                 ])
                 return Completed(run_id, "completed", "end", {})
         return _E()
@@ -86,6 +120,18 @@ def _factories(calls: _Calls, *, decomposable: bool, plan_verdict: str = "approv
 
         class _E:
             async def run(self, run_id):
+                Path(manifest_path).write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "plan_id": f"plan-{item_id}-test",
+                            "root_item_id": item_id,
+                            "dry_run": False,
+                            "id_map": {str(item_id * 100 + 1): 9001},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
                 _write_log(log_dir, run_id, [
                     ("write_manifest", {"kind": "success",
                                         "value": {"manifest_path": str(manifest_path)}}),
@@ -209,6 +255,26 @@ async def test_planning_not_approved_pauses(tmp_path):
     assert result.stage == "planning"
     assert result.status == "paused"
     # Never proceeds past an unapproved plan.
+    assert calls.commit == 0 and calls.executor == 0
+
+
+async def test_accept_last_needs_human_still_pauses_before_mutation(tmp_path):
+    calls = _Calls()
+    pf, cf, ef = _factories(
+        calls, decomposable=True, plan_verdict="needs_human"
+    )
+    result = await run_pipeline(
+        500,
+        log_dir=tmp_path,
+        board="requiem-500",
+        commit=True,
+        escalation_policy="accept-last",
+        planning_factory=pf,
+        commit_factory=cf,
+        executor_factory=ef,
+    )
+    assert result.stage == "planning"
+    assert result.status == "paused"
     assert calls.commit == 0 and calls.executor == 0
 
 

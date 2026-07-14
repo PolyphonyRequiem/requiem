@@ -229,6 +229,7 @@ class FakeGhClient:
         strategy: str,
         expected_head: str | None = None,
         expected_base: str | None = None,
+        expected_head_sha: str | None = None,
     ) -> RepoCompleteResult:
         pr = await self.pr_view(repo, number)
         if expected_head is not None and pr.head != expected_head:
@@ -241,6 +242,7 @@ class FakeGhClient:
             "strategy": strategy,
             "expected_head": expected_head,
             "expected_base": expected_base,
+            "expected_head_sha": expected_head_sha,
         })
         return RepoCompleteResult(
             number=number,

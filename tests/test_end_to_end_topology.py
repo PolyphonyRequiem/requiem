@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from requiem.end_to_end import (
     IntegrationResult,
     integrate_pipeline,
@@ -388,6 +390,146 @@ async def test_failed_bootstrap_does_not_dispatch(tmp_path):
     # Trunk-before-fan-out: the executor and leaf_pr never ran.
     assert calls.executor == 0 and calls.leaf_pr == 0
     assert result.trunk_verdict == "failed"
+
+
+@pytest.mark.parametrize(
+    ("dispatch_backend", "expected_stage"),
+    [("fanout", "fanout"), ("kanban", "executor")],
+)
+async def test_artifact_preflight_stops_before_trunk_mutation(
+    tmp_path,
+    dispatch_backend,
+    expected_stage,
+):
+    calls = _Calls()
+    _, _, _, trunk_factory, leaf_pr_factory, leaf_lifecycle_factory = (
+        _topology_factories(calls)
+    )
+    tree_path = tmp_path / "misaligned.plan.tree.json"
+
+    def planning_factory(
+        log_dir,
+        *,
+        item_id=700,
+        twig=None,
+        provider=None,
+        gate_handler=None,
+        process_config=None,
+    ):
+        calls.planning += 1
+        calls.order.append("planning")
+
+        class _E:
+            async def run(self, run_id):
+                tree_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 2,
+                            "plan_id": "plan-700-test",
+                            "item_id": 700,
+                            "decomposable": True,
+                            "verdict": "approved",
+                            "proposals": [
+                                {
+                                    "title": "Leaf",
+                                    "description": "body",
+                                    "work_item_type": "Task",
+                                }
+                            ],
+                            "children": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                _write_log(
+                    log_dir,
+                    run_id,
+                    [
+                        (
+                            "record_plan",
+                            {
+                                "kind": "success",
+                                "value": {
+                                    "item_id": item_id,
+                                    "item_title": "item 700",
+                                    "summary": "misaligned",
+                                    "decomposable": True,
+                                    "final_verdict": "approved",
+                                    "plan_artifact": str(tree_path),
+                                },
+                            },
+                        )
+                    ],
+                )
+                return Completed(run_id, "completed", "end", {})
+
+        return _E()
+
+    def commit_factory(
+        log_dir,
+        *,
+        plan_tree_path=None,
+        dry_run=None,
+        twig=None,
+        manifest_path=None,
+        gate_handler=None,
+    ):
+        calls.commit += 1
+        calls.order.append("commit")
+
+        class _E:
+            async def run(self, run_id):
+                Path(manifest_path).write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "plan_id": "plan-700-test",
+                            "root_item_id": 700,
+                            "dry_run": False,
+                            "id_map": {"70001": 9001},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                _write_log(
+                    log_dir,
+                    run_id,
+                    [
+                        (
+                            "write_manifest",
+                            {
+                                "kind": "success",
+                                "value": {"manifest_path": str(manifest_path)},
+                            },
+                        )
+                    ],
+                )
+                return Completed(run_id, "completed", "end_success", {})
+
+        return _E()
+
+    result = await run_pipeline(
+        700,
+        log_dir=tmp_path,
+        board="requiem-700",
+        commit=True,
+        live=True,
+        dispatch_backend=dispatch_backend,
+        repo_path=tmp_path,
+        github_repo="Owner/Repo",
+        base_branch="main",
+        planning_factory=planning_factory,
+        commit_factory=commit_factory,
+        trunk_bootstrap_factory=trunk_factory,
+        leaf_pr_factory=leaf_pr_factory,
+        leaf_lifecycle_factory=leaf_lifecycle_factory,
+    )
+
+    assert result.stage == expected_stage
+    assert result.status == "paused"
+    assert "misaligned" in result.detail
+    assert calls.order == ["planning", "commit"]
+    assert calls.trunk == 0
 
 
 # ---- a leaf_pr gate (needs_human/failed) surfaces, doesn't crash ----------

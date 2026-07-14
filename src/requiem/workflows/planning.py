@@ -10,11 +10,17 @@ three iterations before the workflow escalates to a human.
 ::
 
     start → guard_depth → fetch_item → policy_classifier
-        policy_classifier ─ success    → planner_1 → reviewer_1 → router_1
+        policy_classifier ─ success    → planner_1 → pin_validator_1
+                                      → reviewer_1 → router_1
+        planner_i ─ cumulative-input exhaustion
+                    → bounded evidence-only planner retry → pin_validator_i
+        reviewer_i ─ request-body timeout
+                     → bounded evidence-only reviewer retry → router_i
         policy_classifier ─ short_circuit_implementable → record_leaf_from_policy → end
         router_1 ─ approve  → branch_decomposable
-        router_1 ─ revise   → planner_2 → reviewer_2 → router_2
-            ...continues up to planner_{ITER_CAP} → reviewer_{ITER_CAP} → router_{ITER_CAP}
+        router_1 ─ revise   → planner_2 → pin_validator_2 → reviewer_2 → router_2
+            ...continues up to planner_{ITER_CAP} → pin_validator_{ITER_CAP}
+            → reviewer_{ITER_CAP} → router_{ITER_CAP}
             router_{ITER_CAP} ─ approve  → branch_decomposable
             router_{ITER_CAP} ─ revise   → escalation_gate
             router_{ITER_CAP} ─ escalate → escalation_gate
@@ -76,6 +82,9 @@ child engine's construction (ADR 0005 addendum). No sidecar.
 * Each ``prep_child_i`` enforces a **cycle check**: if the child's
   proposed (or synthesised) ``item_id`` appears in the parent's
   ``ancestor_item_ids`` tuple, routes to ``cycle_gate``.
+* Every planner-proposed pinned ``item_id`` is validated against the
+  authoritative Scenario descendant inventory before review. Invalid pins
+  receive a bounded planner revision; unresolved lineage routes to HITL.
 * If the planner proposes more than ``MAX_CHILDREN`` children, routes to
   ``too_many_children_gate``. v0 cap is 8 — bump in v1 with care.
 
@@ -130,8 +139,16 @@ from requiem.clients.twig import (
 from requiem.dsl import AgentRegistry, VerbRegistry, Workflow, WorkflowBuilder
 from requiem.kernel import Engine
 from requiem.outcomes import NeedsHuman, PermanentFailure, RetryableFailure, Success
+from requiem.plan_lineage import (
+    marker_belongs_to_scenario,
+    parse_commit_marker,
+)
 from requiem.persistence import replay
 from requiem.process_config import ProcessConfig, default_process_config
+from requiem.token_budget import (
+    is_cumulative_input_exhaustion,
+    token_failure_evidence,
+)
 from requiem.toolbelt import Toolbelt
 
 
@@ -140,6 +157,7 @@ from requiem.toolbelt import Toolbelt
 # rather than silently truncating. Sequential per-child topology (no
 # parallel_fork yet) keeps the resume cursor trivially per-child.
 MAX_CHILDREN = 8
+MAX_EXISTING_WORK_ITEMS = 200
 
 
 # Module-level contextvars used to thread test fakes (twig / provider /
@@ -307,7 +325,80 @@ REVIEWER = AgentSpec(
     response_model=ReviewerOutput,
 )
 
-ALL_SPECS = [PLANNER, REVIEWER]
+BOUNDED_REVIEWER = AgentSpec(
+    name="bounded_plan_reviewer",
+    charter=(
+        "You are Requiem's bounded recovery plan reviewer. A prior reviewer "
+        "session failed while transmitting an accumulated agentic-loop request. "
+        "Review only the complete planning evidence supplied in the prompt; "
+        "repository inspection tools are disabled. Return the same complete "
+        "ReviewerOutput as the normal reviewer without weakening lineage, "
+        "dependency, or structural approval checks."
+    ),
+    response_model=ReviewerOutput,
+    model_options={"disable_repo_tools": True},
+)
+
+BOUNDED_PLANNER = AgentSpec(
+    name="bounded_planner",
+    charter=(
+        "You are Requiem's bounded recovery planner. A prior planner session "
+        "exhausted its cumulative input-token budget. Produce the same "
+        "actionable PlannerOutput using only the complete planning evidence "
+        "supplied in the prompt; repository inspection tools are disabled. "
+        "Do not invent missing facts. The normal reviewer will escalate any "
+        "remaining ambiguity."
+    ),
+    response_model=PlannerOutput,
+    model_options={"disable_repo_tools": True},
+)
+
+ALL_SPECS = [PLANNER, REVIEWER, BOUNDED_REVIEWER, BOUNDED_PLANNER]
+
+
+def _planner_outcome(completed: dict[str, Any], iteration: int) -> dict[str, Any]:
+    """Return the successful primary or bounded-recovery planner outcome."""
+    recovery = completed.get(f"planner_recovery_{iteration}")
+    if recovery and recovery.get("kind") == "success":
+        return recovery
+    return completed[f"planner_{iteration}"]
+
+
+def _planner_parsed(completed: dict[str, Any], iteration: int) -> dict[str, Any]:
+    return _planner_outcome(completed, iteration)["value"]["parsed"]
+
+
+def _reviewer_outcome(
+    completed: dict[str, Any], iteration: int
+) -> dict[str, Any]:
+    """Return the successful primary or bounded-recovery reviewer outcome."""
+    recovery = completed.get(f"reviewer_recovery_{iteration}")
+    if recovery and recovery.get("kind") == "success":
+        return recovery
+    return completed[f"reviewer_{iteration}"]
+
+
+def _reviewer_parsed(completed: dict[str, Any], iteration: int) -> dict[str, Any]:
+    return _reviewer_outcome(completed, iteration)["value"]["parsed"]
+
+
+def _is_request_body_timeout(outcome: dict[str, Any]) -> bool:
+    """Whether the provider failed on the exact request-body timeout signature."""
+    if (
+        outcome.get("kind") != "retryable_failure"
+        or outcome.get("error_kind") != "provider_unavailable"
+    ):
+        return False
+    evidence = token_failure_evidence(outcome)
+    messages = [str(evidence.get("message") or "")]
+    messages.extend(
+        str(receipt.get("error") or "") for receipt in evidence["receipts"]
+    )
+    normalized = "\n".join(messages).lower()
+    return (
+        "timed out reading request body" in normalized
+        and "user_request_timeout" in normalized
+    )
 
 
 # ---- twig seam ---------------------------------------------------------
@@ -345,6 +436,180 @@ class FakeTwigClient:
             raise TwigItemNotFoundError(f"fake: item {item_id} not found")
         return self.items[item_id]
 
+    async def list_children_async(self, parent_id: int) -> list[TwigItem]:
+        return [item for item in self.items.values() if item.parent_id == parent_id]
+
+
+def _existing_work_entry(
+    item: TwigItem,
+    *,
+    scenario_item_id: int,
+    path: Sequence[int],
+) -> dict[str, Any]:
+    marker = parse_commit_marker(item)
+    return {
+        "item_id": item.id,
+        "title": item.title,
+        "work_item_type": item.work_item_type,
+        "parent_id": item.parent_id,
+        "path": [int(part) for part in path],
+        "marker_plan_id": marker.plan_id if marker is not None else None,
+        "marker_synth_id": marker.synth_id if marker is not None else None,
+        "marker_durable": marker.durable if marker is not None else False,
+        "same_scenario_lineage": marker_belongs_to_scenario(
+            marker, scenario_item_id
+        ),
+    }
+
+
+def _render_existing_work(item: dict[str, Any]) -> str:
+    existing = item.get("existing_work") or []
+    if item.get("existing_work_complete") is not True:
+        return (
+            "Authoritative existing-work inventory is unavailable from this "
+            "Twig client. Do not pin or reuse existing work in this plan.\n"
+        )
+    if not existing:
+        return (
+            "Authoritative existing-work inventory: no descendants currently "
+            "exist under this Scenario.\n"
+        )
+    lines = [
+        "Authoritative existing-work inventory for this Scenario "
+        "(ADO parentage + Requiem lineage):"
+    ]
+    for entry in existing:
+        marker = entry.get("marker_plan_id")
+        if entry.get("same_scenario_lineage"):
+            lineage = (
+                f"durable same-scenario lineage {marker} "
+                f"synth={entry.get('marker_synth_id')}"
+            )
+        elif marker:
+            lineage = (
+                f"non-durable or foreign Requiem lineage {marker}"
+            )
+        else:
+            lineage = "unmarked"
+        lines.append(
+            f"- AB#{entry.get('item_id')} parent=AB#{entry.get('parent_id')} "
+            f"path={entry.get('path')} [{entry.get('work_item_type')}] "
+            f"{entry.get('title')!r}; {lineage}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _pin_validation_errors(
+    planner: dict[str, Any],
+    item: dict[str, Any],
+    *,
+    ancestor_item_ids: Sequence[int],
+) -> list[str]:
+    """Require complete reconciliation against the authoritative inventory."""
+    children = list(planner.get("children") or [])
+    if not children:
+        return []
+
+    inventory = item.get("existing_work") or []
+    inventory_complete = item.get("existing_work_complete") is True
+    ancestors = {int(value) for value in ancestor_item_ids}
+    current_item_id = int(item.get("item_id", 0))
+    errors: list[str] = []
+    seen_pins: set[int] = set()
+
+    if not inventory_complete:
+        return [
+            f"cannot reconcile {len(children)} proposed child(ren) under "
+            f"AB#{current_item_id}: the authoritative Scenario inventory is "
+            "incomplete"
+        ]
+
+    for index, child in enumerate(children):
+        pinned_value = child.get("item_id")
+        pinned_id = int(pinned_value) if isinstance(pinned_value, int) else None
+        exact_candidates = [
+            entry
+            for entry in inventory
+            if entry.get("parent_id") == current_item_id
+            and entry.get("title") == child.get("title")
+            and entry.get("work_item_type") == child.get("work_item_type")
+        ]
+
+        if pinned_id is None:
+            if len(exact_candidates) == 1:
+                candidate = exact_candidates[0]
+                candidate_id = candidate.get("item_id")
+                if candidate.get("same_scenario_lineage") is True:
+                    errors.append(
+                        f"child[{index}] must pin AB#{candidate_id}: it is the "
+                        "sole exact direct title/type match with durable "
+                        f"Requiem lineage for Scenario "
+                        f"AB#{item.get('scenario_item_id')}"
+                    )
+                else:
+                    errors.append(
+                        f"child[{index}] has sole exact direct match "
+                        f"AB#{candidate_id}, but it lacks durable Requiem "
+                        f"lineage for Scenario AB#{item.get('scenario_item_id')}"
+                    )
+            elif len(exact_candidates) > 1:
+                errors.append(
+                    f"child[{index}] has {len(exact_candidates)} exact direct "
+                    f"title/type matches under AB#{current_item_id}; reuse is "
+                    "ambiguous"
+                )
+            else:
+                other_parent_matches = [
+                    entry
+                    for entry in inventory
+                    if entry.get("title") == child.get("title")
+                    and entry.get("work_item_type") == child.get("work_item_type")
+                ]
+                if other_parent_matches:
+                    locations = ", ".join(
+                        f"AB#{entry.get('item_id')} under "
+                        f"AB#{entry.get('parent_id')}"
+                        for entry in other_parent_matches
+                    )
+                    errors.append(
+                        f"child[{index}] has exact title/type match(es) outside "
+                        f"AB#{current_item_id}: {locations}; planning must not "
+                        "silently reparent or duplicate them"
+                    )
+            continue
+
+        if pinned_id in ancestors or pinned_id == current_item_id:
+            # The existing prep_child cycle check owns this classification.
+            continue
+        if pinned_id in seen_pins:
+            errors.append(
+                f"child[{index}] reuses pinned item AB#{pinned_id} more than once"
+            )
+            continue
+        seen_pins.add(pinned_id)
+
+        if len(exact_candidates) != 1:
+            errors.append(
+                f"child[{index}] pin AB#{pinned_id} has "
+                f"{len(exact_candidates)} exact title/type candidates under "
+                f"AB#{current_item_id}; expected exactly one"
+            )
+            continue
+        candidate = exact_candidates[0]
+        if candidate.get("item_id") != pinned_id:
+            errors.append(
+                f"child[{index}] pins AB#{pinned_id}, but the sole exact "
+                f"title/type match is AB#{candidate.get('item_id')}"
+            )
+            continue
+        if candidate.get("same_scenario_lineage") is not True:
+            errors.append(
+                f"child[{index}] pins AB#{pinned_id}, but it lacks durable "
+                f"Requiem lineage for Scenario AB#{item.get('scenario_item_id')}"
+            )
+
+    return errors
+
 
 # ---- verb library ------------------------------------------------------
 
@@ -361,10 +626,9 @@ human gate. Iteration history (all on the SKU-fallback dogfood):
   (security review timing, observability ownership, dependency chains).
 * 8 (this commit): bumped after ADR-0026 dogfood retry showed even
   Features under Scenarios need more rounds to converge against
-  high-quality reviewer feedback. The right long-term answer is
-  `--on-escalate=accept-last` policy (where the workflow ships the
-  last planner output and routes the reviewer's escalation feedback
-  to a side-channel rather than blocking) — tracked separately.
+  high-quality reviewer feedback. `--on-escalate=accept-last` can preserve
+  the last output and reviewer feedback for audit, but an approved rerun is
+  still required before mutation.
 
 This is a temporary lever. The right shape is a configurable per-run
 ``iter_cap`` parameter on ``build_engine`` / ``--max-plan-iterations``
@@ -390,9 +654,11 @@ def build_verb_registry(
     log_dir: Path,
     config: ProcessConfig | None = None,
     child_proposal: dict[str, Any] | None = None,
+    existing_work: Sequence[dict[str, Any]] | None = None,
 ) -> VerbRegistry:
     verbs = VerbRegistry()
     ancestor_set = tuple(int(a) for a in ancestor_item_ids)
+    scenario_item_id = ancestor_set[0] if ancestor_set else item_id
     closed_config = config or default_process_config()
 
     def _effective_config(ctx) -> ProcessConfig:
@@ -429,6 +695,13 @@ def build_verb_registry(
                 # parent_id*100+slot that does NOT exist in ADO until
                 # commit_plan seeds it).
                 "child_proposal": child_proposal,
+                # Durable Scenario-wide ADO inventory used by recursive
+                # planning to detect and validate overlap pins after resume.
+                "existing_work": (
+                    [dict(entry) for entry in existing_work]
+                    if existing_work is not None
+                    else None
+                ),
             },
         )
 
@@ -456,6 +729,7 @@ def build_verb_registry(
         start_val = (ctx.completed.get("start") or {}).get("value") or {}
         proposal = start_val.get("child_proposal")
         if proposal:
+            inherited_existing = start_val.get("existing_work")
             return Success(
                 value={
                     "item_id": item_id,
@@ -464,6 +738,11 @@ def build_verb_registry(
                     "work_item_type": proposal.get("work_item_type") or "",
                     "area_path": proposal.get("area_path") or "",
                     "description": proposal.get("description") or "",
+                    "scenario_item_id": scenario_item_id,
+                    "existing_work": [
+                        dict(entry) for entry in (inherited_existing or [])
+                    ],
+                    "existing_work_complete": inherited_existing is not None,
                 },
                 inspected_artifacts=(
                     f"planner:proposal/{parent_plan_id or 'recursive'}@{item_id}",
@@ -492,6 +771,79 @@ def build_verb_registry(
                 error_kind="twig_unknown",
                 message=f"twig error fetching {item_id}: {e}",
             )
+        inventory: list[dict[str, Any]] = []
+        list_children = getattr(twig, "list_children_async", None)
+        inventory_complete = callable(list_children)
+        if inventory_complete:
+            seen = {item.id}
+            queue: list[tuple[int, tuple[int, ...]]] = [
+                (item.id, (item.id,))
+            ]
+            try:
+                while queue:
+                    parent_id, parent_path = queue.pop(0)
+                    children = await list_children(parent_id)
+                    for child in children:
+                        if child.parent_id != parent_id:
+                            return PermanentFailure(
+                                error_kind="existing_work_conflict",
+                                message=(
+                                    f"ADO listed AB#{child.id} under "
+                                    f"AB#{parent_id}, but its authoritative "
+                                    f"parent_id is {child.parent_id!r}"
+                                ),
+                                details={
+                                    "item_id": child.id,
+                                    "listed_parent_id": parent_id,
+                                    "authoritative_parent_id": child.parent_id,
+                                },
+                            )
+                        if child.id in seen:
+                            return PermanentFailure(
+                                error_kind="existing_work_conflict",
+                                message=(
+                                    f"ADO Scenario hierarchy repeats "
+                                    f"AB#{child.id}; cannot establish "
+                                    "unambiguous parentage"
+                                ),
+                                details={"item_id": child.id},
+                            )
+                        if len(inventory) >= MAX_EXISTING_WORK_ITEMS:
+                            return PermanentFailure(
+                                error_kind="existing_work_too_large",
+                                message=(
+                                    f"Scenario AB#{scenario_item_id} has more "
+                                    f"than {MAX_EXISTING_WORK_ITEMS} descendants; "
+                                    "refusing to plan from a truncated overlap "
+                                    "inventory"
+                                ),
+                                details={"cap": MAX_EXISTING_WORK_ITEMS},
+                            )
+                        seen.add(child.id)
+                        path = parent_path + (child.id,)
+                        inventory.append(
+                            _existing_work_entry(
+                                child,
+                                scenario_item_id=scenario_item_id,
+                                path=path,
+                            )
+                        )
+                        queue.append((child.id, path))
+            except TwigRateLimitedError as e:
+                return RetryableFailure(
+                    retry_key=f"{ctx.run_id}:fetch_existing_work",
+                    error_kind="rate_limited",
+                    message=str(e),
+                    attempt=ctx.attempt,
+                )
+            except TwigClientError as e:
+                return PermanentFailure(
+                    error_kind="twig_unknown",
+                    message=(
+                        f"twig error inventorying Scenario "
+                        f"AB#{scenario_item_id}: {e}"
+                    ),
+                )
         # ADR (gap fix, 2026-07-05 dogfood run #34 postmortem): the planner
         # and reviewer previously only ever saw title/type/state — never
         # the work item's actual description. On AB#62759077 the title
@@ -512,6 +864,9 @@ def build_verb_registry(
                     "System.Description"
                 )
                 or "",
+                "scenario_item_id": scenario_item_id,
+                "existing_work": inventory,
+                "existing_work_complete": inventory_complete,
             },
             inspected_artifacts=(f"twig:item/{item.id}",),
         )
@@ -689,6 +1044,17 @@ def build_verb_registry(
                 "prerequisite — not a preferred read/review order. Most "
                 "children should leave it unset.\n"
             )
+            overlap_line = (
+                _render_existing_work(item)
+                + "Overlap reconciliation rules: set a proposed child's "
+                "`item_id` only when the inventory shows exactly one DIRECT "
+                "child of the current item with an exact title and work-item "
+                "type match plus a same-scenario Requiem marker. A matching "
+                "descendant under another parent may prove overlapping scope, "
+                "but it must not be silently reparented or pinned. Unmarked, "
+                "foreign-lineage, non-exact, or duplicate matches require a "
+                "revised non-overlapping plan or reviewer escalation.\n"
+            )
 
             base = (
                 f"Plan work item AB#{item['item_id']} — \"{item['title']}\" "
@@ -698,12 +1064,24 @@ def build_verb_registry(
                 + policy_line
                 + guidance_line
                 + depends_on_line
+                + overlap_line
             )
             if iteration == 1:
                 return base + "Produce a first plan."
-            # On revise: re-read the prior reviewer's feedback.
-            prior = ctx.completed.get(f"reviewer_{iteration - 1}", {})
-            feedback = (prior.get("value", {}).get("parsed") or {}).get("feedback", "")
+            # On revise: use deterministic pin-validation feedback when that
+            # rejected the prior attempt; otherwise use the reviewer's feedback.
+            prior_pin = ctx.completed.get(f"pin_validator_{iteration - 1}", {})
+            pin_details = prior_pin.get("details") or {}
+            pin_feedback = pin_details.get("feedback")
+            reviewer_feedback = ""
+            if (
+                f"reviewer_{iteration - 1}" in ctx.completed
+                or f"reviewer_recovery_{iteration - 1}" in ctx.completed
+            ):
+                reviewer_feedback = _reviewer_parsed(
+                    ctx.completed, iteration - 1
+                ).get("feedback", "")
+            feedback = pin_feedback or reviewer_feedback
             return (
                 base
                 + f"This is revision attempt {iteration}. Reviewer feedback to address:\n"
@@ -714,7 +1092,7 @@ def build_verb_registry(
 
     def _reviewer_prompt(iteration: int):
         def _prompt(ctx):
-            planner = ctx.completed[f"planner_{iteration}"]["value"]["parsed"]
+            planner = _planner_parsed(ctx.completed, iteration)
             item = ctx.completed["fetch_item"]["value"]
             children = planner.get("children") or []
             # ADR-0025 Gap A* fix: render the actual children so the
@@ -761,6 +1139,7 @@ def build_verb_registry(
                 if desc
                 else ""
             )
+            overlap_block = _render_existing_work(item)
 
             return (
                 f"Review the following plan for AB#{item['item_id']} "
@@ -771,10 +1150,17 @@ def build_verb_registry(
                 f"  estimated_complexity: {planner['estimated_complexity']}\n"
                 f"  rationale: {planner['rationale']}"
                 f"{child_block}\n"
+                f"{overlap_block}"
                 "Check that the children are grounded in the original "
                 "description above (not just the title) before approving — "
                 "escalate or request revision if a child invents scope "
                 "(e.g. work that already exists) not supported by it.\n"
+                "For every proposed `item_id`, verify that the inventory has "
+                "exactly one direct child with exact title/type and a "
+                "same-scenario Requiem marker. Request revision for a fixable "
+                "bad pin. Escalate when overlap ownership or lineage remains "
+                "ambiguous; never approve silent reparenting or an unmarked/"
+                "foreign-lineage reuse.\n"
                 "Also sanity-check any `depends_on` slot references: they "
                 "must point to a real sibling slot in THIS list (not "
                 "itself), and should only be set for a genuine build-time "
@@ -792,13 +1178,243 @@ def build_verb_registry(
         verbs.register(f"planner_prompt_{i}")(_planner_prompt(i))
         verbs.register(f"reviewer_prompt_{i}")(_reviewer_prompt(i))
 
+    def _recover_reviewer_request_body_timeout(iteration: int):
+        def _recover(ctx):
+            trigger = ctx.completed[f"reviewer_{iteration}"]
+            evidence = token_failure_evidence(trigger)
+            if not _is_request_body_timeout(trigger):
+                return PermanentFailure(
+                    error_kind="reviewer.runtime_failure",
+                    message="plan reviewer failed before producing a complete report",
+                    details={"iteration": iteration, "trigger": evidence},
+                    receipts=tuple(trigger.get("receipts") or ()),
+                )
+
+            item = ctx.completed["fetch_item"]["value"]
+            pin_validation = ctx.completed[f"pin_validator_{iteration}"]
+            if (
+                item.get("existing_work_complete") is not True
+                or pin_validation.get("kind") != "success"
+            ):
+                return PermanentFailure(
+                    error_kind="reviewer.recovery_evidence_incomplete",
+                    message=(
+                        "plan reviewer hit a request-body timeout, but the "
+                        "authoritative inventory or pin validation is incomplete; "
+                        "refusing a tool-free retry"
+                    ),
+                    details={"iteration": iteration, "trigger": evidence},
+                    receipts=tuple(trigger.get("receipts") or ()),
+                )
+
+            return Success(
+                value={
+                    "iteration": iteration,
+                    "trigger": evidence,
+                    "evidence_complete": True,
+                }
+            )
+
+        return _recover
+
+    def _reviewer_recovery_prompt(iteration: int):
+        primary_prompt = _reviewer_prompt(iteration)
+
+        def _prompt(ctx):
+            recovery = ctx.completed[
+                f"recover_reviewer_request_body_timeout_{iteration}"
+            ]["value"]
+            return (
+                f"Retry plan review iteration {iteration} after the prior reviewer "
+                "session failed while transmitting an accumulated request body. "
+                "This is the single bounded recovery attempt.\n\n"
+                "The evidence below is complete for this review decision: it "
+                "contains the original work item, the complete planner output, "
+                "the authoritative Scenario inventory, and the dependency and "
+                "lineage rules. Do not call tools or seek additional repository "
+                "context. Apply the normal approval standard and return a complete "
+                "structured reviewer report. If the supplied evidence is genuinely "
+                "insufficient to decide safely, return `escalate`.\n\n"
+                "Previous failure evidence:\n"
+                f"{json.dumps(recovery['trigger'], indent=2, sort_keys=True)}\n\n"
+                "Complete review evidence:\n"
+                f"{primary_prompt(ctx)}"
+            )
+
+        return _prompt
+
+    def _finalize_reviewer_recovery_failure(iteration: int):
+        def _finalize(ctx):
+            trigger = ctx.completed[f"reviewer_recovery_{iteration}"]
+            return PermanentFailure(
+                error_kind="reviewer.bounded_retry_failed",
+                message=(
+                    "bounded evidence-only plan reviewer retry failed before "
+                    "producing a complete structured report"
+                ),
+                details={
+                    "iteration": iteration,
+                    "trigger": trigger,
+                    "primary_failure": ctx.completed[
+                        f"recover_reviewer_request_body_timeout_{iteration}"
+                    ]["value"]["trigger"],
+                },
+                receipts=tuple(trigger.get("receipts") or ()),
+            )
+
+        return _finalize
+
+    for i in range(1, ITER_CAP + 1):
+        verbs.register(f"recover_reviewer_request_body_timeout_{i}")(
+            _recover_reviewer_request_body_timeout(i)
+        )
+        verbs.register(f"reviewer_recovery_prompt_{i}")(
+            _reviewer_recovery_prompt(i)
+        )
+        verbs.register(f"finalize_reviewer_recovery_failure_{i}")(
+            _finalize_reviewer_recovery_failure(i)
+        )
+
+    def _recover_planner_token_exhaustion(iteration: int):
+        def _recover(ctx):
+            trigger = ctx.completed[f"planner_{iteration}"]
+            evidence = token_failure_evidence(trigger)
+            if not is_cumulative_input_exhaustion(trigger):
+                return PermanentFailure(
+                    error_kind="planner.runtime_failure",
+                    message="planner failed before producing a complete plan",
+                    details={"iteration": iteration, "trigger": evidence},
+                    receipts=tuple(trigger.get("receipts") or ()),
+                )
+
+            item = ctx.completed["fetch_item"]["value"]
+            if item.get("existing_work_complete") is not True:
+                return PermanentFailure(
+                    error_kind="planner.recovery_evidence_incomplete",
+                    message=(
+                        "planner exhausted its token budget, but the authoritative "
+                        "Scenario inventory is incomplete; refusing a tool-free retry"
+                    ),
+                    details={"iteration": iteration, "trigger": evidence},
+                    receipts=tuple(trigger.get("receipts") or ()),
+                )
+
+            return Success(
+                value={
+                    "iteration": iteration,
+                    "trigger": evidence,
+                    "evidence_complete": True,
+                }
+            )
+
+        return _recover
+
+    def _planner_recovery_prompt(iteration: int):
+        primary_prompt = _planner_prompt(iteration)
+
+        def _prompt(ctx):
+            recovery = ctx.completed[
+                f"recover_planner_token_exhaustion_{iteration}"
+            ]["value"]
+            return (
+                f"Retry planning iteration {iteration} after the prior planner "
+                "exhausted its cumulative input-token budget. This is the single "
+                "bounded recovery attempt.\n\n"
+                "The evidence below is complete for this planning decision: it "
+                "contains the authoritative work-item fields, process policy, "
+                "decomposition guidance, dependency rules, and complete Scenario "
+                "descendant inventory. Do not call tools or seek additional "
+                "repository context. Do not invent facts; produce the most "
+                "conservative structurally valid plan the evidence supports. The "
+                "normal reviewer will escalate any unresolved ambiguity.\n\n"
+                "Previous failure evidence:\n"
+                f"{json.dumps(recovery['trigger'], indent=2, sort_keys=True)}\n\n"
+                "Complete planning evidence:\n"
+                f"{primary_prompt(ctx)}"
+            )
+
+        return _prompt
+
+    def _finalize_planner_recovery_failure(iteration: int):
+        def _finalize(ctx):
+            trigger = ctx.completed[f"planner_recovery_{iteration}"]
+            return PermanentFailure(
+                error_kind="planner.bounded_retry_failed",
+                message=(
+                    "bounded evidence-only planner retry failed before producing "
+                    "a complete plan"
+                ),
+                details={
+                    "iteration": iteration,
+                    "trigger": trigger,
+                    "primary_failure": ctx.completed[
+                        f"recover_planner_token_exhaustion_{iteration}"
+                    ]["value"]["trigger"],
+                },
+                receipts=tuple(trigger.get("receipts") or ()),
+            )
+
+        return _finalize
+
+    for i in range(1, ITER_CAP + 1):
+        verbs.register(f"recover_planner_token_exhaustion_{i}")(
+            _recover_planner_token_exhaustion(i)
+        )
+        verbs.register(f"planner_recovery_prompt_{i}")(
+            _planner_recovery_prompt(i)
+        )
+        verbs.register(f"finalize_planner_recovery_failure_{i}")(
+            _finalize_planner_recovery_failure(i)
+        )
+
+    def _pin_validator(iteration: int):
+        def _validate(ctx):
+            planner = _planner_parsed(ctx.completed, iteration)
+            item = ctx.completed["fetch_item"]["value"]
+            errors = _pin_validation_errors(
+                planner,
+                item,
+                ancestor_item_ids=ancestor_set,
+            )
+            if not errors:
+                return Success(
+                    value={
+                        "iteration": iteration,
+                        "pinned_count": sum(
+                            1
+                            for child in planner.get("children") or []
+                            if isinstance(child.get("item_id"), int)
+                        ),
+                    }
+                )
+            feedback = (
+                "The proposed children failed authoritative overlap "
+                "reconciliation. Revise so every sole exact direct durable "
+                "same-Scenario match is explicitly pinned and every unpinned "
+                "child is genuinely new; never reuse ambiguous, foreign-lineage, "
+                "or differently-parented work:\n- "
+                + "\n- ".join(errors)
+            )
+            return PermanentFailure(
+                error_kind="pin_reconcile",
+                message=f"planner iteration {iteration} left overlap unresolved",
+                details={
+                    "iteration": iteration,
+                    "errors": errors,
+                    "feedback": feedback,
+                },
+            )
+
+        return _validate
+
+    for i in range(1, ITER_CAP + 1):
+        verbs.register(f"pin_validator_{i}")(_pin_validator(i))
+
     def _router(iteration: int):
         last = iteration == ITER_CAP
 
         def _route(ctx):
-            verdict = (
-                ctx.completed[f"reviewer_{iteration}"]["value"]["parsed"]["verdict"]
-            )
+            verdict = _reviewer_parsed(ctx.completed, iteration)["verdict"]
             if verdict == "approve":
                 return Success(
                     value={"verdict": "approve", "iteration": iteration},
@@ -810,13 +1426,9 @@ def build_verb_registry(
                     details={"iteration": iteration},
                 )
             # revise
-            current_planner = ctx.completed[f"planner_{iteration}"]["value"]["parsed"]
+            current_planner = _planner_parsed(ctx.completed, iteration)
             if iteration > 1:
-                prev_planner = (
-                    ctx.completed.get(f"planner_{iteration - 1}", {})
-                    .get("value", {})
-                    .get("parsed")
-                )
+                prev_planner = _planner_parsed(ctx.completed, iteration - 1)
                 if prev_planner is not None and current_planner == prev_planner:
                     return PermanentFailure(
                         error_kind="escalate",
@@ -876,7 +1488,7 @@ def build_verb_registry(
         established convention in this workflow (see ``router_i``).
         """
         approved_iter = _find_approved_iteration(ctx.completed)
-        planner = ctx.completed[f"planner_{approved_iter}"]["value"]["parsed"]
+        planner = _planner_parsed(ctx.completed, approved_iter)
         planner_decomposable = bool(planner.get("decomposable"))
         children = planner.get("children", [])
         child_count = len(children)
@@ -1072,7 +1684,7 @@ def build_verb_registry(
 
     def _approved_children_from_completed(completed: dict) -> list[dict]:
         approved_iter = _find_approved_iteration(completed)
-        planner = completed[f"planner_{approved_iter}"]["value"]["parsed"]
+        planner = _planner_parsed(completed, approved_iter)
         return list(planner.get("children", []))
 
     def _make_prep_child(index: int):
@@ -1165,6 +1777,12 @@ def build_verb_registry(
             "work_item_type": prep.get("child_work_item_type") or "",
             "state": "Proposed",
         }
+        existing_inventory = (
+            (ctx.completed.get("fetch_item") or {}).get("value", {}).get(
+                "existing_work"
+            )
+            or []
+        )
         return {
             "item_id": child_id,
             "current_depth": current_depth + 1,
@@ -1173,6 +1791,7 @@ def build_verb_registry(
             "ancestor_item_ids": new_ancestors,
             "process_config": snap,
             "child_proposal": child_proposal,
+            "existing_work": [dict(entry) for entry in existing_inventory],
         }
 
     @verbs.register("aggregate_children")
@@ -1241,7 +1860,7 @@ def build_verb_registry(
     @verbs.register("record_plan")
     def _record(ctx):
         approved_iter = _find_approved_iteration(ctx.completed)
-        planner = ctx.completed[f"planner_{approved_iter}"]["value"]["parsed"]
+        planner = _planner_parsed(ctx.completed, approved_iter)
         item = ctx.completed["fetch_item"]["value"]
         plan_id = f"plan-{item['item_id']}-{ctx.run_id}"
 
@@ -1318,7 +1937,7 @@ def build_verb_registry(
         # Reached when an escalation gate routed `abort`. The plan record
         # still captures the planner's last output so the operator can act.
         approved_iter = _last_planner_iteration(ctx.completed)
-        planner_block = ctx.completed.get(f"planner_{approved_iter}", {})
+        planner_block = _planner_outcome(ctx.completed, approved_iter)
         planner = (planner_block.get("value") or {}).get("parsed") or {}
         item = ctx.completed.get("fetch_item", {}).get("value", {})
         plan_id = f"plan-{item.get('item_id', item_id)}-{ctx.run_id}"
@@ -1342,8 +1961,12 @@ def build_verb_registry(
         # The reviewer at the same iteration as the planner is the one
         # whose verdict drove the escalation (escalation_gate routes
         # `proceed`→record_needs_human after the last reviewer escalated).
-        reviewer_block = ctx.completed.get(f"reviewer_{approved_iter}", {})
-        reviewer_parsed = (reviewer_block.get("value") or {}).get("parsed") or {}
+        reviewer_parsed = {}
+        if (
+            f"reviewer_{approved_iter}" in ctx.completed
+            or f"reviewer_recovery_{approved_iter}" in ctx.completed
+        ):
+            reviewer_parsed = _reviewer_parsed(ctx.completed, approved_iter)
         escalation_artifact: Path | None = None
         try:
             escalation_artifact = _write_escalation_sidecar(
@@ -1446,7 +2069,7 @@ def _find_approved_iteration(completed: dict) -> int:
 def _last_planner_iteration(completed: dict) -> int:
     last = 1
     for i in range(1, ITER_CAP + 1):
-        if f"planner_{i}" in completed:
+        if f"planner_{i}" in completed or f"planner_recovery_{i}" in completed:
             last = i
     return last
 
@@ -1492,18 +2115,9 @@ def _write_plan_sidecar(
         and effective_decomposable is False
     )
     rec_children = list(recursive_children or [])
-    # ADR-0027 (accept-last) + ADR-0006 (decomposable trees): when the
-    # planner produced a decomposable plan, ALWAYS write the JSON tree
-    # sidecar — even when the operator escalation routed through
-    # record_needs_human. The verdict field captures the operator's
-    # decision; commit_plan's load_tree accepts both `approved` and
-    # `needs_human` verdicts (the escalation policy already gated entry).
-    # The pre-ADR-0027 behavior of suppressing the tree on needs_human
-    # broke the `--on-escalate accept-last` dogfood path because commit_plan
-    # received a `.plan.md` and rejected it with `bad_artifact` (not
-    # JSON). Writing the tree unconditionally for decomposable plans
-    # preserves the operator's audit (verdict carries the escalation)
-    # while restoring commit_plan's input.
+    # A decomposable needs-human plan still gets a JSON tree for audit and
+    # diagnosis, but downstream mutation consumers reject its verdict until
+    # planning is rerun and approved.
     if decomposable:
         path = log_dir / f"{run_id}.plan.tree.json"
         path.write_text(
@@ -1601,9 +2215,7 @@ def _write_escalation_sidecar(
 
     ADR-0027 Shape B: ALWAYS written on escalation regardless of
     ``--on-escalate`` policy. This is the durable artifact the
-    operator reads to either (a) act on the reviewer's blocking
-    questions and re-run, or (b) confirm the plan that ``accept-last``
-    auto-shipped is the one they want.
+    operator reads to act on the reviewer's blocking questions before rerunning.
 
     Path: ``<log_dir>/<run_id>.escalation-feedback.md``. Co-located
     with ``<run_id>.events.jsonl`` and ``<run_id>.plan.tree.json`` so
@@ -1633,8 +2245,7 @@ def _write_escalation_sidecar(
         f"**Reviewer verdict:** {reviewer_verdict}\n"
         f"**Plan disposition:** "
         f"`needs_human` (the last planner output is recorded as the plan; "
-        f"the operator must decide whether to ship it as-is or revise the "
-        f"work item and re-run)\n\n"
+        f"it cannot seed ADO work or enter fanout until an approved rerun)\n\n"
         f"## Reviewer feedback (open questions)\n\n"
         f"{reviewer_feedback or '(empty — reviewer emitted no feedback text)'}\n\n"
         f"## Last planner output\n\n"
@@ -1659,9 +2270,8 @@ def _write_escalation_sidecar(
         f"1. Read the reviewer feedback above.\n"
         f"2. If the open questions need product/PM input, resolve them in "
         f"the work item description (or a comment) and re-run.\n"
-        f"3. If the plan as proposed is good enough to ship, re-run with "
-        f"`--on-escalate=accept-last` (the sidecar will still be written "
-        f"for audit but the run will proceed past planning).\n"
+        f"3. Re-run planning and require an approved, structurally aligned "
+        f"artifact before plan commit or fanout.\n"
         f"4. If the plan is fundamentally wrong, file follow-up items and "
         f"start fresh against a tighter scope.\n"
     )
@@ -1832,7 +2442,7 @@ def build_workflow() -> Workflow:
         WorkflowBuilder(
             "planning",
             module="requiem.workflows.planning",
-            version="0.1",
+            version="0.3",
         )
         .entry("start")
         .script("start", verb="start_run")
@@ -1866,6 +2476,16 @@ def build_workflow() -> Workflow:
                 "fetch_item",
                 on="permanent_failure:twig_unknown",
                 to="twig_gate",
+            )
+            .edge(
+                "fetch_item",
+                on="permanent_failure:existing_work_conflict",
+                to="lineage_gate",
+            )
+            .edge(
+                "fetch_item",
+                on="permanent_failure:existing_work_too_large",
+                to="lineage_gate",
             )
             # Any other permanent_failure (verb.crash from an unexpected
             # exception in the twig seam, etc.) → narrated crash terminal.
@@ -1920,6 +2540,17 @@ def build_workflow() -> Workflow:
         )
             .edge("escalation_gate", on="needs_human:proceed", to="record_needs_human")
             .edge("escalation_gate", on="needs_human:abort", to="fail_end")
+        .human_gate(
+            "lineage_gate",
+            prompt=(
+                "Planning could not reconcile proposed reuse against "
+                "authoritative ADO parentage and Requiem lineage. Record the "
+                "unresolved plan for human review or abort?"
+            ),
+            options=["proceed", "abort"],
+        )
+            .edge("lineage_gate", on="needs_human:proceed", to="record_needs_human")
+            .edge("lineage_gate", on="needs_human:abort", to="fail_end")
     )
 
     # `ITER_CAP` planner/reviewer/router iterations, wired left-to-right.
@@ -1930,19 +2561,127 @@ def build_workflow() -> Workflow:
                 agent="planner",
                 prompt_verb=f"planner_prompt_{i}",
             )
-                .edge(f"planner_{i}", on="success", to=f"reviewer_{i}")
+                .edge(f"planner_{i}", on="success", to=f"pin_validator_{i}")
+                .edge(
+                    f"planner_{i}",
+                    on="retry_exhausted",
+                    to=f"recover_planner_token_exhaustion_{i}",
+                )
                 .edge(f"planner_{i}", on="bad_output", to="bad_output_gate")
                 # Catch-all (verb.crash, provider failure, etc.) → narrated
                 # crash terminal (issue #31).
                 .edge(f"planner_{i}", on="permanent_failure", to="fail_end_crash")
+            .script(
+                f"recover_planner_token_exhaustion_{i}",
+                verb=f"recover_planner_token_exhaustion_{i}",
+            )
+                .edge(
+                    f"recover_planner_token_exhaustion_{i}",
+                    on="success",
+                    to=f"planner_recovery_{i}",
+                )
+                .edge(
+                    f"recover_planner_token_exhaustion_{i}",
+                    on="permanent_failure",
+                    to="fail_end_crash",
+                )
+            .agent(
+                f"planner_recovery_{i}",
+                agent="bounded_planner",
+                prompt_verb=f"planner_recovery_prompt_{i}",
+            )
+                .edge(
+                    f"planner_recovery_{i}",
+                    on="success",
+                    to=f"pin_validator_{i}",
+                )
+                .edge(
+                    f"planner_recovery_{i}",
+                    on="retry_exhausted",
+                    to=f"finalize_planner_recovery_failure_{i}",
+                )
+                .edge(
+                    f"planner_recovery_{i}",
+                    on="bad_output",
+                    to=f"finalize_planner_recovery_failure_{i}",
+                )
+                .edge(
+                    f"planner_recovery_{i}",
+                    on="permanent_failure",
+                    to=f"finalize_planner_recovery_failure_{i}",
+                )
+            .script(
+                f"finalize_planner_recovery_failure_{i}",
+                verb=f"finalize_planner_recovery_failure_{i}",
+            )
+                .edge(
+                    f"finalize_planner_recovery_failure_{i}",
+                    on="permanent_failure",
+                    to="fail_end_crash",
+                )
+            .script(f"pin_validator_{i}", verb=f"pin_validator_{i}")
+                .edge(f"pin_validator_{i}", on="success", to=f"reviewer_{i}")
             .agent(
                 f"reviewer_{i}",
                 agent="plan_reviewer",
                 prompt_verb=f"reviewer_prompt_{i}",
             )
                 .edge(f"reviewer_{i}", on="success", to=f"router_{i}")
+                .edge(
+                    f"reviewer_{i}",
+                    on="retry_exhausted",
+                    to=f"recover_reviewer_request_body_timeout_{i}",
+                )
                 .edge(f"reviewer_{i}", on="bad_output", to="bad_output_gate")
                 .edge(f"reviewer_{i}", on="permanent_failure", to="fail_end_crash")
+            .script(
+                f"recover_reviewer_request_body_timeout_{i}",
+                verb=f"recover_reviewer_request_body_timeout_{i}",
+            )
+                .edge(
+                    f"recover_reviewer_request_body_timeout_{i}",
+                    on="success",
+                    to=f"reviewer_recovery_{i}",
+                )
+                .edge(
+                    f"recover_reviewer_request_body_timeout_{i}",
+                    on="permanent_failure",
+                    to="fail_end_crash",
+                )
+            .agent(
+                f"reviewer_recovery_{i}",
+                agent="bounded_plan_reviewer",
+                prompt_verb=f"reviewer_recovery_prompt_{i}",
+            )
+                .edge(
+                    f"reviewer_recovery_{i}",
+                    on="success",
+                    to=f"router_{i}",
+                )
+                .edge(
+                    f"reviewer_recovery_{i}",
+                    on="retry_exhausted",
+                    to=f"finalize_reviewer_recovery_failure_{i}",
+                )
+                .edge(
+                    f"reviewer_recovery_{i}",
+                    on="bad_output",
+                    to=f"finalize_reviewer_recovery_failure_{i}",
+                )
+                .edge(
+                    f"reviewer_recovery_{i}",
+                    on="permanent_failure",
+                    to=f"finalize_reviewer_recovery_failure_{i}",
+                )
+            .script(
+                f"finalize_reviewer_recovery_failure_{i}",
+                verb=f"finalize_reviewer_recovery_failure_{i}",
+            )
+                .edge(
+                    f"finalize_reviewer_recovery_failure_{i}",
+                    on="permanent_failure",
+                    to="fail_end_crash",
+                )
             .script(f"router_{i}", verb=f"router_{i}")
                 .edge(f"router_{i}", on="success", to="branch_decomposable")
                 .edge(
@@ -1953,10 +2692,32 @@ def build_workflow() -> Workflow:
                 .edge(f"router_{i}", on="permanent_failure", to="fail_end_crash")
         )
         if i < ITER_CAP:
+            b = (
+                b.edge(
+                    f"pin_validator_{i}",
+                    on="permanent_failure:pin_reconcile",
+                    to=f"planner_{i + 1}",
+                )
+                .edge(
+                    f"pin_validator_{i}",
+                    on="permanent_failure",
+                    to="fail_end_crash",
+                )
+                .edge(
+                    f"router_{i}",
+                    on="permanent_failure:revise",
+                    to=f"planner_{i + 1}",
+                )
+            )
+        else:
             b = b.edge(
-                f"router_{i}",
-                on="permanent_failure:revise",
-                to=f"planner_{i + 1}",
+                f"pin_validator_{i}",
+                on="permanent_failure:pin_reconcile",
+                to="lineage_gate",
+            ).edge(
+                f"pin_validator_{i}",
+                on="permanent_failure",
+                to="fail_end_crash",
             )
         # router_{ITER_CAP}'s revise is rerouted to escalation_gate by the verb
         # itself (it returns escalate on revise when the cap is hit), so
@@ -2176,6 +2937,7 @@ def _humanize_map() -> dict[str, str]:
         "twig_gate": "twig error — proceed?",
         "bad_output_gate": "agent produced bad output",
         "escalation_gate": "planner loop escalated",
+        "lineage_gate": "overlap lineage unresolved",
         "recursion_depth_gate": "decomposable + would exceed max_depth — proceed?",
         "too_many_children_gate": (
             f"planner proposed > {MAX_CHILDREN} children — proceed?"
@@ -2194,7 +2956,26 @@ def _humanize_map() -> dict[str, str]:
     }
     for i in range(1, ITER_CAP + 1):
         m[f"planner_{i}"] = f"Planner (iteration {i})"
+        m[f"recover_planner_token_exhaustion_{i}"] = (
+            f"Prepared bounded planner recovery (iteration {i})"
+        )
+        m[f"planner_recovery_{i}"] = (
+            f"Retried planner from complete evidence (iteration {i})"
+        )
+        m[f"finalize_planner_recovery_failure_{i}"] = (
+            f"Recorded bounded planner retry failure (iteration {i})"
+        )
+        m[f"pin_validator_{i}"] = f"Validated overlap pins (iteration {i})"
         m[f"reviewer_{i}"] = f"Reviewer (iteration {i})"
+        m[f"recover_reviewer_request_body_timeout_{i}"] = (
+            f"Prepared bounded reviewer recovery (iteration {i})"
+        )
+        m[f"reviewer_recovery_{i}"] = (
+            f"Retried reviewer from complete evidence (iteration {i})"
+        )
+        m[f"finalize_reviewer_recovery_failure_{i}"] = (
+            f"Recorded bounded reviewer retry failure (iteration {i})"
+        )
         m[f"router_{i}"] = f"Route after review {i}"
     for i in range(1, MAX_CHILDREN + 1):
         m[f"prep_child_{i}"] = f"Prep child slot {i}"
@@ -2225,7 +3006,8 @@ _default_gate_handler.__requiem_auto__ = True  # type: ignore[attr-defined]
 VALID_ESCALATION_POLICIES = ("escalate", "accept-last", "abort")
 """Allowed values for the `--on-escalate` CLI flag. Default is `escalate`
 (current behavior pre-ADR-0027); `accept-last` answers `proceed` to
-ship the last planner output as needs-human; `abort` answers `abort`."""
+record the last planner output as needs-human for audit; `abort` answers
+`abort`. No policy authorizes commit or fanout of an unresolved plan."""
 
 
 def make_escalation_policy_handler(
@@ -2246,9 +3028,8 @@ def make_escalation_policy_handler(
 
     ``policy=accept-last``: auto-answer ``proceed`` at escalation_gate.
     The workflow records the last planner output as needs-human, the
-    sidecar captures the reviewer's escalation rationale, and the run
-    continues (run_pipeline must allow needs_human past the planning
-    phase when policy is accept-last — see end_to_end.py).
+    sidecar captures the reviewer's escalation rationale, and the pipeline
+    pauses before plan commit or fanout.
 
     ``policy=abort``: auto-answer ``abort`` at escalation_gate. Run
     terminates; sidecar is NOT written (no record_needs_human path).
@@ -2297,6 +3078,7 @@ def build_engine(
     gate_handler=None,
     process_config: "ProcessConfig | dict[str, Any] | None" = None,
     child_proposal: dict[str, Any] | None = None,
+    existing_work: Sequence[dict[str, Any]] | None = None,
 ) -> Engine:
     """Construct a runnable Engine for the planning workflow.
 
@@ -2318,6 +3100,10 @@ def build_engine(
     seeds it, so a twig fetch is guaranteed to fail. Top-level callers
     always leave this ``None``; the recursive ``child_inputs`` verb
     populates it from the parent's ``prep_child_i`` outcome.
+
+    ``existing_work`` is the compact, durable Scenario descendant inventory
+    inherited by recursive child runs. Root callers leave it ``None`` and
+    ``fetch_item`` builds the authoritative snapshot from Twig.
 
     Test-fake threading: any non-None ``twig`` / ``provider`` /
     ``gate_handler`` arguments are installed in module-level contextvars
@@ -2369,6 +3155,7 @@ def build_engine(
             log_dir=log_dir,
             config=final_config,
             child_proposal=child_proposal,
+            existing_work=existing_work,
         ),
         agents=build_agent_registry(),
         provider=final_provider,
@@ -2508,7 +3295,9 @@ def render_hints() -> dict:
     }
     for i in range(1, ITER_CAP + 1):
         details[f"planner_{i}"] = _detail_planner
+        details[f"planner_recovery_{i}"] = _detail_planner
         details[f"reviewer_{i}"] = _detail_reviewer
+        details[f"reviewer_recovery_{i}"] = _detail_reviewer
         details[f"router_{i}"] = _detail_router
     for i in range(1, MAX_CHILDREN + 1):
         details[f"prep_child_{i}"] = _detail_prep_child

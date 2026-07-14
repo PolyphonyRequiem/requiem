@@ -55,8 +55,9 @@ and complete. `commit_plan` refuses artifacts below version 2.
 (with `end_failed` / `end_human` terminals).
 
 - **load_tree** parses + *recursively validates* the artifact before any write:
-  schema_version ≥ 2; top-level verdict `approved` and `decomposable`; every
-  node's verdict approved; `len(children) == len(proposals)` for each
+  schema_version ≥ 2; top-level verdict exactly `approved` and `decomposable`;
+  every node's verdict approved (including policy-forced leaves);
+  `len(children) == len(proposals)` for each
   decomposable node; `children[i].item_id == expected_synth` (alignment is
   explicit, not positional trust); and a total-create **size cap** (refuses
   oversized trees). Bad/missing/oversized → `end_failed`.
@@ -66,35 +67,55 @@ and complete. `commit_plan` refuses artifacts below version 2.
 
 ### Idempotency — marker, not (title, type)
 
-Each created item's **description is stamped** with a stable marker:
+Each created item's **description is stamped** with a visible, versioned marker:
 
 ```
-<!-- requiem-commit plan_id=<plan_id> synth_id=<synth_id> -->
+Requiem-Lineage-v1: scenario_id=<root-id> plan_id=<plan-id> synth_id=<synth-id>
 ```
+
+ADO strips HTML comments from `System.Description`, so the original hidden
+`<!-- requiem-commit ... -->` representation was not durable across fresh
+fenced runs. The visible record above survives ADO's HTML conversion and is
+written in the same create operation as the item.
 
 On every (re)run, `seed_tree` lists the parent's existing children and matches
-by **marker first**. The marker is keyed on `plan_id + synth_id` (NOT the
-commit run id), so a second commit of the same plan — or a resume after a
-crash — reuses the already-seeded item rather than duplicating it. This covers
-the crash-after-create-before-log window (the item persists in ADO; the marker
-finds it). A human renaming a seeded item does **not** break idempotency
-because the match is on the marker, not the title.
+by **lineage first**. The lineage is keyed on root Scenario + `plan_id +
+synth_id` (NOT the commit run id), so a second commit of the same plan — or a
+resume after a crash — reuses the already-seeded item rather than duplicating
+it. The authoritative read-back must also prove the exact parent, title, type,
+and uniqueness before reuse. A human rename is therefore treated as drift and
+routes to reconciliation rather than silently reusing a changed item.
 
-`(title, work_item_type)` is used only as a **fallback** when no marker is
-found (e.g. items a human created by hand); an *ambiguous* title/type fallback
-(duplicate siblings) routes to `NeedsHuman` rather than guessing.
+`(title, work_item_type)` is **not** an adoption fallback. If an existing child
+matches a proposal but lacks the current plan marker, seeding routes to
+`NeedsHuman` rather than guessing or creating a duplicate. Planning must first
+regenerate an approved, aligned artifact that explicitly pins the existing
+item.
 
 **Pinned proposals** (`item_id` set by the planner) mean "this ADO item already
-exists" — `commit_plan` validates via `show_async` and reuses it; it never
-calls `create_child` for a pinned id.
+exists." Before reuse, `commit_plan` revalidates the item through `show_async`
+and the parent's authoritative child list: parentage must match, title/type
+must match exactly, the item must carry a Requiem marker rooted at the same
+Scenario, and it must be the sole exact title/type candidate under that parent.
+Conflicting or ambiguous lineage routes to `NeedsHuman`; `create_child` is
+never called for a pinned id.
+
+Legacy manifests can be migrated with
+`requiem migrate-plan-lineage --item <root> --manifest <path> --twig-cwd
+<workspace>`. The command validates the complete live Scenario hierarchy and
+every manifest mapping before any write; `--apply` appends durable markers and
+then re-reads the hierarchy. Partial application is restart-safe because
+already-correct markers are accepted and conflicting markers fail closed.
 
 ### Failure mapping (Ravel L-1)
 
 Inside `seed_tree`: `TwigRateLimitedError → RetryableFailure`;
 `TwigItemNotFoundError → PermanentFailure(not_found)`;
-`TwigUnknownError → NeedsHuman(retry/abort)`. Whole-verb re-run is safe by
-construction (marker dedupe). On failure the outcome carries the
-partial-progress ledger so the operator sees what was already created.
+timeout-like `TwigUnknownError` (exit -1 / empty stderr) →
+`RetryableFailure`; other `TwigUnknownError` cases still route to
+`NeedsHuman(retry/abort)`. Whole-verb re-run is safe by construction
+(marker dedupe). On failure the outcome carries the partial-progress
+ledger so the operator sees what was already created.
 
 ### Dry-run default ON
 

@@ -15,16 +15,21 @@ See ADR-0011 for the decision and the rubber-duck-hardened design. Highlights:
   carries its own ``proposals`` (creatable metadata) plus its ``children``
   (recursive sub-plans), so this workflow needs no per-sub-run event logs.
 * **Marker idempotency** (NOT title/type): every created item's *description* is
-  stamped with ``<!-- requiem-commit plan_id=<plan_id> synth_id=<synth_id> -->``.
+  stamped with a visible ``Requiem-Lineage-v1`` record that survives ADO
+  sanitization.
   Re-runs (or a second commit of the same plan) match on the marker first and
   reuse rather than duplicate — covering the crash-after-create-before-log
-  window and surviving human renames. ``(title, work_item_type)`` is only a
-  fallback for hand-created items; an *ambiguous* fallback routes to a human.
+  window. Authoritative title/type drift still blocks reuse. Existing title/type
+  matches without the current marker must be reconciled and pinned by planning;
+  commit never guesses.
 * **Pinned proposals** (``item_id`` set) mean "this item already exists" —
-  validated via ``show_async`` and reused, never re-created.
+  revalidated against authoritative parentage, exact title/type, and a
+  same-Scenario Requiem marker before reuse.
 * **Ravel L-1**: rate-limit → ``RetryableFailure``; not-found →
-  ``PermanentFailure``; unclassified → ``NeedsHuman``. Whole-verb re-run is safe
-  by construction (marker dedupe); partial progress rides on the failure.
+  ``PermanentFailure``; timeout-like ``TwigUnknownError`` (exit -1 / empty
+  stderr) → ``RetryableFailure``; other unclassified failures →
+  ``NeedsHuman``. Whole-verb re-run is safe by construction (marker dedupe);
+  partial progress rides on the failure.
 * **Dry-run default ON** (per ``close_out`` convention): walks + lists but never
   creates, emitting an explicit ``would_create`` / ``would_reuse`` / ``ambiguous``
   / ``missing_pinned`` preview. Operators opt into writes with ``dry_run=False``.
@@ -51,7 +56,6 @@ import argparse
 import asyncio
 import json
 import os
-import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -68,6 +72,12 @@ from requiem.clients.twig import (
 from requiem.dsl import AgentRegistry, VerbRegistry, Workflow, WorkflowBuilder
 from requiem.kernel import Engine
 from requiem.outcomes import NeedsHuman, PermanentFailure, RetryableFailure, Success
+from requiem.plan_lineage import (
+    format_commit_marker,
+    marker_belongs_to_scenario,
+    marker_matches,
+    parse_commit_marker,
+)
 from requiem.toolbelt import Toolbelt
 
 # ---- closed `error_kind` vocabulary (ADR 0004 §4.2) --------------------
@@ -81,11 +91,14 @@ EK_VALIDATION         = "validation_failed"
 EK_TOO_LARGE          = "tree_too_large"
 EK_NOT_FOUND          = "not_found"
 EK_RATE_LIMITED       = "rate_limited"
+EK_TIMEOUT            = "timeout"
 
 # ---- gate identifiers (free-form but namespaced) -----------------------
 
 GATE_PINNED_MISSING = "commit_plan.pinned_item_missing"
+GATE_PINNED_CONFLICT = "commit_plan.pinned_item_conflict"
 GATE_AMBIGUOUS      = "commit_plan.ambiguous_existing_child"
+GATE_LINEAGE_LOST   = "commit_plan.lineage_not_preserved"
 GATE_UNKNOWN_TWIG   = "commit_plan.unknown_twig_failure"
 
 # ---- artifact schema ---------------------------------------------------
@@ -100,35 +113,30 @@ MIN_SCHEMA_VERSION = 2
 # could in principle be thousands of items). Tunable per invocation.
 DEFAULT_MAX_CREATES = 200
 
-_MARKER_RE = re.compile(
-    r"<!--\s*requiem-commit\s+plan_id=(?P<plan>\S+)\s+synth_id=(?P<synth>\d+)\s*-->"
-)
-
-
-def _marker(plan_id: str, synth_id: int) -> str:
-    return f"<!-- requiem-commit plan_id={plan_id} synth_id={synth_id} -->"
-
-
-def _description_of(item: TwigItem) -> str:
-    """Best-effort extraction of an item's description across twig payload shapes."""
-    raw = item.raw or {}
-    for key in ("description", "Description"):
-        val = raw.get(key)
-        if val:
-            return str(val)
-    fields = raw.get("fields") or {}
-    return str(fields.get("System.Description") or "")
+def _marker(plan_id: str, synth_id: int, scenario_id: int) -> str:
+    return format_commit_marker(
+        plan_id,
+        synth_id,
+        scenario_id=scenario_id,
+    )
 
 
 def _find_by_marker(
-    existing: list[TwigItem], plan_id: str, synth_id: int
-) -> TwigItem | None:
-    needle = str(synth_id)
-    for it in existing:
-        m = _MARKER_RE.search(_description_of(it))
-        if m and m.group("plan") == str(plan_id) and m.group("synth") == needle:
-            return it
-    return None
+    existing: list[TwigItem],
+    scenario_id: int,
+    plan_id: str,
+    synth_id: int,
+) -> list[TwigItem]:
+    return [
+        item
+        for item in existing
+        if marker_matches(
+            parse_commit_marker(item),
+            scenario_id=scenario_id,
+            plan_id=plan_id,
+            synth_id=synth_id,
+        )
+    ]
 
 
 # ---- public result type -------------------------------------------------
@@ -234,13 +242,20 @@ def _synth_of(prop: dict[str, Any], parent_synth: int, index: int) -> int:
 
 
 def _validate_node(
-    node: dict[str, Any], *, parent_synth: int, depth: int, errors: list[str]
+    node: dict[str, Any],
+    *,
+    parent_synth: int,
+    depth: int,
+    errors: list[str],
+    claimed_synths: set[int] | None = None,
 ) -> int:
     """Recursively validate a plan node; return the number of *creates* it implies.
 
     Pinned proposals (``item_id`` set) are reuse, not creates, so they do not
     count toward the size cap. Records every structural problem into ``errors``.
     """
+    if claimed_synths is None:
+        claimed_synths = set()
     proposals = node.get("proposals") or []
     children = node.get("children") or []
     if node.get("decomposable") and len(children) != len(proposals):
@@ -255,6 +270,13 @@ def _validate_node(
             errors.append(f"depth {depth}: proposal[{i}] missing title/work_item_type")
             continue
         synth = _synth_of(prop, parent_synth, i)
+        if synth in claimed_synths:
+            errors.append(
+                f"depth {depth}: proposal[{i}] claims item/synth id {synth} "
+                "more than once"
+            )
+        else:
+            claimed_synths.add(synth)
         if not isinstance(prop.get("item_id"), int):
             total += 1  # a create (pinned ids are reuse)
         child = children[i] if i < len(children) else None
@@ -269,27 +291,19 @@ def _validate_node(
             #   * ``policy-forced-leaf`` (ADR-0025 Gap A): planning workflow
             #     short-circuited an implementable-type node entirely. The
             #     policy IS the approval; no planner/reviewer ran.
-            #   * ``needs_human`` (ADR-0027 `--on-escalate accept-last`): the
-            #     planner produced output but the reviewer escalated and the
-            #     operator policy is "ship the last planner output anyway."
-            #     The node carries proposals but NO committed children — by
-            #     design. The escalation sidecar carries the open questions
-            #     for follow-up. We seed the node itself and stop descending.
-            if fv not in (None, "approved", "policy-forced-leaf", "needs_human"):
+            if fv not in (None, "approved", "policy-forced-leaf"):
                 errors.append(
                     f"depth {depth}: child[{i}] final_verdict {fv!r} is not approved"
                 )
-            # Decomposable AND approved → descend. needs_human / policy-forced-leaf
-            # are terminal in commit_plan's view (we seed the node, stop here).
-            if child.get("decomposable") and fv != "needs_human":
+            if child.get("decomposable"):
                 total += _validate_node(
-                    child, parent_synth=synth, depth=depth + 1, errors=errors
+                    child,
+                    parent_synth=synth,
+                    depth=depth + 1,
+                    errors=errors,
+                    claimed_synths=claimed_synths,
                 )
     return total
-
-
-def _read_tree(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 # ---- internal control-flow signal --------------------------------------
@@ -315,7 +329,8 @@ def build_verb_registry(inputs: CommitPlanInputs, *, twig: Any, log_dir: Path) -
 
     @verbs.register("load_tree")
     def _load_tree(ctx):
-        path = inputs.plan_tree_path
+        start = ctx.completed["start"]["value"]
+        path = Path(start["plan_tree_path"])
         try:
             raw = path.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -342,10 +357,10 @@ def build_verb_registry(inputs: CommitPlanInputs, *, twig: Any, log_dir: Path) -
                 ),
                 details={"path": str(path), "schema_version": sv},
             )
-        if tree.get("verdict") not in ("approved", "needs_human"):
+        if tree.get("verdict") != "approved":
             return PermanentFailure(
                 error_kind=EK_NOT_APPROVED,
-                message=f"plan verdict is {tree.get('verdict')!r}, not 'approved' or 'needs_human'",
+                message=f"plan verdict is {tree.get('verdict')!r}, not 'approved'",
                 details={"verdict": tree.get("verdict")},
             )
         if not tree.get("decomposable"):
@@ -370,26 +385,31 @@ def build_verb_registry(inputs: CommitPlanInputs, *, twig: Any, log_dir: Path) -
                 message="plan tree failed structural validation",
                 details={"errors": errors[:20]},
             )
-        if total > inputs.max_creates:
+        max_creates = int(start["max_creates"])
+        if total > max_creates:
             return PermanentFailure(
                 error_kind=EK_TOO_LARGE,
                 message=(
                     f"plan would create {total} items, exceeding the cap "
-                    f"{inputs.max_creates}; raise max_creates to proceed"
+                    f"{max_creates}; raise max_creates to proceed"
                 ),
-                details={"total_creates": total, "cap": inputs.max_creates},
+                details={"total_creates": total, "cap": max_creates},
             )
         return Success(
             value={
                 "root_item_id": int(tree["item_id"]),
                 "plan_id": tree.get("plan_id"),
                 "total_creates": total,
+                "tree": tree,
             },
         )
 
     @verbs.register("seed_tree")
     async def _seed_tree(ctx):
-        tree = _read_tree(inputs.plan_tree_path)
+        start = ctx.completed["start"]["value"]
+        tree = ctx.completed["load_tree"]["value"]["tree"]
+        dry_run = bool(start["dry_run"])
+        area_path = start.get("area_path")
         plan_id = str(tree.get("plan_id") or f"plan-{tree.get('item_id')}")
         root_id = int(tree["item_id"])
         ledger: list[dict[str, Any]] = []
@@ -424,7 +444,7 @@ def build_verb_registry(inputs: CommitPlanInputs, *, twig: Any, log_dir: Path) -
                     try:
                         item = await twig.show_async(synth)
                     except TwigItemNotFoundError:
-                        if inputs.dry_run:
+                        if dry_run:
                             ledger.append(_rec(synth, None, title, wit, real_parent, "missing_pinned"))
                             continue
                         raise _SeedAbort(NeedsHuman(
@@ -436,51 +456,230 @@ def build_verb_registry(inputs: CommitPlanInputs, *, twig: Any, log_dir: Path) -
                             options=("retry", "abort"),
                             context={"synth_id": synth, "title": title, "created": ledger},
                         ))
+                    marker = parse_commit_marker(item)
+                    eligible = [
+                        candidate
+                        for candidate in existing
+                        if candidate.parent_id == real_parent
+                        and candidate.title == title
+                        and candidate.work_item_type == wit
+                    ]
+                    conflicts: list[str] = []
+                    if item.parent_id != real_parent:
+                        conflicts.append(
+                           f"parent_id {item.parent_id!r} != expected {real_parent!r}"
+                        )
+                    if item.title != title or item.work_item_type != wit:
+                        conflicts.append(
+                           "title/work_item_type do not exactly match the proposal"
+                        )
+                    if not marker_belongs_to_scenario(marker, root_id):
+                        conflicts.append(
+                           f"item lacks durable Requiem lineage for Scenario {root_id}"
+                        )
+                    if item.id in used:
+                        conflicts.append(
+                            "item was already claimed by another proposal "
+                            "under this parent"
+                        )
+                    if len(eligible) != 1 or eligible[0].id != item.id:
+                        conflicts.append(
+                           "exact title/type match is not unique under the "
+                           "authoritative parent"
+                        )
+                    if conflicts:
+                        if dry_run:
+                           ledger.append(
+                               _rec(
+                                   synth, item.id, title, wit, real_parent,
+                                   "conflicting_pinned",
+                               )
+                           )
+                           continue
+                        raise _SeedAbort(NeedsHuman(
+                           gate=GATE_PINNED_CONFLICT,
+                           prompt=(
+                               f"pinned item {synth} failed lineage validation: "
+                               f"{'; '.join(conflicts)}. Regenerate an aligned "
+                               "approved plan or abort."
+                           ),
+                           options=("retry", "abort"),
+                           context={
+                               "synth_id": synth,
+                               "title": title,
+                               "conflicts": conflicts,
+                               "created": ledger,
+                           },
+                        ))
                     real, status = item.id, "pinned_reuse"
                 else:
-                    marker_item = _find_by_marker(existing, plan_id, synth)
-                    if marker_item is not None:
-                        real, status = marker_item.id, "reused"
-                    else:
-                        cands = [
-                            it for it in existing
-                            if it.id not in used
-                            and it.title == title
-                            and it.work_item_type == wit
-                            and _MARKER_RE.search(_description_of(it)) is None
+                    marker_items = _find_by_marker(
+                        existing,
+                        root_id,
+                        plan_id,
+                        synth,
+                    )
+                    if len(marker_items) > 1:
+                        if dry_run:
+                           ledger.append(
+                               _rec(synth, None, title, wit, real_parent, "ambiguous")
+                           )
+                           continue
+                        raise _SeedAbort(NeedsHuman(
+                           gate=GATE_AMBIGUOUS,
+                           prompt=(
+                               f"{len(marker_items)} children under {real_parent} "
+                               f"carry the same Requiem marker for synth {synth}; "
+                               "resolve the duplicate lineage before committing."
+                           ),
+                           options=("retry", "abort"),
+                           context={
+                               "synth_id": synth,
+                               "candidate_ids": [item.id for item in marker_items],
+                               "created": ledger,
+                           },
+                        ))
+                    if marker_items:
+                        item = marker_items[0]
+                        exact_candidates = [
+                            candidate
+                            for candidate in existing
+                            if candidate.title == title
+                            and candidate.work_item_type == wit
                         ]
-                        if len(cands) > 1:
-                            if inputs.dry_run:
-                                ledger.append(_rec(synth, None, title, wit, real_parent, "ambiguous"))
+                        conflicts: list[str] = []
+                        if item.title != title or item.work_item_type != wit:
+                            conflicts.append(
+                                "title/work_item_type drifted from the approved plan"
+                            )
+                        if (
+                            len(exact_candidates) != 1
+                            or exact_candidates[0].id != item.id
+                        ):
+                            conflicts.append(
+                                "exact title/type match is not unique under the "
+                                "authoritative parent"
+                            )
+                        if conflicts:
+                            if dry_run:
+                                ledger.append(
+                                    _rec(
+                                        synth,
+                                        item.id,
+                                        title,
+                                        wit,
+                                        real_parent,
+                                        "conflicting_reuse",
+                                    )
+                                )
                                 continue
                             raise _SeedAbort(NeedsHuman(
-                                gate=GATE_AMBIGUOUS,
+                                gate=GATE_PINNED_CONFLICT,
                                 prompt=(
-                                    f"{len(cands)} existing children under {real_parent} "
-                                    f"match (title={title!r}, type={wit}) with no commit "
-                                    "marker — cannot disambiguate. Resolve in ADO or abort."
+                                    f"existing item {item.id} matched lineage but "
+                                    f"failed exact reuse validation: "
+                                    f"{'; '.join(conflicts)}"
                                 ),
                                 options=("retry", "abort"),
-                                context={"title": title, "candidate_ids": [c.id for c in cands], "created": ledger},
+                                context={
+                                    "synth_id": synth,
+                                    "item_id": item.id,
+                                    "conflicts": conflicts,
+                                    "created": ledger,
+                                },
                             ))
-                        elif len(cands) == 1:
-                            real, status = cands[0].id, "adopted"
-                        elif inputs.dry_run:
-                            ledger.append(_rec(synth, None, title, wit, real_parent, "would_create"))
-                            if sub_decomp:
-                                await seed_level(None, synth, sub_props, sub_children)
-                            continue
+                        real, status = item.id, "reused"
+                    else:
+                        cands = [
+                           it for it in existing
+                           if it.title == title
+                           and it.work_item_type == wit
+                        ]
+                        if cands:
+                           if dry_run:
+                               ledger.append(_rec(synth, None, title, wit, real_parent, "ambiguous"))
+                               continue
+                           raise _SeedAbort(NeedsHuman(
+                               gate=GATE_AMBIGUOUS,
+                               prompt=(
+                                   f"{len(cands)} existing children under {real_parent} "
+                                   f"match (title={title!r}, type={wit}) without the "
+                                   "current plan marker. Planning must reconcile and "
+                                   "explicitly pin one exact same-Scenario item before "
+                                   "commit can continue."
+                               ),
+                               options=("retry", "abort"),
+                               context={"title": title, "candidate_ids": [c.id for c in cands], "created": ledger},
+                           ))
+                        if dry_run:
+                           ledger.append(_rec(synth, None, title, wit, real_parent, "would_create"))
+                           if sub_decomp:
+                               await seed_level(None, synth, sub_props, sub_children)
+                           continue
                         else:
-                            marker = _marker(plan_id, synth)
+                            marker = _marker(plan_id, synth, root_id)
                             full_desc = f"{desc}\n\n{marker}" if desc else marker
                             created = await twig.create_child_async(
                                 parent_id=real_parent,
                                 title=title,
                                 work_item_type=wit,
-                                area_path=inputs.area_path,
+                                area_path=area_path,
                                 description=full_desc,
                             )
-                            real, status = created.id, "created"
+                            verified = await twig.show_async(created.id)
+                            verification_errors: list[str] = []
+                            if verified.parent_id != real_parent:
+                                verification_errors.append(
+                                    f"parent_id {verified.parent_id!r} != "
+                                    f"expected {real_parent!r}"
+                                )
+                            if (
+                                verified.title != title
+                                or verified.work_item_type != wit
+                            ):
+                                verification_errors.append(
+                                    "title/work_item_type do not match the "
+                                    "approved plan"
+                                )
+                            if not marker_matches(
+                                parse_commit_marker(verified),
+                                scenario_id=root_id,
+                                plan_id=plan_id,
+                                synth_id=synth,
+                            ):
+                                verification_errors.append(
+                                    "ADO did not preserve the durable lineage marker"
+                                )
+                            if verification_errors:
+                                ledger.append(
+                                    _rec(
+                                        synth,
+                                        verified.id,
+                                        title,
+                                        wit,
+                                        real_parent,
+                                        "created_unverified",
+                                    )
+                                )
+                                raise _SeedAbort(NeedsHuman(
+                                    gate=GATE_LINEAGE_LOST,
+                                    prompt=(
+                                        f"created item {verified.id}, but its "
+                                        "authoritative read-back failed lineage "
+                                        f"verification: "
+                                        f"{'; '.join(verification_errors)}. "
+                                        "Do not retry creation until the existing "
+                                        "item is reconciled."
+                                    ),
+                                    options=("retry", "abort"),
+                                    context={
+                                        "synth_id": synth,
+                                        "item_id": verified.id,
+                                        "conflicts": verification_errors,
+                                        "created": ledger,
+                                    },
+                                ))
+                            real, status = verified.id, "created"
 
                 used.add(real)
                 id_map[synth] = real
@@ -508,6 +707,14 @@ def build_verb_registry(inputs: CommitPlanInputs, *, twig: Any, log_dir: Path) -
                 details={"created": ledger},
             )
         except TwigUnknownError as e:
+            if e.exit_code == -1:
+                return RetryableFailure(
+                    retry_key=f"{ctx.run_id}:seed_tree",
+                    error_kind=EK_TIMEOUT,
+                    message=f"twig timed out mid-seed: {e}",
+                    attempt=ctx.attempt,
+                    after=30,
+                )
             return NeedsHuman(
                 gate=GATE_UNKNOWN_TWIG,
                 prompt=(
@@ -532,11 +739,11 @@ def build_verb_registry(inputs: CommitPlanInputs, *, twig: Any, log_dir: Path) -
         created_count = sum(1 for r in ledger if r["status"] == "created")
         would_create = sum(1 for r in ledger if r["status"] == "would_create")
         reused_count = sum(
-            1 for r in ledger if r["status"] in ("reused", "adopted", "pinned_reuse")
+            1 for r in ledger if r["status"] in ("reused", "pinned_reuse")
         )
         return Success(
             value={
-                "dry_run": inputs.dry_run,
+                "dry_run": dry_run,
                 "plan_id": plan_id,
                 "root_item_id": root_id,
                 "id_map": {str(k): v for k, v in id_map.items()},
@@ -549,6 +756,7 @@ def build_verb_registry(inputs: CommitPlanInputs, *, twig: Any, log_dir: Path) -
 
     @verbs.register("write_manifest")
     def _write_manifest(ctx):
+        start = ctx.completed["start"]["value"]
         seed = ctx.completed["seed_tree"]["value"]
         manifest = {
             "schema_version": 1,
@@ -561,7 +769,12 @@ def build_verb_registry(inputs: CommitPlanInputs, *, twig: Any, log_dir: Path) -
             "id_map": seed.get("id_map"),
             "ledger": seed.get("ledger"),
         }
-        path = inputs.manifest_path or (log_dir / f"{ctx.run_id}.plan.committed.json")
+        configured_path = start.get("manifest_path")
+        path = (
+            Path(configured_path)
+            if configured_path
+            else log_dir / f"{ctx.run_id}.plan.committed.json"
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         return Success(
@@ -608,9 +821,10 @@ def build_workflow() -> Workflow:
             .script("load_tree", verb="load_tree")
                 .edge("load_tree", on="success", to="seed_tree")
                 .edge("load_tree", on="permanent_failure", to="end_failed")
-            .script("seed_tree", verb="seed_tree")
+            .script("seed_tree", verb="seed_tree", retry_max=2)
                 .edge("seed_tree", on="success", to="write_manifest")
                 .edge("seed_tree", on="permanent_failure", to="end_failed")
+                .edge("seed_tree", on="retryable_failure", to="seed_tree")
                 .edge("seed_tree", on="needs_human:retry", to="seed_tree")
                 .edge("seed_tree", on="needs_human:abort", to="end_human")
             .script("write_manifest", verb="write_manifest")

@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import shutil
 from dataclasses import dataclass, field
@@ -197,6 +198,8 @@ class TwigClient:
 
     `timeout_s` caps each call so a hung subprocess doesn't wedge the
     engine -- twig itself has internal timeouts but we belt-and-brace.
+    The default is intentionally generous for live ADO calls, and can be
+    overridden with ``REQUIEM_TWIG_TIMEOUT_S`` or a direct constructor arg.
     """
 
     def __init__(
@@ -204,8 +207,11 @@ class TwigClient:
         cwd: Path | None = None,
         *,
         executable: str = "twig",
-        timeout_s: float = 30.0,
+        timeout_s: float | None = None,
     ) -> None:
+        if timeout_s is None:
+            env_timeout = os.environ.get("REQUIEM_TWIG_TIMEOUT_S")
+            timeout_s = float(env_timeout) if env_timeout else 180.0
         self._cwd = cwd
         self._executable = executable
         self._timeout_s = timeout_s
@@ -253,6 +259,24 @@ class TwigClient:
         normal ``_classify_failure`` table.
         """
         await self._run(["comment", "--id", str(item_id), "--message", message])
+
+    async def append_description_async(self, item_id: int, text: str) -> TwigItem:
+        """Append visible Markdown to ``System.Description`` and read it back."""
+        await self._run(
+            [
+                "update",
+                "System.Description",
+                text,
+                "--id",
+                str(item_id),
+                "--append",
+                "--format",
+                "markdown",
+                "--output",
+                "json",
+            ]
+        )
+        return await self.show_async(item_id)
 
     async def create_child_async(
         self,
@@ -344,6 +368,9 @@ class TwigClient:
 
     def comment(self, item_id: int, message: str) -> None:
         return asyncio.run(self.comment_async(item_id, message))
+
+    def append_description(self, item_id: int, text: str) -> TwigItem:
+        return asyncio.run(self.append_description_async(item_id, text))
 
     def create_child(
         self,

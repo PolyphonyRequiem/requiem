@@ -20,8 +20,10 @@ from requiem.clients.repo import (
     RepoPullRequest,
 )
 from requiem.kernel import Completed, Suspended
+from requiem.outcomes import RetryableFailure
 from requiem.persistence import replay
 from requiem.toolbelt import Toolbelt
+from requiem.workflows.implementation import TestRunResult
 from requiem.workflows import leaf_lifecycle as leaf_lifecycle_module
 from requiem.workflows.leaf_lifecycle import (
     FakeLeafLifecycleToolkit,
@@ -82,13 +84,15 @@ def _pr(*, state: str = "open", merged: bool = False,
 
 
 def _mergeable(*, mergeable=True, state="clean", checks="success",
-               conflicts=False, policies=True) -> RepoMergeabilityReport:
+               conflicts=False, policies=True,
+               head_sha=None) -> RepoMergeabilityReport:
     return RepoMergeabilityReport(
         mergeable=mergeable,
         mergeable_state=state,
         checks_state=checks,
         conflicts=conflicts,
         policies_satisfied=policies,
+        head_sha=head_sha,
     )
 
 
@@ -96,11 +100,12 @@ def _toolkit(
     *,
     prs: list[RepoPullRequest] | None = None,
     mergeability: list[RepoMergeabilityReport] | None = None,
+    branch_shas: list[str] | None = None,
     push_shas: list[str] | None = None,
 ) -> FakeLeafLifecycleToolkit:
     return FakeLeafLifecycleToolkit(
         pr_snapshots=prs or [_pr()],
-        branch_sha_snapshots=["head-sha-1", "head-sha-2", "head-sha-3"],
+        branch_sha_snapshots=branch_shas or ["head-sha-1"],
         mergeability_snapshots=mergeability or [_mergeable()],
         complete_result=RepoCompleteResult(
             number=41,
@@ -112,20 +117,38 @@ def _toolkit(
     )
 
 
-def _provider(*, reviewer=None, synth=None, addresser=None) -> FakeProvider:
-    return FakeProvider(scripts={
+def _provider(
+    *,
+    reviewer=None,
+    compacted_reviewer=None,
+    synth=None,
+    addresser=None,
+) -> FakeProvider:
+    scripts = {
         "leaf_reviewer": reviewer or [
             {"verdict": "approve", "comments": [], "summary": "ok"}
         ],
         "comment_synthesizer": synth or [],
         "comment_addresser": addresser or [],
-    })
+    }
+    if compacted_reviewer is not None:
+        scripts["compacted_leaf_reviewer"] = compacted_reviewer
+    return FakeProvider(scripts=scripts)
+
+
+def _passing_test_runner(command: str, cwd: Path) -> TestRunResult:
+    return TestRunResult(
+        passed=True,
+        summary=f"passed via {command} in {cwd}",
+        full_output="",
+    )
 
 
 def _engine(log_dir: Path, *, toolkit: FakeLeafLifecycleToolkit,
             provider: FakeProvider | None = None,
             repo_path: Path | None = None,
-            dry_run=False, max_iterations=3, default_branch="main"):
+            dry_run=False, max_iterations=3, default_branch="main",
+            test_runner=_passing_test_runner):
     inputs = LeafLifecycleInputs(
         repo=REPO,
         repo_path=repo_path or log_dir,
@@ -133,6 +156,7 @@ def _engine(log_dir: Path, *, toolkit: FakeLeafLifecycleToolkit,
         root_item_id=ROOT,
         pr_number=41,
         default_branch=default_branch,
+        test_command="pytest -q",
         dry_run=dry_run,
         max_iterations=max_iterations,
     )
@@ -147,6 +171,7 @@ def _engine(log_dir: Path, *, toolkit: FakeLeafLifecycleToolkit,
         toolkit=toolkit,
         provider=provider or _provider(),
         toolbelt=toolbelt,
+        test_runner=test_runner,
     )
 
 
@@ -168,6 +193,137 @@ async def test_happy_path_approves_and_merges(log_dir: Path, repo_path: Path):
     assert res.final_state == "merged"
     assert res.merge_sha == "merge-sha-41"
     assert tk.complete_calls[0]["strategy"] == "squash"
+    assert tk.complete_calls[0]["expected_head_sha"] == "push-sha-1"
+
+
+async def test_token_exhaustion_gets_one_tool_free_compacted_review(
+    log_dir: Path, repo_path: Path
+):
+    tk = _toolkit()
+    tk.review_diff_text = (
+        "diff --git a/.requiem/AGENTS.md b/.requiem/AGENTS.md\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/.requiem/AGENTS.md\n"
+        "@@ -0,0 +1 @@\n"
+        "+internal context\n"
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+safe\n"
+    )
+    timeout = RetryableFailure(
+        retry_key="review#1",
+        error_kind="network_timeout",
+        message=(
+            "session input tokens (91647) exceeded "
+            "max_cumulative_input_tokens=80000"
+        ),
+        receipts=({
+            "kind": "llm_call",
+            "model": "claude-sonnet-5",
+            "input_tokens": 91647,
+            "output_tokens": 59,
+            "latency_ms": 240061,
+            "request_id": "live-run-40",
+            "error": (
+                "session input tokens (91647) exceeded "
+                "max_cumulative_input_tokens=80000"
+            ),
+        },),
+    )
+    provider = _provider(
+        reviewer=[timeout],
+        compacted_reviewer=[{
+            "verdict": "approve",
+            "comments": [],
+            "summary": "merge-bound diff is safe",
+        }],
+    )
+    engine = _engine(
+        log_dir,
+        toolkit=tk,
+        provider=provider,
+        repo_path=repo_path,
+    )
+
+    result = await engine.run("review_token_recovery")
+
+    assert result.final_node == "end_merged"
+    completed = _completed_map(log_dir / "review_token_recovery.events.jsonl")
+    assert completed["recover_review_token_exhaustion"]["kind"] == "success"
+    assert (
+        completed["recover_review_token_exhaustion"]["value"]["trigger"][
+            "input_tokens"
+        ]
+        == 91647
+    )
+    assert completed["verify_compacted_review"]["kind"] == "success"
+    calls = {call["agent"]: call for call in provider.calls}
+    assert ".requiem/AGENTS.md" not in calls["leaf_reviewer"]["user_message"]
+    compacted_prompt = calls["compacted_leaf_reviewer"]["user_message"]
+    assert calls["compacted_leaf_reviewer"]["model_options"] == {
+        "disable_repo_tools": True
+    }
+    assert "Do not call tools" in compacted_prompt
+    assert "diff --git a/app.py b/app.py" in compacted_prompt
+    assert ".requiem/AGENTS.md" not in compacted_prompt
+
+
+async def test_non_token_reviewer_failure_is_not_disguised_as_human_gate(
+    log_dir: Path
+):
+    provider = _provider(reviewer=[RetryableFailure(
+        retry_key="review#1",
+        error_kind="provider_unavailable",
+        message="temporary upstream outage",
+    )])
+    engine = _engine(log_dir, toolkit=_toolkit(), provider=provider)
+
+    result = await engine.run("review_runtime_failure")
+
+    assert result.final_node == "needs_human_end"
+    completed = _completed_map(log_dir / "review_runtime_failure.events.jsonl")
+    assert (
+        completed["recover_review_token_exhaustion"]["error_kind"]
+        == "review.runtime_failure"
+    )
+    assert build_result(completed).final_state == "failed"
+    assert all(
+        call["agent"] != "compacted_leaf_reviewer" for call in provider.calls
+    )
+
+
+async def test_oversized_diff_refuses_unsafe_compacted_review(log_dir: Path):
+    tk = _toolkit()
+    tk.review_diff_text = (
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -1 +1 @@\n"
+        f"+{'x' * (leaf_lifecycle_module.MAX_COMPACTED_REVIEW_DIFF_CHARS + 1)}\n"
+    )
+    provider = _provider(reviewer=[RetryableFailure(
+        retry_key="review#1",
+        error_kind="network_timeout",
+        message=(
+            "session input tokens (90000) exceeded "
+            "max_cumulative_input_tokens=80000"
+        ),
+    )])
+    engine = _engine(log_dir, toolkit=tk, provider=provider)
+
+    result = await engine.run("review_compaction_unsafe")
+
+    assert result.final_node == "needs_human_end"
+    completed = _completed_map(log_dir / "review_compaction_unsafe.events.jsonl")
+    assert (
+        completed["recover_review_token_exhaustion"]["error_kind"]
+        == "review.compaction_unsafe"
+    )
+    assert build_result(completed).final_state == "failed"
 
 
 async def test_async_merge_completion_is_confirmed_by_authoritative_requery(
@@ -304,6 +460,34 @@ async def test_prune_context_pack_is_idempotent_when_absent(log_dir: Path, repo_
     assert prune_value["commit_sha"] is None
     assert prune_value["status_posted"] is True
     assert tk.posted_statuses[0]["sha"] == "push-sha-1"
+
+
+async def test_fresh_cleanup_status_recovers_before_merge(
+    log_dir: Path,
+    repo_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(leaf_lifecycle_module, "TEST_STATUS_RETRY_DELAY_S", 0.0)
+    tk = _toolkit(
+        mergeability=[
+            _mergeable(),
+            _mergeable(checks="unknown"),
+            _mergeable(),
+            _mergeable(),
+        ],
+        branch_shas=["initial-sha", "cleanup-sha", "cleanup-sha"],
+        push_shas=["cleanup-sha"],
+    )
+    engine = _engine(log_dir, toolkit=tk, repo_path=repo_path)
+
+    result = await engine.run("cleanup_status_recovers")
+
+    assert result.final_node == "end_merged"
+    completed = _completed_map(log_dir / "cleanup_status_recovers.events.jsonl")
+    assert completed["verify_tests_status_before_merge"]["value"][
+        "verification_attempt"
+    ] == 1
+    assert tk.posted_statuses[0]["sha"] == "cleanup-sha"
 
 
 async def test_request_changes_loops_once_then_merges(log_dir: Path, repo_path: Path):
@@ -508,13 +692,310 @@ async def test_tests_not_passed_precondition_blocks_before_review(log_dir: Path)
 
 
 async def test_tests_status_unknown_precondition_blocks_before_review(log_dir: Path):
-    tk = _toolkit(mergeability=[_mergeable(checks="pending")])
+    tk = _toolkit(mergeability=[_mergeable(checks="unknown")])
     engine = _engine(log_dir, toolkit=tk)
     result = await engine.run("tests_unknown")
     assert result.final_node == "needs_human_end"
     completed = _completed_map(log_dir / "tests_unknown.events.jsonl")
     assert completed["check_tests_passed"]["error_kind"] == "needs_human.tests_status_unknown"
     assert "review_leaf" not in completed
+
+
+async def test_pending_test_status_recovers_after_authoritative_reread(
+    log_dir: Path,
+    repo_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(leaf_lifecycle_module, "TEST_STATUS_RETRY_DELAY_S", 0.0)
+    tk = _toolkit(
+        mergeability=[
+            _mergeable(checks="pending"),
+            _mergeable(),
+            _mergeable(),
+        ],
+    )
+    engine = _engine(log_dir, toolkit=tk, repo_path=repo_path)
+
+    result = await engine.run("tests_pending_recovers")
+
+    assert result.final_node == "end_merged"
+    completed = _completed_map(log_dir / "tests_pending_recovers.events.jsonl")
+    assert completed["check_tests_passed"]["error_kind"] == (
+        "tests_status.recheck_required"
+    )
+    assert completed["verify_tests_status_before_review"]["value"][
+        "verification_attempt"
+    ] == 1
+
+
+async def test_test_status_verification_rejects_concurrent_head_change(
+    log_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(leaf_lifecycle_module, "TEST_STATUS_RETRY_DELAY_S", 0.0)
+    tk = _toolkit(
+        mergeability=[
+            _mergeable(checks="pending", head_sha="expected-sha"),
+            _mergeable(checks="pending", head_sha="expected-sha"),
+        ],
+        branch_shas=["initial-sha", "changed-sha"],
+    )
+    engine = _engine(log_dir, toolkit=tk)
+
+    result = await engine.run("tests_head_changed")
+
+    assert result.final_node == "needs_human_end"
+    completed = _completed_map(log_dir / "tests_head_changed.events.jsonl")
+    outcome = completed["verify_tests_status_before_review"]
+    assert outcome["error_kind"] == "needs_human.tests_status_unknown"
+    assert outcome["details"]["expected_head_sha"] == "expected-sha"
+    assert outcome["details"]["current_head_sha"] == "changed-sha"
+
+
+async def test_review_fixes_rerun_tests_publish_status_and_recover_unknown(
+    log_dir: Path,
+    repo_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(leaf_lifecycle_module, "TEST_STATUS_RETRY_DELAY_S", 0.0)
+    review = {
+        "verdict": "request_changes",
+        "summary": "fix it",
+        "comments": [{"file": "a.py", "line": 1, "body": "fix", "severity": "major"}],
+    }
+    synth = {
+        "actionable_items": [{
+            "file": "a.py",
+            "line_range": [1, 1],
+            "change_summary": "fix",
+            "original_comment_ids": [1],
+        }],
+        "non_actionable": [],
+    }
+    addr = {
+        "file_changes": [{"path": "a.py", "operation": "create", "content": "fixed\n"}],
+        "summary": "fixed",
+        "items_addressed": [1],
+    }
+    test_calls: list[tuple[str, Path]] = []
+
+    def runner(command: str, cwd: Path) -> TestRunResult:
+        test_calls.append((command, cwd))
+        return TestRunResult(passed=True, summary="green", full_output="")
+
+    tk = _toolkit(
+        mergeability=[
+            _mergeable(),
+            _mergeable(checks="unknown"),
+            _mergeable(),
+            _mergeable(),
+        ],
+        branch_shas=[
+            "initial-sha",
+            "review-fix-sha",
+            "review-fix-sha",
+        ],
+        push_shas=["review-fix-sha"],
+    )
+    engine = _engine(
+        log_dir,
+        toolkit=tk,
+        provider=_provider(
+            reviewer=[review, {"verdict": "approve", "comments": [], "summary": "ok"}],
+            synth=[synth],
+            addresser=[addr],
+        ),
+        repo_path=repo_path,
+        test_runner=runner,
+    )
+
+    result = await engine.run("addressal_status_recovers")
+
+    assert result.final_node == "end_merged"
+    assert test_calls == [("pytest -q", repo_path)]
+    completed = _completed_map(log_dir / "addressal_status_recovers.events.jsonl")
+    assert completed["run_addressal_tests"]["value"]["passed"] is True
+    assert completed["check_tests_passed"]["error_kind"] == (
+        "tests_status.recheck_required"
+    )
+    assert completed["verify_tests_status_before_review"]["value"][
+        "verification_attempt"
+    ] == 1
+    assert tk.posted_statuses[0] == {
+        "repo": REPO,
+        "sha": "review-fix-sha",
+        "context": "requiem/local-tests",
+        "state": "success",
+        "description": "requiem: local tests passed after review fixes",
+    }
+
+
+async def test_review_fix_test_failure_blocks_before_push(
+    log_dir: Path,
+    repo_path: Path,
+):
+    review = {
+        "verdict": "request_changes",
+        "summary": "fix it",
+        "comments": [{"file": "a.py", "line": 1, "body": "fix", "severity": "major"}],
+    }
+    synth = {
+        "actionable_items": [{
+            "file": "a.py",
+            "line_range": [1, 1],
+            "change_summary": "fix",
+            "original_comment_ids": [1],
+        }],
+        "non_actionable": [],
+    }
+    addr = {
+        "file_changes": [{"path": "a.py", "operation": "create", "content": "broken\n"}],
+        "summary": "fixed",
+        "items_addressed": [1],
+    }
+
+    def runner(command: str, cwd: Path) -> TestRunResult:
+        return TestRunResult(passed=False, summary="failed", full_output="failed")
+
+    tk = _toolkit()
+    engine = _engine(
+        log_dir,
+        toolkit=tk,
+        provider=_provider(reviewer=[review], synth=[synth], addresser=[addr]),
+        repo_path=repo_path,
+        test_runner=runner,
+    )
+
+    result = await engine.run("addressal_tests_fail")
+
+    assert result.final_node == "needs_human_end"
+    completed = _completed_map(log_dir / "addressal_tests_fail.events.jsonl")
+    assert completed["run_addressal_tests"]["error_kind"] == (
+        "needs_human.tests_not_passed"
+    )
+    assert not any(name == "git_push" for name, _args in tk.calls)
+    assert tk.posted_statuses == []
+
+
+async def test_review_fix_worktree_drift_after_tests_blocks_before_push(
+    log_dir: Path,
+    repo_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    review = {
+        "verdict": "request_changes",
+        "summary": "fix it",
+        "comments": [{"file": "a.py", "line": 1, "body": "fix", "severity": "major"}],
+    }
+    synth = {
+        "actionable_items": [{
+            "file": "a.py",
+            "line_range": [1, 1],
+            "change_summary": "fix",
+            "original_comment_ids": [1],
+        }],
+        "non_actionable": [],
+    }
+    addr = {
+        "file_changes": [{"path": "a.py", "operation": "create", "content": "fixed\n"}],
+        "summary": "fixed",
+        "items_addressed": [1],
+    }
+    original = FilesystemClient.git_stage_all_and_tree_sha
+    stage_calls = 0
+
+    async def stage_with_drift(fs: FilesystemClient) -> str:
+        nonlocal stage_calls
+        stage_calls += 1
+        if stage_calls == 2:
+            (repo_path / "drift.py").write_text("untested\n", encoding="utf-8")
+        return await original(fs)
+
+    monkeypatch.setattr(
+        FilesystemClient,
+        "git_stage_all_and_tree_sha",
+        stage_with_drift,
+    )
+    tk = _toolkit()
+    engine = _engine(
+        log_dir,
+        toolkit=tk,
+        provider=_provider(reviewer=[review], synth=[synth], addresser=[addr]),
+        repo_path=repo_path,
+    )
+
+    result = await engine.run("addressal_tree_drift")
+
+    assert result.final_node == "needs_human_end"
+    completed = _completed_map(log_dir / "addressal_tree_drift.events.jsonl")
+    outcome = completed["push_addressal"]
+    assert outcome["error_kind"] == "needs_human.tests_status_unknown"
+    assert outcome["details"]["reason"] == "tested_tree_changed"
+    assert not any(name == "git_push" for name, _args in tk.calls)
+    assert tk.posted_statuses == []
+
+
+async def test_unresolved_fresh_test_status_suspends_with_escalation_brief(
+    log_dir: Path,
+    repo_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(leaf_lifecycle_module, "TEST_STATUS_RETRY_DELAY_S", 0.0)
+    review = {
+        "verdict": "request_changes",
+        "summary": "fix it",
+        "comments": [{"file": "a.py", "line": 1, "body": "fix", "severity": "major"}],
+    }
+    synth = {
+        "actionable_items": [{
+            "file": "a.py",
+            "line_range": [1, 1],
+            "change_summary": "fix",
+            "original_comment_ids": [1],
+        }],
+        "non_actionable": [],
+    }
+    addr = {
+        "file_changes": [{"path": "a.py", "operation": "create", "content": "fixed\n"}],
+        "summary": "fixed",
+        "items_addressed": [1],
+    }
+    unknown = _mergeable(checks="unknown")
+    tk = _toolkit(
+        mergeability=[_mergeable(), unknown, unknown, unknown, unknown],
+        branch_shas=[
+            "initial-sha",
+            "review-fix-sha",
+            "review-fix-sha",
+            "review-fix-sha",
+            "review-fix-sha",
+        ],
+        push_shas=["review-fix-sha"],
+    )
+    engine = _engine(
+        log_dir,
+        toolkit=tk,
+        provider=_provider(reviewer=[review], synth=[synth], addresser=[addr]),
+        repo_path=repo_path,
+    )
+
+    result = await engine.run("addressal_status_stays_unknown")
+
+    assert isinstance(result, Suspended)
+    assert result.node_id == "verify_tests_status_before_review"
+    assert result.options == ("retry_verification", "abort")
+    completed = _completed_map(
+        log_dir / "addressal_status_stays_unknown.events.jsonl"
+    )
+    brief = completed["verify_tests_status_before_review"]["context"]
+    assert brief["trigger"]["problem_kind"] == "tests_status.recheck_required"
+    assert brief["recovery_attempts"] == [{
+        "kind": "authoritative_test_status_reread",
+        "attempts": 3,
+        "result": "checks_unknown",
+    }]
+    assert brief["recommended_option"] == "retry_verification"
+    assert tk.complete_calls == []
 
 
 async def test_reviewer_needs_human_routes_to_needs_human(log_dir: Path):
@@ -633,8 +1114,28 @@ async def test_same_findings_twice_on_new_sha_escalates(log_dir: Path, repo_path
     [
         (_mergeable(mergeable=False, state="dirty", checks="failure", conflicts=True), "needs_human.conflicts"),
         (_mergeable(mergeable=True, state="blocked", checks="failure"), "needs_human.tests_not_passed"),
-        (_mergeable(mergeable=True, state="blocked", checks="pending"), "needs_human.tests_status_unknown"),
-        (_mergeable(mergeable=None, state="unknown", checks="success", policies=False), "needs_human.mergeability_unknown"),
+        (
+            _mergeable(
+                mergeable=True,
+                state="blocked",
+                checks="unknown",
+                head_sha="unpublished-sha",
+            ),
+            "needs_human.tests_status_unknown",
+        ),
+        (
+            _mergeable(
+                mergeable=False,
+                state="rejectedByPolicy",
+                checks="success",
+                policies=False,
+            ),
+            "needs_human.policies_unsatisfied",
+        ),
+        (
+            _mergeable(mergeable=False, state="failure", checks="success"),
+            "needs_human.not_mergeable",
+        ),
     ],
 )
 async def test_mergeability_fail_closed_paths(log_dir: Path, repo_path: Path, report, error_kind):
@@ -645,6 +1146,132 @@ async def test_mergeability_fail_closed_paths(log_dir: Path, repo_path: Path, re
     assert result.final_node == "needs_human_end"
     completed = _completed_map(log_dir / f"mergeability_{error_kind.split('.')[-1]}.events.jsonl")
     assert completed["check_can_merge"]["error_kind"] == error_kind
+
+
+async def test_mergeability_unknown_recovers_after_authoritative_reread(
+    log_dir: Path, repo_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(leaf_lifecycle_module, "MERGEABILITY_RETRY_DELAY_S", 0.0)
+    tk = _toolkit(mergeability=[
+        _mergeable(),
+        _mergeable(mergeable=None, state="unknown"),
+        _mergeable(),
+    ])
+    engine = _engine(log_dir, toolkit=tk, repo_path=repo_path)
+
+    result = await engine.run("mergeability_converges")
+
+    assert result.final_node == "end_merged"
+    completed = _completed_map(log_dir / "mergeability_converges.events.jsonl")
+    assert completed["check_can_merge"]["error_kind"] == "mergeability.recheck_required"
+    assert completed["verify_mergeability"]["value"]["verification_attempt"] == 1
+    assert [call[0] for call in tk.calls].count("pr_mergeability") == 3
+    assert len(tk.complete_calls) == 1
+
+
+async def test_test_status_flap_during_mergeability_verification_recovers(
+    log_dir: Path,
+    repo_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(leaf_lifecycle_module, "TEST_STATUS_RETRY_DELAY_S", 0.0)
+    tk = _toolkit(
+        mergeability=[
+            _mergeable(),
+            _mergeable(mergeable=None, state="queued"),
+            _mergeable(mergeable=None, state="queued", checks="unknown"),
+            _mergeable(),
+            _mergeable(),
+        ],
+        branch_shas=["initial-sha", "cleanup-sha", "cleanup-sha"],
+        push_shas=["cleanup-sha"],
+    )
+    engine = _engine(log_dir, toolkit=tk, repo_path=repo_path)
+
+    result = await engine.run("mergeability_checks_flap")
+
+    assert result.final_node == "end_merged"
+    completed = _completed_map(log_dir / "mergeability_checks_flap.events.jsonl")
+    assert completed["verify_mergeability"]["error_kind"] == (
+        "tests_status.recheck_required"
+    )
+    assert completed["verify_tests_status_before_merge"]["value"][
+        "verification_attempt"
+    ] == 1
+    assert len(tk.complete_calls) == 1
+
+
+async def test_unresolved_mergeability_suspends_with_escalation_brief(
+    log_dir: Path, repo_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(leaf_lifecycle_module, "MERGEABILITY_RETRY_DELAY_S", 0.0)
+    unknown = _mergeable(mergeable=None, state="queued")
+    tk = _toolkit(mergeability=[_mergeable(), unknown, unknown, unknown, unknown])
+    engine = _engine(log_dir, toolkit=tk, repo_path=repo_path)
+
+    result = await engine.run("mergeability_stays_unknown")
+
+    assert isinstance(result, Suspended)
+    assert result.node_id == "verify_mergeability"
+    assert result.options == ("retry_verification", "abort")
+    completed = _completed_map(log_dir / "mergeability_stays_unknown.events.jsonl")
+    brief = completed["verify_mergeability"]["context"]
+    assert brief["trigger"]["problem_kind"] == "mergeability.recheck_required"
+    assert brief["recovery_attempts"] == [
+        {
+            "kind": "authoritative_mergeability_reread",
+            "attempts": 3,
+            "result": "mergeability_queued",
+        }
+    ]
+    assert brief["recommended_option"] == "retry_verification"
+    assert [call[0] for call in tk.calls].count("pr_mergeability") == 5
+    assert tk.complete_calls == []
+    assert build_result(completed).final_state == "needs_human"
+
+
+@pytest.mark.parametrize(
+    ("resolved_report", "error_kind"),
+    [
+        (
+            _mergeable(
+                mergeable=False,
+                state="conflicts",
+                conflicts=True,
+            ),
+            "needs_human.conflicts",
+        ),
+        (
+            _mergeable(
+                mergeable=False,
+                state="rejectedByPolicy",
+                policies=False,
+            ),
+            "needs_human.policies_unsatisfied",
+        ),
+    ],
+)
+async def test_mergeability_reread_preserves_concrete_escalations(
+    log_dir: Path,
+    repo_path: Path,
+    resolved_report: RepoMergeabilityReport,
+    error_kind: str,
+):
+    tk = _toolkit(mergeability=[
+        _mergeable(),
+        _mergeable(mergeable=None, state="queued"),
+        resolved_report,
+    ])
+    engine = _engine(log_dir, toolkit=tk, repo_path=repo_path)
+
+    result = await engine.run(f"mergeability_resolves_{error_kind.split('.')[-1]}")
+
+    assert result.final_node == "needs_human_end"
+    completed = _completed_map(
+        log_dir / f"mergeability_resolves_{error_kind.split('.')[-1]}.events.jsonl"
+    )
+    assert completed["verify_mergeability"]["error_kind"] == error_kind
+    assert tk.complete_calls == []
 
 
 async def test_scope_violation_rejected_on_initial_fetch(log_dir: Path):

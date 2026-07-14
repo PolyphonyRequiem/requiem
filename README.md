@@ -191,14 +191,22 @@ For the architecture, invariants, and decision provenance:
 | `requiem cancel <run_id>` | Write a `cancel_requested` event into the log; the engine short-circuits at the next loop tick or on the next resume. |
 | `requiem describe <module>` | Print nodes, edges, registered agents, retry budgets, humanize map. |
 | `requiem clean --item <id>` | Remove local run artifacts for one work item; idempotency manifests are preserved unless `--include-manifest` is explicit. |
-| `requiem pre-run-cleanup --item <id> --ado-repo <org/project/repo> --repo-path <path>` | Write a read-only stale-run cleanup manifest for canonical `feature/<root>` and `impl/<root>-*` state. Mutation is launcher-only via fenced `--apply`. |
-| `requiem-launch ... -- <scenario-command>` | Acquire the shared root lease, apply pre-run cleanup in `--repo-path`, then run the Scenario from `--scenario-cwd` (or the caller directory) while holding and renewing the lease. |
+| `requiem migrate-plan-lineage --item <id> --manifest <path>` | Verify a legacy commit manifest against the live ADO Scenario hierarchy; add `--apply` to append durable lineage markers after validation. |
+| `requiem pre-run-cleanup --item <id> --ado-repo <org/project/repo> --repo-path <path>` | Write a read-only stale-run cleanup manifest for canonical `feature/<root>` / `impl/<root>-*` state and the selected checkout's current HEAD. Mutation is launcher-only via fenced `--apply`. |
+| `requiem-launch ... -- <scenario-command>` | Acquire the shared root lease, apply cleanup and verified default-branch rebaselining in `--repo-path`, then run the Scenario from `--scenario-cwd` (or the caller directory) while holding and renewing the lease. |
 
 The `module` argument is any importable Python module exposing
 `build_engine(log_dir) -> Engine` or `build_workflow() -> Workflow`. See
 `src/requiem/workflows/code_review_demo.py` for the canonical shape; the
 workflow itself records its own module path (Wagner builder `.module(...)`)
 so post-hoc commands re-import without an explicit flag.
+
+Plan lineage is stored as a visible, versioned record in each created ADO
+item's description, so ownership survives HTML sanitization and independent
+run-log directories. For a hierarchy created by the legacy hidden-comment
+format, run `migrate-plan-lineage` first without `--apply`; only apply after the
+preview verifies every real id, parent, title, type, unique sibling match, and
+root Scenario.
 
 ### Fenced Scenario launches
 
@@ -215,7 +223,12 @@ requiem pre-run-cleanup --item <root-id> \
 
 The launcher is the only supported mutation path. It acquires the fenced
 `(repo, root-item)` lease, invokes cleanup with `--apply`, and keeps renewing
-the lease through the child process's terminal state:
+the lease through the child process's terminal state. Fenced launching
+currently supports Windows only. Before acquiring the lease, the launcher
+must establish an `ES_CONTINUOUS | ES_SYSTEM_REQUIRED` request; it clears the
+request only after releasing the lease and never requests display wakefulness
+or away mode. Failure to establish the request, or use on an unsupported
+platform, aborts before cleanup:
 
 ```text
 requiem-launch \
@@ -229,16 +242,28 @@ requiem-launch \
 ```
 
 `--repo-path` identifies the checkout whose Requiem-owned refs and local state
-cleanup may mutate. It does not control the Scenario process's working
-directory. `--scenario-cwd` identifies the Twig-initialized workspace the
-Scenario command needs; when omitted, the launcher preserves the directory
+cleanup may mutate. Fenced apply also requires this checkout to be clean and
+leaves it detached at the repository's authoritatively verified default-branch
+commit before the Scenario starts. It does not control the Scenario process's
+working directory. `--scenario-cwd` identifies the Twig-initialized workspace
+the Scenario command needs; when omitted, the launcher preserves the directory
 from which it was invoked.
+
+Automatic system sleep is inhibited while the fenced run is active. Explicit
+lid-close, power-button, or user-initiated sleep still cancels the run: after
+resume, an expired or replaced lease identity remains irreversibly lost and
+must not be revived.
 
 Cleanup abandons matching active PRs, compare-and-deletes remote `impl` refs
 then `feature/<root>`, removes matching local refs, clears existing local run
-state, and records before/after evidence in a durable manifest. It refuses to
-mutate on checked-out candidate branches, observed-state drift, incomplete
-reads, lease loss, or any API/git failure.
+state, and records before/after evidence in a durable manifest. Before any
+destructive mutation, cleanup verifies that the selected `--repo-path` is
+clean, resolves the ADO repository's default branch and SHA, fetches that branch
+into `FETCH_HEAD`, compare-verifies both the source HEAD and fetched target, and
+checks out the verified commit detached. It never resets or cleans the
+worktree, moves non-Requiem refs, or deletes an unowned branch. A dirty selected
+checkout, a candidate checked out in any other worktree, observed-state drift,
+incomplete reads, lease loss, or any API/git failure fails closed.
 
 Exit codes:
 

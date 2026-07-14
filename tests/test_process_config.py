@@ -66,7 +66,7 @@ roles:
   implementer:
     profile: requiem-implementer
     skills: [coder, lsp]
-    model: anthropic/claude-sonnet-4
+    model: anthropic/claude-sonnet-5
   closer:
     profile: requiem-closer
 """,
@@ -77,7 +77,7 @@ roles:
     assert impl == RoleBinding(
         profile="requiem-implementer",
         skills=("coder", "lsp"),
-        model="anthropic/claude-sonnet-4",
+        model="anthropic/claude-sonnet-5",
     )
     closer = cfg.role("closer")
     assert closer.profile == "requiem-closer"
@@ -574,7 +574,7 @@ def test_models_block_loaded_from_yaml(tmp_path):
         "models:\n"
         "  implementer:\n"
         "    provider: copilot\n"
-        "    model: claude-sonnet-4.6\n"
+        "    model: claude-sonnet-5\n"
         "  planner:\n"
         "    provider: anthropic\n"
         "    model: claude-opus-4.7\n"
@@ -591,7 +591,7 @@ def test_models_block_loaded_from_yaml(tmp_path):
     # routes calls.
     impl = resolve_model_for_role("implementer", cfg)
     assert impl.provider == "copilot"
-    assert impl.model == "claude-sonnet-4.6"
+    assert impl.model == "claude-sonnet-5"
     assert impl.max_tokens is None
 
     planner = resolve_model_for_role("planner", cfg)
@@ -641,7 +641,7 @@ def test_models_entry_rejects_non_mapping(tmp_path):
     p.write_text(
         "root_parent_types: [Scenario]\n"
         "models:\n"
-        "  implementer: claude-sonnet-4.6\n",
+        "  implementer: claude-sonnet-5\n",
         encoding="utf-8",
     )
     with pytest.raises(ProcessConfigError, match="implementer.*must be a mapping"):
