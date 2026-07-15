@@ -1084,6 +1084,7 @@ class FakeAdoClient:
             head=head, base=base, url=url,
             raw={
                 "pullRequestId": n, "title": title,
+                "description": body,
                 "sourceRefName": f"refs/heads/{head}",
                 "targetRefName": f"refs/heads/{base}",
                 "_repo": repo,

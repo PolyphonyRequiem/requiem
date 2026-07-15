@@ -56,9 +56,11 @@ Closed ``error_kind`` taxonomy (ADR 0004 §4.2) used by this workflow:
 
 ``plan.not_found``, ``plan.fetch_failed``, ``workspace.dirty``,
 ``branch.create_failed``, ``coder.no_changes``, ``coder.invalid_path``,
-``coder.apply_failed``, ``tests.failed``, ``tests.error``,
-``commit.failed``, ``push.failed``, ``pr.create_failed``,
-``pr.link_failed``.
+``coder.apply_failed``, ``coder.apply_ineffective``, ``coder.ignored_path``,
+``coder.no_effective_changes``, ``tests.failed``, ``tests.error``,
+``tests.tree_changed``,
+``commit.failed``, ``push.failed``, ``push.status_failed``, ``pr.create_failed``,
+``pr.head_mismatch``, ``pr.no_op_proof_missing``, ``pr.link_failed``.
 
 INV-RESTART: every state-mutating step is idempotent against the local
 git state. The kernel's resume protocol (events.jsonl → cursor) handles
@@ -238,13 +240,20 @@ ERROR_KINDS: frozenset[str] = frozenset({
     "coder.no_changes",
     "coder.invalid_path",
     "coder.apply_failed",
+    "coder.apply_ineffective",
+    "coder.ignored_path",
+    "coder.no_effective_changes",
     "tests.failed",
     "tests.error",
     "tests.undetected",
+    "tests.tree_changed",
     "commit.failed",
     "push.failed",
+    "push.status_failed",
     "pr.create_failed",
     "pr.search_failed",
+    "pr.head_mismatch",
+    "pr.no_op_proof_missing",
     "pr.link_failed",
     "toolbelt.missing_client",
 })
@@ -708,6 +717,9 @@ def build_verb_registry(
         if isinstance(fs, PermanentFailure):
             return fs
         try:
+            base_sha = (await fs._git(  # noqa: SLF001 — branch provenance
+                "rev-parse", inputs.base_branch
+            )).strip()
             exists = await fs.git_branch_exists(branch_name)
             current = await fs.git_current_branch()
         except FsGitError as e:
@@ -722,6 +734,7 @@ def build_verb_registry(
                 "branch_name": branch_name,
                 "created": False,
                 "already_on_branch": True,
+                "base_sha": base_sha,
             })
         # An existing branch we are not on means a prior run (or a
         # human) left state behind. We refuse to auto-checkout to
@@ -752,7 +765,11 @@ def build_verb_registry(
                 details={"stderr": e.stderr},
             )
         return Success(
-            value={"branch_name": branch_name, "created": True},
+            value={
+                "branch_name": branch_name,
+                "created": True,
+                "base_sha": base_sha,
+            },
             inspected_artifacts=(f"git:{inputs.repo_path}:branch:{branch_name}",),
         )
 
@@ -916,7 +933,71 @@ def build_verb_registry(
 
     # ---- apply_changes (both first and revision use this) ------------
 
-    def _apply_changes_impl(
+    def _safe_declared_target(rel: Path) -> tuple[Path | None, str | None]:
+        repo_root = inputs.repo_path.resolve()
+        cursor = repo_root
+        for part in rel.parts[:-1]:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                return None, f"parent component {cursor} is a symlink"
+        target = repo_root / rel
+        try:
+            resolved_parent = target.parent.resolve()
+            resolved_parent.relative_to(repo_root)
+        except (OSError, ValueError) as e:
+            return None, (
+                "target parent escapes or cannot be resolved within the "
+                f"repository: {type(e).__name__}: {e}"
+            )
+        return target, None
+
+    def _operation_postcondition_failure(
+        entry: dict[str, Any],
+    ) -> tuple[Path | None, str | None]:
+        rel = _validate_relative_path(entry.get("path", ""))
+        if rel is None:
+            return None, "path is not a safe repository-relative path"
+        target, target_failure = _safe_declared_target(rel)
+        if target is None:
+            return rel, target_failure
+
+        op = entry.get("operation")
+        if op == "delete":
+            if target.exists() or target.is_symlink():
+                return rel, "delete target still exists"
+            return rel, None
+        if op not in ("create", "modify"):
+            return rel, f"unknown operation {op!r}"
+        if target.is_symlink():
+            return rel, "create/modify targets cannot be symlinks"
+        content = entry.get("content")
+        if content is None:
+            return rel, f"operation {op!r} requires content"
+        try:
+            actual = target.read_bytes()
+        except FileNotFoundError:
+            return rel, "target does not exist after write"
+        except OSError as e:
+            return rel, f"could not read target after write: {type(e).__name__}: {e}"
+        if actual != content.encode("utf-8"):
+            return rel, "target content does not match the coder output"
+        return rel, None
+
+    def _latest_coder_changes(ctx) -> tuple[str | None, list[dict[str, Any]]]:
+        for node in ("invoke_coder_revision", "invoke_coder_retry", "invoke_coder"):
+            parsed = ctx.completed.get(node, {}).get("value", {}).get("parsed")
+            if parsed is not None:
+                return node, list(parsed.get("file_changes") or [])
+        return None, []
+
+    def _latest_apply_value(ctx) -> tuple[str | None, dict[str, Any]]:
+        for node in ("apply_changes_revision", "apply_changes"):
+            value = ctx.completed.get(node, {}).get("value")
+            if value is not None:
+                return node, value
+        return None, {}
+
+    async def _apply_changes_impl(
         ctx,
         coder_nodes: tuple[str, ...],
         *,
@@ -954,6 +1035,7 @@ def build_verb_registry(
                 message=f"coder agent returned 0 file_changes ({coder_nodes})",
             )
         applied: list[str] = []
+        already_satisfied: list[str] = []
         for entry in raw_changes:
             rel = _validate_relative_path(entry.get("path", ""))
             if rel is None:
@@ -965,23 +1047,59 @@ def build_verb_registry(
                     ),
                     details={"path": entry.get("path")},
                 )
-            target = (inputs.repo_path / rel).resolve()
-            try:
-                # Belt-and-brace: the resolved path must still live inside
-                # the repo. Catches cleverness like symlinks that point
-                # outside the worktree.
-                target.relative_to(inputs.repo_path.resolve())
-            except ValueError:
+            target, target_failure = _safe_declared_target(rel)
+            if target is None:
                 return PermanentFailure(
                     error_kind="coder.invalid_path",
-                    message=f"path escapes repo root: {entry.get('path')!r}",
-                    details={"path": entry.get("path")},
+                    message=(
+                        f"refusing to apply path {entry.get('path')!r}: "
+                        f"{target_failure}"
+                    ),
+                    details={
+                        "path": entry.get("path"),
+                        "diagnosis": target_failure,
+                    },
+                )
+            try:
+                await fs._git(  # noqa: SLF001 — reject ignored coder targets
+                    "check-ignore",
+                    "-q",
+                    "--",
+                    str(rel),
+                )
+            except FsGitError as e:
+                if e.returncode != 1:
+                    return PermanentFailure(
+                        error_kind="coder.apply_failed",
+                        message=(
+                            f"could not determine whether {rel} is ignored: "
+                            f"{e.stderr.strip() or e}"
+                        ),
+                        details={
+                            "path": str(rel),
+                            "stderr": e.stderr,
+                        },
+                    )
+            else:
+                return PermanentFailure(
+                    error_kind="coder.ignored_path",
+                    message=(
+                        f"refusing coder operation on ignored path {rel}; "
+                        "the change cannot be represented in the Git tree"
+                    ),
+                    details={
+                        "path": str(rel),
+                        "operation": entry.get("operation"),
+                    },
                 )
             op = entry.get("operation")
             content = entry.get("content")
+            _before_rel, before_failure = _operation_postcondition_failure(entry)
+            if before_failure is None:
+                already_satisfied.append(str(rel))
             try:
                 if op == "delete":
-                    if target.exists():
+                    if target.exists() or target.is_symlink():
                         target.unlink()
                 elif op in ("create", "modify"):
                     if content is None:
@@ -997,38 +1115,64 @@ def build_verb_registry(
                         error_kind="coder.apply_failed",
                         message=f"unknown operation {op!r} on {rel}",
                     )
-            except FsClientError as e:
+            except (FsClientError, OSError, NotImplementedError) as e:
                 return PermanentFailure(
                     error_kind="coder.apply_failed",
-                    message=f"writing {rel}: {e}",
-                    details={"path": str(rel)},
+                    message=f"applying {op!r} to {rel}: {e}",
+                    details={
+                        "path": str(rel),
+                        "operation": op,
+                        "error_type": type(e).__name__,
+                    },
+                )
+            _verified_rel, post_failure = _operation_postcondition_failure(entry)
+            if post_failure is not None:
+                return PermanentFailure(
+                    error_kind="coder.apply_ineffective",
+                    message=(
+                        f"coder operation {op!r} on {rel} did not establish "
+                        f"its declared postcondition: {post_failure}"
+                    ),
+                    details={
+                        "path": str(rel),
+                        "operation": op,
+                        "diagnosis": post_failure,
+                    },
                 )
             applied.append(str(rel))
         return Success(
-            value={"applied_paths": applied, "change_count": len(applied)},
+            value={
+                "applied_paths": applied,
+                "change_count": len(applied),
+                "effective_change_count": len(applied) - len(already_satisfied),
+                "already_satisfied_paths": already_satisfied,
+                "postconditions_verified": True,
+            },
             inspected_artifacts=tuple(f"file:{p}" for p in applied),
         )
 
     @verbs.register("apply_changes")
-    def _apply_changes(ctx):
-        return _apply_changes_impl(
+    async def _apply_changes(ctx):
+        return await _apply_changes_impl(
             ctx, ("invoke_coder_retry", "invoke_coder"), dry_run_passthrough=True
         )
 
     @verbs.register("apply_changes_revision")
-    def _apply_changes_revision(ctx):
-        return _apply_changes_impl(
+    async def _apply_changes_revision(ctx):
+        return await _apply_changes_impl(
             ctx, ("invoke_coder_revision",), dry_run_passthrough=False
         )
 
     # ---- run_tests ----------------------------------------------------
 
-    def _run_tests_impl(ctx) -> Outcome:
+    async def _run_tests_impl(ctx) -> Outcome:
         if inputs.dry_run:
             return Success(value={
                 "passed": True,
                 "summary": "(dry-run: tests not executed)",
                 "command": inputs.test_command or "(auto-detect skipped)",
+                "tested_tree_sha": None,
+                "tested_head_sha": None,
             })
         detected = None
         if inputs.test_command is not None:
@@ -1054,10 +1198,27 @@ def build_verb_registry(
                 message=f"test runner crashed: {type(e).__name__}: {e}",
             )
         if result.passed:
+            fs = _require_fs(ctx)
+            if isinstance(fs, PermanentFailure):
+                return fs
+            try:
+                tested_tree_sha = await fs.git_stage_all_and_tree_sha()
+                tested_head_sha = await fs.git_head_sha()
+            except FsGitError as e:
+                return PermanentFailure(
+                    error_kind="tests.error",
+                    message=(
+                        "tests passed, but Requiem could not snapshot the "
+                        f"tested Git tree: {e.stderr.strip() or e}"
+                    ),
+                    details={"stderr": e.stderr},
+                )
             return Success(value={
                 "passed": True,
                 "summary": result.summary,
                 "command": detected.command,
+                "tested_tree_sha": tested_tree_sha,
+                "tested_head_sha": tested_head_sha,
             })
         return PermanentFailure(
             error_kind="tests.failed",
@@ -1070,8 +1231,8 @@ def build_verb_registry(
         )
 
     @verbs.register("run_tests")
-    def _run_tests(ctx):
-        out = _run_tests_impl(ctx)
+    async def _run_tests(ctx):
+        out = await _run_tests_impl(ctx)
         # The router consumes outcome variants; we additionally surface
         # `summary` in the *failure details* so the revision prompt can
         # quote it. The route helper `run_tests` reads `value` for the
@@ -1079,10 +1240,10 @@ def build_verb_registry(
         return out
 
     @verbs.register("run_tests_final")
-    def _run_tests_final(ctx):
+    async def _run_tests_final(ctx):
         # Same logic as run_tests, but lives as a distinct node so the
         # graph is acyclic and the revision branch can't loop.
-        return _run_tests_impl(ctx)
+        return await _run_tests_impl(ctx)
 
     # ---- commit_changes ----------------------------------------------
 
@@ -1099,18 +1260,281 @@ def build_verb_registry(
             return fs
         plan = ctx.completed["fetch_plan"]["value"]
         try:
-            if await fs.git_is_clean():
-                # Idempotent resume: a prior commit already landed.
+            tests_value = (
+                ctx.completed.get("run_tests_final", {}).get("value")
+                or ctx.completed.get("run_tests", {}).get("value")
+                or {}
+            )
+            tested_tree_sha = str(tests_value.get("tested_tree_sha") or "")
+            tested_head_sha = str(tests_value.get("tested_head_sha") or "")
+            if not tested_tree_sha or not tested_head_sha:
+                return PermanentFailure(
+                    error_kind="tests.tree_changed",
+                    message="passing test evidence is missing its Git tree identity",
+                    details={"reason": "tested_tree_unavailable"},
+                )
+            current_tree_sha = await fs.git_stage_all_and_tree_sha()
+            current_head_sha = await fs.git_head_sha()
+            if current_tree_sha != tested_tree_sha:
+                return PermanentFailure(
+                    error_kind="tests.tree_changed",
+                    message="worktree changed after implementation tests passed",
+                    details={
+                        "reason": "tested_tree_changed",
+                        "tested_tree_sha": tested_tree_sha,
+                        "current_tree_sha": current_tree_sha,
+                        "tested_head_sha": tested_head_sha,
+                        "current_head_sha": current_head_sha,
+                    },
+                )
+            staged_output = await fs._git(  # noqa: SLF001 — inspect staged tree
+                "diff", "--cached", "--name-only"
+            )
+            staged_paths = [
+                Path(line) for line in staged_output.splitlines() if line.strip()
+            ]
+            if not staged_paths:
+                coder_node, raw_changes = _latest_coder_changes(ctx)
+                apply_node, apply_value = _latest_apply_value(ctx)
+                postcondition_failures: list[dict[str, str]] = []
+                index_failures: list[dict[str, str]] = []
+                apply_already_satisfied = {
+                    str(path)
+                    for path in apply_value.get("already_satisfied_paths", [])
+                }
+                for entry in raw_changes:
+                    rel, failure = _operation_postcondition_failure(entry)
+                    if failure is not None:
+                        postcondition_failures.append({
+                            "path": str(rel or entry.get("path", "")),
+                            "operation": str(entry.get("operation", "")),
+                            "diagnosis": failure,
+                        })
+                    if (
+                        failure is None
+                        and entry.get("operation") in ("create", "modify")
+                        and rel is not None
+                    ):
+                        try:
+                            await fs._git(  # noqa: SLF001 — index membership proof
+                                "ls-files",
+                                "--error-unmatch",
+                                "--",
+                                str(rel),
+                            )
+                        except FsGitError:
+                            index_failures.append({
+                                "path": str(rel),
+                                "operation": str(entry.get("operation", "")),
+                                "diagnosis": (
+                                    "target is absent from the Git index "
+                                    "(ignored or otherwise untracked)"
+                                ),
+                            })
+                    elif (
+                        failure is None
+                        and entry.get("operation") == "delete"
+                        and rel is not None
+                        and str(rel) not in apply_already_satisfied
+                    ):
+                        index_failures.append({
+                            "path": str(rel),
+                            "operation": "delete",
+                            "diagnosis": (
+                                "delete changed only an ignored or untracked "
+                                "workspace path, not the Git tree"
+                            ),
+                        })
+                branch_files = await fs.git_diff_name_only(inputs.base_branch)
+                proof_complete = (
+                    bool(raw_changes)
+                    and apply_value.get("postconditions_verified") is True
+                    and not postcondition_failures
+                    and not index_failures
+                    and await fs.git_is_clean()
+                )
+                expected_impl_subject = (
+                    f"impl: AB#{plan['item_id']} {plan['title']}"
+                )
+                head_subject = (
+                    await fs._git(  # noqa: SLF001 — provenance probe
+                        "log", "-1", "--format=%s", "HEAD"
+                    )
+                ).strip()
+                context_value = (
+                    ctx.completed.get("commit_context_pack", {}).get("value") or {}
+                )
+                base_sha = str(
+                    ctx.completed.get("create_branch", {})
+                    .get("value", {})
+                    .get("base_sha")
+                    or ""
+                )
+                plan_hash = str(context_value.get("plan_hash") or "")
+                expected_context_subject = (
+                    "chore(context): requiem context pack for leaf "
+                    f"{inputs.item_id} [plan_hash {plan_hash[:12]}]"
+                    if plan_hash
+                    else ""
+                )
+
+                async def _valid_context_commit(sha: str) -> bool:
+                    if not sha or not base_sha or not expected_context_subject:
+                        return False
+                    subject = (
+                        await fs._git(  # noqa: SLF001 — provenance probe
+                            "log", "-1", "--format=%s", sha
+                        )
+                    ).strip()
+                    parent = (
+                        await fs._git(  # noqa: SLF001 — provenance probe
+                            "rev-parse", f"{sha}^"
+                        )
+                    ).strip()
+                    changed_output = await fs._git(  # noqa: SLF001
+                        "diff-tree",
+                        "--no-commit-id",
+                        "--name-only",
+                        "-r",
+                        sha,
+                    )
+                    changed_paths = {
+                        line.replace("\\", "/")
+                        for line in changed_output.splitlines()
+                        if line.strip()
+                    }
+                    expected_paths = {
+                        ".requiem/.plan_hash",
+                        ".requiem/AGENTS.md",
+                        ".requiem/acceptance.md",
+                        ".requiem/rationale.md",
+                    }
+                    return (
+                        subject == expected_context_subject
+                        and parent == base_sha
+                        and changed_paths == expected_paths
+                    )
+
+                if (
+                    current_head_sha == tested_head_sha
+                    and await _valid_context_commit(current_head_sha)
+                ):
+                    provenance = "context_pack_commit"
+                elif head_subject == expected_impl_subject:
+                    impl_parent_sha = (
+                        await fs._git(  # noqa: SLF001 — provenance probe
+                            "rev-parse", f"{current_head_sha}^"
+                        )
+                    ).strip()
+                    impl_parent_valid = (
+                        await _valid_context_commit(impl_parent_sha)
+                        if plan_hash
+                        else impl_parent_sha == base_sha
+                    )
+                    provenance = (
+                        "resumed_implementation_commit"
+                        if impl_parent_valid
+                        else None
+                    )
+                else:
+                    provenance = None
+                if not proof_complete or not branch_files or provenance is None:
+                    reason = (
+                        "the tested coder postconditions do not match the "
+                        "current clean HEAD"
+                        if not proof_complete
+                        else (
+                            "the implementation is already satisfied at the "
+                            "base tree, but no committed branch delta exists "
+                            "to carry a pull request"
+                            if not branch_files
+                            else (
+                                "the current HEAD is neither the verified "
+                                "context-pack commit nor a resumed Requiem "
+                                "implementation commit for this work item"
+                            )
+                        )
+                    )
+                    return PermanentFailure(
+                        error_kind="coder.no_effective_changes",
+                        message=(
+                            "coder output produced no staged Git tree change; "
+                            f"{reason}"
+                        ),
+                        details={
+                            "head_sha": current_head_sha,
+                            "tested_head_sha": tested_head_sha,
+                            "tested_tree_sha": tested_tree_sha,
+                            "head_subject": head_subject,
+                            "coder_node": coder_node,
+                            "apply_node": apply_node,
+                            "coder_paths": [
+                                str(entry.get("path", "")) for entry in raw_changes
+                            ],
+                            "branch_files": [str(p) for p in branch_files],
+                            "postcondition_failures": postcondition_failures,
+                            "index_failures": index_failures,
+                        },
+                    )
+                # The tested operations are all true at the current clean HEAD.
+                # This covers both an idempotent resume and a legitimately
+                # already-satisfied implementation on a context-pack commit.
+                context_no_op = provenance == "context_pack_commit"
                 return Success(value={
-                    "sha": None,
-                    "files_changed": [
-                        str(p) for p in await fs.git_diff_name_only(inputs.base_branch)
-                    ],
+                    "sha": current_head_sha,
+                    "files_changed": [str(p) for p in branch_files],
                     "already_committed": True,
+                    "implementation_already_satisfied": context_no_op,
+                    "resumed_implementation_commit": (
+                        provenance == "resumed_implementation_commit"
+                    ),
+                    "already_satisfied_paths": (
+                        [str(entry.get("path", "")) for entry in raw_changes]
+                        if context_no_op
+                        else []
+                    ),
+                    "no_op_proof": {
+                        "kind": "coder_postconditions_match_clean_head",
+                        "head_sha": current_head_sha,
+                        "tested_head_sha": tested_head_sha,
+                        "tested_tree_sha": tested_tree_sha,
+                        "head_provenance": provenance,
+                        "coder_node": coder_node,
+                        "apply_node": apply_node,
+                    },
                 })
-            await fs._git("add", "-A")  # noqa: SLF001 — staging shortcut
+            if current_head_sha != tested_head_sha:
+                return PermanentFailure(
+                    error_kind="tests.tree_changed",
+                    message="HEAD changed after implementation tests passed",
+                    details={
+                        "reason": "tested_head_changed",
+                        "tested_head_sha": tested_head_sha,
+                        "current_head_sha": current_head_sha,
+                        "tested_tree_sha": tested_tree_sha,
+                    },
+                )
             message = f"impl: AB#{plan['item_id']} {plan['title']}"
             sha = await fs.git_commit(message)
+            committed_tree_sha = (
+                await fs._git(  # noqa: SLF001 — post-hook tree verification
+                    "rev-parse", f"{sha}^{{tree}}"
+                )
+            ).strip()
+            if committed_tree_sha != tested_tree_sha:
+                return PermanentFailure(
+                    error_kind="tests.tree_changed",
+                    message=(
+                        "the committed tree differs from the tree that passed "
+                        "implementation tests"
+                    ),
+                    details={
+                        "reason": "commit_hook_changed_tree",
+                        "commit_sha": sha,
+                        "tested_tree_sha": tested_tree_sha,
+                        "committed_tree_sha": committed_tree_sha,
+                    },
+                )
             changed = await fs.git_diff_name_only(inputs.base_branch)
             numstat = await fs.git_diff_numstat(inputs.base_branch)
         except FsGitError as e:
@@ -1148,17 +1572,33 @@ def build_verb_registry(
                 message=f"git push origin {branch_name} failed: {e.stderr.strip() or e}",
                 details={"stderr": e.stderr},
             )
-        status_posted = await _post_local_tests_status(ctx)
+        status_posted, status_error = await _post_local_tests_status(ctx)
+        commit = ctx.completed.get("commit_changes", {}).get("value", {})
+        if commit.get("already_committed") and not status_posted:
+            return PermanentFailure(
+                error_kind="push.status_failed",
+                message=(
+                    "pushed a reused tested implementation head, but "
+                    "could not publish required requiem/local-tests evidence "
+                    "for that exact SHA; refusing to create or reuse its PR"
+                ),
+                details={
+                    "sha": commit.get("sha"),
+                    "branch": branch_name,
+                    "diagnosis": status_error,
+                },
+            )
         return Success(value={
             "pushed": True,
             "remote": "origin",
             "branch": branch_name,
+            "sha": commit.get("sha"),
             "status_posted": status_posted,
+            "status_error": status_error,
         })
 
-    async def _post_local_tests_status(ctx) -> bool:
-        """Best-effort: post a real commit status reflecting the
-        already-passed ``run_tests`` result (ADR-0032 follow-up).
+    async def _post_local_tests_status(ctx) -> tuple[bool, str | None]:
+        """Post a real status for the exact SHA verified by ``run_tests``.
 
         Leaf PRs land on an ephemeral ``feature/<root>`` trunk with no
         build-validation policy attached, so nothing else ever posts a
@@ -1170,17 +1610,17 @@ def build_verb_registry(
         the only path in), so posting "success" here is honest evidence,
         not an optimistic shortcut — the gate itself stays strict.
 
-        Deliberately swallows all errors: a missing/failed status post
-        just leaves the leaf at "unknown" as before (safe, pre-existing
-        failure mode), it must never fail the push itself.
+        Callers retain the legacy best-effort behavior for newly-created
+        commits. Reused tested heads are stricter: they refuse to create or
+        reuse a PR unless this publication succeeds.
         """
         sha = ctx.completed.get("commit_changes", {}).get("value", {}).get("sha")
         if not sha:
-            return False
+            return False, "commit_changes did not identify the tested HEAD SHA"
         repo_client = ctx.toolbelt.repo or ctx.toolbelt.gh
         poster = getattr(repo_client, "post_commit_status", None)
         if poster is None:
-            return False
+            return False, "repository client does not support commit statuses"
         try:
             await poster(
                 inputs.repo,
@@ -1189,9 +1629,9 @@ def build_verb_registry(
                 state="success",
                 description="requiem: local test run passed before push",
             )
-        except Exception:  # noqa: BLE001 — best-effort, never fail the push
-            return False
-        return True
+        except (GhClientError, AdoClientError) as e:
+            return False, f"{type(e).__name__}: {e}"
+        return True, None
 
     # ---- create_pr ----------------------------------------------------
 
@@ -1216,9 +1656,27 @@ def build_verb_registry(
             "## Plan",
             "",
             plan.get("plan_text", "(empty)"),
-            "",
-            "## Files changed",
         ]
+        if commit.get("implementation_already_satisfied"):
+            body_lines.extend([
+                "",
+                "## Implementation already satisfied",
+                "",
+                (
+                    "Requiem verified every coder-declared postcondition against "
+                    f"the clean tested tree at `{commit.get('sha')}`. Staging "
+                    "produced no implementation delta, so the existing head is "
+                    "the authoritative implementation."
+                ),
+                "",
+                "### Already satisfied paths",
+            ])
+            for p in commit.get("already_satisfied_paths", []):
+                body_lines.append(f"- `{p}`")
+        body_lines.extend([
+            "",
+            "## Branch files changed",
+        ])
         for p in commit.get("files_changed", []):
             body_lines.append(f"- `{p}`")
         body_lines.extend([
@@ -1227,6 +1685,37 @@ def build_verb_registry(
             "workflow (Gluck) takes over from here.",
         ])
         body = "\n".join(body_lines)
+
+        if commit.get("already_committed"):
+            expected_sha = str(commit.get("sha") or "")
+            try:
+                remote_head_sha = await gh.branch_sha(inputs.repo, branch_name)
+            except (GhClientError, AdoClientError) as e:
+                return PermanentFailure(
+                    error_kind="pr.head_mismatch",
+                    message=(
+                        f"could not verify remote head for reused branch "
+                        f"{branch_name}: {e}"
+                    ),
+                    details={
+                        "branch": branch_name,
+                        "expected_sha": expected_sha,
+                        "error": str(e),
+                    },
+                )
+            if remote_head_sha != expected_sha:
+                return PermanentFailure(
+                    error_kind="pr.head_mismatch",
+                    message=(
+                        f"remote branch {branch_name} moved after tests: "
+                        f"expected {expected_sha}, found {remote_head_sha}"
+                    ),
+                    details={
+                        "branch": branch_name,
+                        "expected_sha": expected_sha,
+                        "remote_head_sha": remote_head_sha,
+                    },
+                )
 
         # Idempotency: if a PR already exists on this head branch
         # (we crashed between create_pr and link_pr_to_item on a
@@ -1248,6 +1737,40 @@ def build_verb_registry(
             )
         for pr in existing:
             if pr.head == branch_name:
+                if commit.get("implementation_already_satisfied"):
+                    existing_body = str(
+                        pr.raw.get("body")
+                        or pr.raw.get("description")
+                        or ""
+                    )
+                    required_fragments = [
+                        "## Implementation already satisfied",
+                        f"`{commit.get('sha')}`",
+                        *[
+                            f"- `{p}`"
+                            for p in commit.get("already_satisfied_paths", [])
+                        ],
+                    ]
+                    missing = [
+                        fragment
+                        for fragment in required_fragments
+                        if fragment not in existing_body
+                    ]
+                    if missing:
+                        return PermanentFailure(
+                            error_kind="pr.no_op_proof_missing",
+                            message=(
+                                f"open PR {pr.number} for {branch_name} lacks "
+                                "the authoritative already-satisfied proof for "
+                                f"tested SHA {commit.get('sha')}"
+                            ),
+                            details={
+                                "pr_number": pr.number,
+                                "pr_url": pr.url,
+                                "sha": commit.get("sha"),
+                                "missing_fragments": missing,
+                            },
+                        )
                 return Success(
                     value={
                         "pr_number": pr.number,
@@ -1522,6 +2045,9 @@ def _detail_commit(value: dict) -> str:
     sha = value.get("sha")
     if value.get("dry_run"):
         return "(dry-run)"
+    if value.get("implementation_already_satisfied"):
+        paths = value.get("already_satisfied_paths", [])
+        return f"{(sha or '')[:7]} · already satisfied ({len(paths)} path(s))"
     if value.get("already_committed"):
         return f"already committed ({len(files)} file(s))"
     short = (sha or "")[:7]
@@ -1794,11 +2320,12 @@ class _DemoGhClient:
             head=head,
             base=base,
             url=url,
-            raw={"number": n, "title": title, "url": url},
+            raw={"number": n, "title": title, "url": url, "body": body},
         )
         self.created.append({
             "title": title, "body": body, "head": head, "base": base, "url": url
         })
+        self.existing.append(pr)
         return pr
 
 

@@ -225,3 +225,50 @@ dependent subtree. This is the minimal edge set that preserves the compound
 dependency. It keeps internal parallelism, leaves unrelated subtrees untouched,
 and survives the plan-artifact, commit real-id mapping, fanout event-log, and
 resume boundaries.
+
+## Addendum (2026-07-14): prove no-op implementations before opening a PR
+
+Run 60 exposed an ambiguous implementation outcome after the context pack was
+already committed: the coder declared an edit, `apply_changes` reported it,
+tests passed, but staging produced no Git tree delta. The old idempotency path
+returned `sha=null`, pushed the context-pack head without
+`requiem/local-tests`, and opened a PR that later failed closed as
+`tests_status_unknown`.
+
+The implementation workflow now distinguishes a legitimately already-satisfied
+tree from a lost or ineffective application at two boundaries:
+
+1. `apply_changes` verifies every declared create, modify, or delete
+   postcondition after applying it. A swallowed or ineffective operation fails
+   immediately as `coder.apply_ineffective`.
+2. `commit_changes` stages first. If the staged tree is empty, it re-verifies
+   the coder postconditions against a clean current `HEAD` and requires the
+   exact Git tree identity captured immediately after tests passed. A no-op may
+   reuse only the verified context-pack commit, or a prior Requiem
+   implementation commit for the same item when resuming after a commit/event
+   boundary. Context provenance includes the exact recorded branch baseline,
+   commit parent, commit subject, and the four expected `.requiem/` paths.
+   Create/modify targets must also exist in the Git index, preventing ignored
+   files from masquerading as implementation. Ignored targets are rejected
+   before any mutation, including deletes, so a failed leaf cannot leave
+   invisible cross-leaf workspace state behind. The result carries the concrete
+   SHA, tested tree, provenance, and proven paths. Missing proof, a later
+   tree/head change, foreign commit provenance, or a branch with no committed
+   delta fails before PR creation.
+
+Normal commits are also compared back to the tested tree after `git commit`
+returns, so a pre-commit hook cannot stage untested content and smuggle it into
+the published SHA. Delete verification is symlink-aware and removes the
+declared link itself rather than following or overlooking a dangling target.
+Any symlinked parent component is rejected before file I/O, preventing a
+repository-relative coder path from escaping through a linked directory.
+
+For the proven no-op path, `push_branch` must publish
+`requiem/local-tests=success` on that exact existing SHA before PR creation.
+The same exact-SHA publication and remote-head check applies when resuming a
+real implementation commit after its commit event was lost. Failure to publish
+stops as `push.status_failed`; a context-only PR is never treated as completed
+implementation without the explicit already-satisfied proof recorded in its
+body and event log. Reusing an existing open no-op PR is also fail-closed unless
+the remote branch still points to the tested SHA and the PR body already carries
+the same SHA and path proof.

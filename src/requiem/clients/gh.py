@@ -311,6 +311,7 @@ def _classify(
 _PR_FIELDS: Final[tuple[str, ...]] = (
     "number",
     "title",
+    "body",
     "state",
     "mergedAt",
     "mergeCommit",

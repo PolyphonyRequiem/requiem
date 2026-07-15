@@ -28,8 +28,9 @@ import pytest
 
 from requiem.agent import FakeProvider
 from requiem.clients.fs import FilesystemClient
-from requiem.clients.gh import GhPullRequest
+from requiem.clients.gh import GhClientError, GhPullRequest
 from requiem.clients.twig import TwigItem
+from requiem.context_pack import ContextPack
 from requiem.kernel import Completed, Suspended
 from requiem.outcomes import BadOutput
 from requiem.persistence import replay
@@ -98,8 +99,10 @@ class FakeGh:
     existing_prs: list[GhPullRequest] = field(default_factory=list)
     created_calls: list[dict[str, Any]] = field(default_factory=list)
     posted_statuses: list[dict[str, Any]] = field(default_factory=list)
+    branch_sha_override: str | None = None
     raise_on_search: Exception | None = None
     raise_on_create: Exception | None = None
+    raise_on_status: Exception | None = None
 
     async def pr_search(self, repo: str, query: str, limit: int = 30):
         if self.raise_on_search is not None:
@@ -136,20 +139,30 @@ class FakeGh:
             head=head,
             base=base,
             url=url,
-            raw={"number": n, "title": title, "url": url},
+            raw={"number": n, "title": title, "url": url, "body": body},
         )
         self.created_calls.append({
             "title": title, "body": body, "head": head, "base": base, "url": url
         })
+        self.existing_prs.append(pr)
         return pr
 
     async def post_commit_status(
         self, repo: str, sha: str, *, context: str, state: str, description: str = "",
     ) -> None:
+        if self.raise_on_status is not None:
+            raise self.raise_on_status
         self.posted_statuses.append({
             "repo": repo, "sha": sha, "context": context,
             "state": state, "description": description,
         })
+
+    async def branch_sha(self, repo: str, branch: str) -> str:
+        if self.branch_sha_override is not None:
+            return self.branch_sha_override
+        if self.posted_statuses:
+            return str(self.posted_statuses[-1]["sha"])
+        raise GhClientError(f"no pushed SHA recorded for {repo}:{branch}")
 
 
 def _make_item(item_id: int = 12345, *, title: str = "Refactor outcome dispatch") -> TwigItem:
@@ -207,6 +220,7 @@ def _make_inputs(
     test_command: str | None = "pytest -q",
     dry_run: bool = False,
     root: int | str | None = None,
+    context_pack: Any | None = None,
 ) -> ImplementationInputs:
     return ImplementationInputs(
         item_id=item_id,
@@ -216,6 +230,17 @@ def _make_inputs(
         test_command=test_command,
         dry_run=dry_run,
         root=root,
+        context_pack=context_pack,
+    )
+
+
+def _make_context_pack(item_id: int = 12345) -> ContextPack:
+    return ContextPack(
+        leaf_id=str(item_id),
+        agents_md=f"# Context for leaf {item_id}\n",
+        rationale_md="# Rationale\n",
+        acceptance_md="# Acceptance\n",
+        plan_hash=f"plan-{item_id}",
     )
 
 
@@ -423,6 +448,724 @@ async def test_happy_path_pr_created(repo_path: Path, tmp_path: Path) -> None:
     assert impl_result.pr_number == 42
     assert impl_result.tests_passed is True
     assert impl_result.branch_name == "feature/12345"
+
+
+async def test_already_satisfied_change_posts_status_on_existing_context_head(
+    repo_path: Path, tmp_path: Path,
+) -> None:
+    """A coder edit that exactly matches HEAD is authoritative no-op proof.
+
+    The context pack already gives the leaf branch a commit to push and open as
+    a PR. The passing test result must be bound to that exact existing SHA.
+    """
+    _make_pushable(repo_path)
+
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh(pr_number=43)
+    provider = FakeProvider(scripts={
+        "coder": [{
+            "intent_summary": "keep the already-correct README",
+            "file_changes": [{
+                "path": "README.md",
+                "operation": "modify",
+                "content": "# repo\n",
+            }],
+            "notes": "",
+        }],
+        "coder_revision": [],
+    })
+    engine = _make_engine(
+        repo_path,
+        tmp_path / "logs",
+        provider=provider,
+        twig=twig,
+        gh=gh,
+        test_runner=_passing_runner,
+        inputs=_make_inputs(
+            repo_path,
+            root=9300,
+            context_pack=_make_context_pack(),
+        ),
+    )
+
+    result = await engine.run("already-satisfied")
+    assert isinstance(result, Completed), result
+    assert result.disposition == "completed"
+
+    completed = {
+        e["node_id"]: e["payload"]["outcome"]
+        for e in replay(engine.log_path("already-satisfied"))
+        if e["kind"] == "verb_completed"
+    }
+    context_sha = completed["commit_context_pack"]["value"]["commit_sha"]
+    commit = completed["commit_changes"]["value"]
+    assert commit["sha"] == context_sha
+    assert commit["already_committed"] is True
+    assert commit["implementation_already_satisfied"] is True
+    assert commit["already_satisfied_paths"] == ["README.md"]
+    assert commit["no_op_proof"]["tested_head_sha"] == context_sha
+    assert commit["no_op_proof"]["head_provenance"] == "context_pack_commit"
+
+    assert len(gh.posted_statuses) == 1
+    assert gh.posted_statuses[0]["sha"] == context_sha
+    assert gh.posted_statuses[0]["context"] == "requiem/local-tests"
+    assert gh.posted_statuses[0]["state"] == "success"
+    assert len(gh.created_calls) == 1
+    assert "already satisfied" in gh.created_calls[0]["body"].lower()
+    assert "`README.md`" in gh.created_calls[0]["body"]
+
+
+async def test_already_satisfied_change_requires_status_before_pr(
+    repo_path: Path, tmp_path: Path,
+) -> None:
+    _make_pushable(repo_path)
+
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh(
+        pr_number=44,
+        raise_on_status=GhClientError("status service unavailable"),
+    )
+    provider = FakeProvider(scripts={
+        "coder": [{
+            "intent_summary": "keep the already-correct README",
+            "file_changes": [{
+                "path": "README.md",
+                "operation": "modify",
+                "content": "# repo\n",
+            }],
+            "notes": "",
+        }],
+        "coder_revision": [],
+    })
+    engine = _make_engine(
+        repo_path,
+        tmp_path / "logs",
+        provider=provider,
+        twig=twig,
+        gh=gh,
+        test_runner=_passing_runner,
+        inputs=_make_inputs(
+            repo_path,
+            root=9300,
+            context_pack=_make_context_pack(),
+        ),
+    )
+
+    result = await engine.run("already-satisfied-status-failure")
+    assert isinstance(result, Completed), result
+    assert result.disposition == "needs_human"
+    assert result.final_node == "end_needs_human"
+    assert gh.posted_statuses == []
+    assert gh.created_calls == []
+
+    failures = [
+        e["payload"]["outcome"]
+        for e in replay(engine.log_path("already-satisfied-status-failure"))
+        if e["kind"] == "verb_completed"
+        and e["node_id"] == "push_branch"
+        and e["payload"]["outcome"]["kind"] == "permanent_failure"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["error_kind"] == "push.status_failed"
+
+
+async def test_already_satisfied_change_requires_remote_head_match(
+    repo_path: Path, tmp_path: Path,
+) -> None:
+    _make_pushable(repo_path)
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh(pr_number=45, branch_sha_override="moved-after-push")
+    provider = FakeProvider(scripts={
+        "coder": [{
+            "intent_summary": "keep the already-correct README",
+            "file_changes": [{
+                "path": "README.md",
+                "operation": "modify",
+                "content": "# repo\n",
+            }],
+            "notes": "",
+        }],
+        "coder_revision": [],
+    })
+    engine = _make_engine(
+        repo_path,
+        tmp_path / "logs",
+        provider=provider,
+        twig=twig,
+        gh=gh,
+        test_runner=_passing_runner,
+        inputs=_make_inputs(
+            repo_path,
+            root=9300,
+            context_pack=_make_context_pack(),
+        ),
+    )
+
+    result = await engine.run("already-satisfied-head-moved")
+    assert isinstance(result, Completed), result
+    assert result.disposition == "needs_human"
+    assert len(gh.posted_statuses) == 1
+    assert gh.created_calls == []
+
+    failures = [
+        e["payload"]["outcome"]
+        for e in replay(engine.log_path("already-satisfied-head-moved"))
+        if e["kind"] == "verb_completed"
+        and e["node_id"] == "create_pr"
+        and e["payload"]["outcome"]["kind"] == "permanent_failure"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["error_kind"] == "pr.head_mismatch"
+
+
+async def test_already_satisfied_change_rejects_foreign_head_provenance(
+    repo_path: Path, tmp_path: Path,
+) -> None:
+    _make_pushable(repo_path)
+    _git(repo_path, "checkout", "-q", "-b", "impl/9300-12345")
+    (repo_path / "UNRELATED.md").write_text("foreign commit\n", encoding="utf-8")
+    _git(repo_path, "add", "-A")
+    _git(repo_path, "commit", "-q", "-m", "unrelated human commit")
+
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh(pr_number=45)
+    provider = FakeProvider(scripts={
+        "coder": [{
+            "intent_summary": "keep the already-correct README",
+            "file_changes": [{
+                "path": "README.md",
+                "operation": "modify",
+                "content": "# repo\n",
+            }],
+            "notes": "",
+        }],
+        "coder_revision": [],
+    })
+    engine = _make_engine(
+        repo_path,
+        tmp_path / "logs",
+        provider=provider,
+        twig=twig,
+        gh=gh,
+        test_runner=_passing_runner,
+        inputs=_make_inputs(repo_path, root=9300),
+    )
+
+    result = await engine.run("foreign-no-op-head")
+    assert isinstance(result, Completed), result
+    assert result.disposition == "needs_human"
+    assert gh.posted_statuses == []
+    assert gh.created_calls == []
+
+    failures = [
+        e["payload"]["outcome"]
+        for e in replay(engine.log_path("foreign-no-op-head"))
+        if e["kind"] == "verb_completed"
+        and e["node_id"] == "commit_changes"
+        and e["payload"]["outcome"]["kind"] == "permanent_failure"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["error_kind"] == "coder.no_effective_changes"
+    assert "neither the verified context-pack commit" in failures[0]["message"]
+
+
+async def test_already_satisfied_change_rejects_context_on_wrong_baseline(
+    repo_path: Path, tmp_path: Path,
+) -> None:
+    _make_pushable(repo_path)
+    initial_sha = _git(repo_path, "rev-parse", "HEAD").strip()
+    (repo_path / "ADVANCED.md").write_text("new trunk state\n", encoding="utf-8")
+    _git(repo_path, "add", "-A")
+    _git(repo_path, "commit", "-q", "-m", "advance main")
+    _git(repo_path, "checkout", "-q", "-b", "impl/9300-12345", initial_sha)
+
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh(pr_number=46)
+    provider = FakeProvider(scripts={
+        "coder": [{
+            "intent_summary": "keep the already-correct README",
+            "file_changes": [{
+                "path": "README.md",
+                "operation": "modify",
+                "content": "# repo\n",
+            }],
+            "notes": "",
+        }],
+        "coder_revision": [],
+    })
+    engine = _make_engine(
+        repo_path,
+        tmp_path / "logs",
+        provider=provider,
+        twig=twig,
+        gh=gh,
+        test_runner=_passing_runner,
+        inputs=_make_inputs(
+            repo_path,
+            root=9300,
+            context_pack=_make_context_pack(),
+        ),
+    )
+
+    result = await engine.run("wrong-context-baseline")
+    assert isinstance(result, Completed), result
+    assert result.disposition == "needs_human"
+    assert gh.posted_statuses == []
+    assert gh.created_calls == []
+
+    failures = [
+        e["payload"]["outcome"]
+        for e in replay(engine.log_path("wrong-context-baseline"))
+        if e["kind"] == "verb_completed"
+        and e["node_id"] == "commit_changes"
+        and e["payload"]["outcome"]["kind"] == "permanent_failure"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["error_kind"] == "coder.no_effective_changes"
+
+
+async def test_already_satisfied_change_rejects_ignored_target(
+    repo_path: Path, tmp_path: Path,
+) -> None:
+    _make_pushable(repo_path)
+    (repo_path / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+    _git(repo_path, "add", "-A")
+    _git(repo_path, "commit", "-q", "-m", "ignore generated file")
+
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh(pr_number=47)
+    provider = FakeProvider(scripts={
+        "coder": [{
+            "intent_summary": "create an ignored implementation file",
+            "file_changes": [{
+                "path": "ignored.txt",
+                "operation": "create",
+                "content": "not committed\n",
+            }],
+            "notes": "",
+        }],
+        "coder_revision": [],
+    })
+    engine = _make_engine(
+        repo_path,
+        tmp_path / "logs",
+        provider=provider,
+        twig=twig,
+        gh=gh,
+        test_runner=_passing_runner,
+        inputs=_make_inputs(
+            repo_path,
+            root=9300,
+            context_pack=_make_context_pack(),
+        ),
+    )
+
+    result = await engine.run("ignored-no-op-target")
+    assert isinstance(result, Completed), result
+    assert result.disposition == "needs_human"
+    assert gh.posted_statuses == []
+    assert gh.created_calls == []
+    assert not (repo_path / "ignored.txt").exists()
+
+    failures = [
+        e["payload"]["outcome"]
+        for e in replay(engine.log_path("ignored-no-op-target"))
+        if e["kind"] == "verb_completed"
+        and e["node_id"] == "apply_changes"
+        and e["payload"]["outcome"]["kind"] == "permanent_failure"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["error_kind"] == "coder.ignored_path"
+    assert failures[0]["details"]["path"] == "ignored.txt"
+
+
+async def test_already_satisfied_change_rejects_ignored_delete(
+    repo_path: Path, tmp_path: Path,
+) -> None:
+    _make_pushable(repo_path)
+    (repo_path / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+    _git(repo_path, "add", "-A")
+    _git(repo_path, "commit", "-q", "-m", "ignore generated file")
+    (repo_path / "ignored.txt").write_text("local-only\n", encoding="utf-8")
+
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh(pr_number=48)
+    provider = FakeProvider(scripts={
+        "coder": [{
+            "intent_summary": "delete an ignored local-only file",
+            "file_changes": [{
+                "path": "ignored.txt",
+                "operation": "delete",
+                "content": None,
+            }],
+            "notes": "",
+        }],
+        "coder_revision": [],
+    })
+    engine = _make_engine(
+        repo_path,
+        tmp_path / "logs",
+        provider=provider,
+        twig=twig,
+        gh=gh,
+        test_runner=_passing_runner,
+        inputs=_make_inputs(
+            repo_path,
+            root=9300,
+            context_pack=_make_context_pack(),
+        ),
+    )
+
+    result = await engine.run("ignored-no-op-delete")
+    assert isinstance(result, Completed), result
+    assert result.disposition == "needs_human"
+    assert gh.posted_statuses == []
+    assert gh.created_calls == []
+    assert (repo_path / "ignored.txt").read_text(
+        encoding="utf-8"
+    ) == "local-only\n"
+
+    failures = [
+        e["payload"]["outcome"]
+        for e in replay(engine.log_path("ignored-no-op-delete"))
+        if e["kind"] == "verb_completed"
+        and e["node_id"] == "apply_changes"
+        and e["payload"]["outcome"]["kind"] == "permanent_failure"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["error_kind"] == "coder.ignored_path"
+    assert failures[0]["details"]["operation"] == "delete"
+
+
+async def test_already_satisfied_change_rejects_legacy_pr_without_proof(
+    repo_path: Path, tmp_path: Path,
+) -> None:
+    _make_pushable(repo_path)
+    existing = GhPullRequest(
+        number=17,
+        title="legacy context-only PR",
+        state="OPEN",
+        merged=False,
+        merged_at=None,
+        head="impl/9300-12345",
+        base="main",
+        url="https://github.com/Owner/Repo/pull/17",
+        raw={"body": "Generated by an older Requiem run."},
+    )
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh(pr_number=49, existing_prs=[existing])
+    provider = FakeProvider(scripts={
+        "coder": [{
+            "intent_summary": "keep the already-correct README",
+            "file_changes": [{
+                "path": "README.md",
+                "operation": "modify",
+                "content": "# repo\n",
+            }],
+            "notes": "",
+        }],
+        "coder_revision": [],
+    })
+    engine = _make_engine(
+        repo_path,
+        tmp_path / "logs",
+        provider=provider,
+        twig=twig,
+        gh=gh,
+        test_runner=_passing_runner,
+        inputs=_make_inputs(
+            repo_path,
+            root=9300,
+            context_pack=_make_context_pack(),
+        ),
+    )
+
+    result = await engine.run("legacy-no-op-pr")
+    assert isinstance(result, Completed), result
+    assert result.disposition == "needs_human"
+    assert len(gh.posted_statuses) == 1
+    assert gh.created_calls == []
+
+    failures = [
+        e["payload"]["outcome"]
+        for e in replay(engine.log_path("legacy-no-op-pr"))
+        if e["kind"] == "verb_completed"
+        and e["node_id"] == "create_pr"
+        and e["payload"]["outcome"]["kind"] == "permanent_failure"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["error_kind"] == "pr.no_op_proof_missing"
+
+
+async def test_ineffective_apply_stops_before_push_or_pr(
+    repo_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A swallowed write is not equivalent to an already-satisfied edit."""
+    _make_pushable(repo_path)
+
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh(pr_number=50)
+    provider = FakeProvider(scripts={
+        "coder": [{
+            "intent_summary": "change the README",
+            "file_changes": [{
+                "path": "README.md",
+                "operation": "modify",
+                "content": "# changed\n",
+            }],
+            "notes": "",
+        }],
+        "coder_revision": [],
+    })
+    engine = _make_engine(
+        repo_path,
+        tmp_path / "logs",
+        provider=provider,
+        twig=twig,
+        gh=gh,
+        test_runner=_passing_runner,
+        inputs=_make_inputs(
+            repo_path,
+            root=9300,
+            context_pack=_make_context_pack(),
+        ),
+    )
+    assert engine.toolbelt.fs is not None
+    original_write_text = engine.toolbelt.fs.write_text
+
+    def _drop_readme_write(path: Path, content: str) -> None:
+        if path.name == "README.md":
+            return
+        original_write_text(path, content)
+
+    monkeypatch.setattr(
+        engine.toolbelt.fs,
+        "write_text",
+        _drop_readme_write,
+    )
+
+    result = await engine.run("ineffective-apply")
+    assert isinstance(result, Completed), result
+    assert result.disposition == "needs_human"
+    assert result.final_node == "end_needs_human"
+    assert gh.posted_statuses == []
+    assert gh.created_calls == []
+
+    failures = [
+        e["payload"]["outcome"]
+        for e in replay(engine.log_path("ineffective-apply"))
+        if e["kind"] == "verb_completed"
+        and e["node_id"] == "apply_changes"
+        and e["payload"]["outcome"]["kind"] == "permanent_failure"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["error_kind"] == "coder.apply_ineffective"
+    assert failures[0]["details"]["path"] == "README.md"
+
+
+async def test_worktree_change_after_tests_stops_before_commit(
+    repo_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _make_pushable(repo_path)
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh(pr_number=47)
+    provider = FakeProvider(scripts={
+        "coder": [_coder_creates("MARKER.md")],
+        "coder_revision": [],
+    })
+    engine = _make_engine(
+        repo_path,
+        tmp_path / "logs",
+        provider=provider,
+        twig=twig,
+        gh=gh,
+        test_runner=_passing_runner,
+    )
+    assert engine.toolbelt.fs is not None
+    original_snapshot = engine.toolbelt.fs.git_stage_all_and_tree_sha
+    calls = 0
+
+    async def _snapshot_then_tamper() -> str:
+        nonlocal calls
+        tree_sha = await original_snapshot()
+        calls += 1
+        if calls == 1:
+            (repo_path / "MARKER.md").write_text("tampered\n", encoding="utf-8")
+        return tree_sha
+
+    monkeypatch.setattr(
+        engine.toolbelt.fs,
+        "git_stage_all_and_tree_sha",
+        _snapshot_then_tamper,
+    )
+
+    result = await engine.run("tree-changed-after-tests")
+    assert isinstance(result, Completed), result
+    assert result.disposition == "needs_human"
+    assert gh.posted_statuses == []
+    assert gh.created_calls == []
+
+    failures = [
+        e["payload"]["outcome"]
+        for e in replay(engine.log_path("tree-changed-after-tests"))
+        if e["kind"] == "verb_completed"
+        and e["node_id"] == "commit_changes"
+        and e["payload"]["outcome"]["kind"] == "permanent_failure"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["error_kind"] == "tests.tree_changed"
+
+
+async def test_pre_commit_hook_cannot_publish_untested_tree(
+    repo_path: Path, tmp_path: Path,
+) -> None:
+    _make_pushable(repo_path)
+    hooks = repo_path / ".git" / "hooks"
+    pre_commit = hooks / "pre-commit"
+    pre_commit.write_text(
+        "#!/bin/sh\n"
+        "printf 'hook mutation\\n' > HOOKED.md\n"
+        "git add HOOKED.md\n",
+        encoding="utf-8",
+    )
+    pre_commit.chmod(0o755)
+
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh(pr_number=51)
+    provider = FakeProvider(scripts={
+        "coder": [_coder_creates("MARKER.md")],
+        "coder_revision": [],
+    })
+    engine = _make_engine(
+        repo_path,
+        tmp_path / "logs",
+        provider=provider,
+        twig=twig,
+        gh=gh,
+        test_runner=_passing_runner,
+    )
+
+    result = await engine.run("pre-commit-tree-mutation")
+    assert isinstance(result, Completed), result
+    assert result.disposition == "needs_human"
+    assert gh.posted_statuses == []
+    assert gh.created_calls == []
+
+    failures = [
+        e["payload"]["outcome"]
+        for e in replay(engine.log_path("pre-commit-tree-mutation"))
+        if e["kind"] == "verb_completed"
+        and e["node_id"] == "commit_changes"
+        and e["payload"]["outcome"]["kind"] == "permanent_failure"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["error_kind"] == "tests.tree_changed"
+    assert failures[0]["details"]["reason"] == "commit_hook_changed_tree"
+
+
+async def test_dangling_symlink_delete_is_committed_not_proven_as_no_op(
+    repo_path: Path, tmp_path: Path,
+) -> None:
+    link = repo_path / "dangling-link"
+    try:
+        link.symlink_to(repo_path / "missing-target")
+    except OSError as e:
+        pytest.skip(f"symlink creation unavailable: {e}")
+    _git(repo_path, "add", "-A")
+    _git(repo_path, "commit", "-q", "-m", "add dangling symlink")
+    _make_pushable(repo_path)
+
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh(pr_number=52)
+    provider = FakeProvider(scripts={
+        "coder": [{
+            "intent_summary": "delete the dangling tracked symlink",
+            "file_changes": [{
+                "path": "dangling-link",
+                "operation": "delete",
+                "content": None,
+            }],
+            "notes": "",
+        }],
+        "coder_revision": [],
+    })
+    engine = _make_engine(
+        repo_path,
+        tmp_path / "logs",
+        provider=provider,
+        twig=twig,
+        gh=gh,
+        test_runner=_passing_runner,
+    )
+
+    result = await engine.run("delete-dangling-symlink")
+    assert isinstance(result, Completed), result
+    assert result.disposition == "completed"
+    assert not link.is_symlink()
+    assert len(gh.created_calls) == 1
+
+    completed = {
+        e["node_id"]: e["payload"]["outcome"]
+        for e in replay(engine.log_path("delete-dangling-symlink"))
+        if e["kind"] == "verb_completed"
+    }
+    commit = completed["commit_changes"]["value"]
+    assert commit.get("implementation_already_satisfied") is not True
+    assert "dangling-link" in commit["files_changed"]
+
+
+async def test_symlinked_parent_cannot_escape_repository(
+    repo_path: Path, tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "victim.txt"
+    victim.write_text("must survive\n", encoding="utf-8")
+    linked_dir = repo_path / "linked-dir"
+    try:
+        linked_dir.symlink_to(outside, target_is_directory=True)
+    except OSError as e:
+        pytest.skip(f"directory symlink creation unavailable: {e}")
+
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh(pr_number=53)
+    provider = FakeProvider(scripts={
+        "coder": [{
+            "intent_summary": "delete through a symlinked parent",
+            "file_changes": [{
+                "path": "linked-dir/victim.txt",
+                "operation": "delete",
+                "content": None,
+            }],
+            "notes": "",
+        }],
+        "coder_revision": [],
+    })
+    engine = _make_engine(
+        repo_path,
+        tmp_path / "logs",
+        provider=provider,
+        twig=twig,
+        gh=gh,
+        test_runner=_passing_runner,
+    )
+
+    result = await engine.run("symlink-parent-escape")
+    assert isinstance(result, Completed), result
+    assert result.disposition == "needs_human"
+    assert victim.read_text(encoding="utf-8") == "must survive\n"
+    assert gh.posted_statuses == []
+    assert gh.created_calls == []
+
+    failures = [
+        e["payload"]["outcome"]
+        for e in replay(engine.log_path("symlink-parent-escape"))
+        if e["kind"] == "verb_completed"
+        and e["node_id"] == "apply_changes"
+        and e["payload"]["outcome"]["kind"] == "permanent_failure"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["error_kind"] == "coder.invalid_path"
 
 
 # ---- B3: merge-group topology branch (ADR-0006 / ADR-0020) ----
@@ -1007,6 +1750,68 @@ async def test_inv_restart_resumes_without_duplicate_pr(
     assert gh2.created_calls == [], "create_pr re-invoked on resume!"
     assert provider2.calls == [], "coder agent re-invoked on resume!"
     assert len(twig2.comments) == 1, twig2.comments
+
+
+async def test_inv_restart_after_commit_event_loss_reuses_implementation_commit(
+    repo_path: Path, tmp_path: Path,
+) -> None:
+    _make_pushable(repo_path)
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh(pr_number=89)
+    provider = FakeProvider(scripts={
+        "coder": [_coder_creates("COMMITTED.md")],
+        "coder_revision": [],
+    })
+    log_dir = tmp_path / "logs"
+    engine = _make_engine(
+        repo_path,
+        log_dir,
+        provider=provider,
+        twig=twig,
+        gh=gh,
+        test_runner=_passing_runner,
+    )
+
+    first = await engine.run("commit-event-loss")
+    assert isinstance(first, Completed)
+    assert len(gh.created_calls) == 1
+
+    log_path = engine.log_path("commit-event-loss")
+    keep: list[str] = []
+    for raw in log_path.read_text(encoding="utf-8").splitlines():
+        keep.append(raw)
+        event = json.loads(raw)
+        if (
+            event["kind"] == "verb_completed"
+            and event.get("node_id") == "run_tests"
+        ):
+            break
+    log_path.write_text("\n".join(keep) + "\n", encoding="utf-8")
+
+    provider2 = FakeProvider(scripts={"coder": [], "coder_revision": []})
+    engine2 = _make_engine(
+        repo_path,
+        log_dir,
+        provider=provider2,
+        twig=twig,
+        gh=gh,
+        test_runner=_passing_runner,
+    )
+    second = await engine2.run("commit-event-loss")
+    assert isinstance(second, Completed)
+    assert second.disposition == "completed"
+    assert provider2.calls == []
+    assert len(gh.created_calls) == 1
+
+    completed = {
+        e["node_id"]: e["payload"]["outcome"]
+        for e in replay(log_path)
+        if e["kind"] == "verb_completed"
+    }
+    commit = completed["commit_changes"]["value"]
+    assert commit["already_committed"] is True
+    assert commit["resumed_implementation_commit"] is True
+    assert commit["implementation_already_satisfied"] is False
 
 
 # ---- error_kind taxonomy is closed ----
