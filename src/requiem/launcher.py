@@ -183,7 +183,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-dir", type=Path, default=Path(".runs"))
     parser.add_argument("--manifest", type=Path, default=None)
     parser.add_argument("--limit", type=int, default=1000)
-    parser.add_argument("--lease-ttl", type=float, default=30.0)
+    parser.add_argument("--lease-ttl", type=float, default=120.0)
     parser.add_argument("--lease-heartbeat", type=float, default=10.0)
     parser.add_argument("--lease-timeout", type=float, default=0.0)
     parser.add_argument("command", nargs=argparse.REMAINDER)

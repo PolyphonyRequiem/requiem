@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
-from requiem.launcher import build_cleanup_command, run_launcher
+from requiem.launcher import _build_parser, build_cleanup_command, run_launcher
 from requiem.lease import LeaseIdentity
 from requiem.sleep_inhibition import SleepInhibitionError
 
@@ -30,6 +30,25 @@ def _args(tmp_path: Path, command: list[str]) -> argparse.Namespace:
         lease_timeout=0.0,
         command=command,
     )
+
+
+def test_default_lease_ttl_tolerates_routine_package_extraction_stall() -> None:
+    args = _build_parser().parse_args([
+        "--item",
+        "42",
+        "--ado-repo",
+        "microsoft/CloudVault/cloudvault-service-api",
+        "--repo-path",
+        ".",
+        "--lease-dir",
+        ".leases",
+        "--",
+        "python",
+        "run.py",
+    ])
+
+    observed_package_extraction_seconds = 30.508
+    assert args.lease_ttl >= observed_package_extraction_seconds * 3
 
 
 class FakeLease:

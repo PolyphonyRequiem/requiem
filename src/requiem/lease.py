@@ -194,7 +194,7 @@ class FencedRootLease:
         lease_dir: Path,
         repo: str,
         root_item: int,
-        ttl_seconds: float = 30.0,
+        ttl_seconds: float = 120.0,
         heartbeat_seconds: float = 10.0,
         acquire_timeout_seconds: float = 0.0,
         holder: str | None = None,
