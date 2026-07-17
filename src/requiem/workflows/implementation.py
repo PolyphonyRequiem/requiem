@@ -113,6 +113,7 @@ from requiem.outcomes import (
     PermanentFailure,
     Success,
 )
+from requiem.plan_lineage import item_description
 from requiem.toolbelt import (
     FakeFileClient,
     RealFileClient,
@@ -576,7 +577,7 @@ def build_verb_registry(
         # The plan content is, in order of preference, an inline
         # description on the item, the literal title, or "(empty plan)".
         plan_text = (
-            item.raw.get("description")
+            item_description(item)
             or item.raw.get("plan")
             or item.title
             or "(empty plan)"

@@ -450,6 +450,44 @@ async def test_happy_path_pr_created(repo_path: Path, tmp_path: Path) -> None:
     assert impl_result.branch_name == "feature/12345"
 
 
+async def test_fetch_plan_reads_current_twig_system_description(
+    repo_path: Path,
+    tmp_path: Path,
+) -> None:
+    _make_pushable(repo_path)
+    item = _make_item()
+    item.raw.pop("description")
+    item.raw["fields"] = {
+        "System.Description": (
+            "<p>Implement the probe inside the Accepted ACI mechanism.</p>"
+        )
+    }
+    provider = FakeProvider(scripts={
+        "coder": [_coder_creates("MARKER.md")],
+        "coder_revision": [],
+    })
+    engine = _make_engine(
+        repo_path,
+        tmp_path / "logs",
+        provider=provider,
+        twig=FakeTwig(item=item),
+        gh=FakeGh(),
+        test_runner=_passing_runner,
+    )
+
+    await engine.run("system_description")
+
+    completed = {
+        event["node_id"]: event["payload"]["outcome"]
+        for event in replay(engine.log_path("system_description"))
+        if event["kind"] == "verb_completed"
+    }
+    assert (
+        completed["fetch_plan"]["value"]["plan_text"]
+        == "<p>Implement the probe inside the Accepted ACI mechanism.</p>"
+    )
+
+
 async def test_already_satisfied_change_posts_status_on_existing_context_head(
     repo_path: Path, tmp_path: Path,
 ) -> None:
