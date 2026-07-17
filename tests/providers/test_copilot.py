@@ -226,6 +226,18 @@ async def test_success_path_parses_json_into_schema():
     assert fake.deleted_sessions == fake.created_sessions
 
 
+def test_default_client_prefers_installed_copilot_cli(monkeypatch):
+    cli_path = r"C:\tools\copilot.exe"
+    monkeypatch.setattr("requiem.providers.copilot.shutil.which", lambda name: (
+        cli_path if name == "copilot" else None
+    ))
+
+    provider = CopilotProvider()
+
+    assert provider.client._connection.path == cli_path
+    assert provider.client._cli_path_source == "explicit"
+
+
 async def test_success_passes_through_per_call_model_override():
     """An AgentSpec with a real model name should override the provider default."""
     fake = _FakeCopilotClient(

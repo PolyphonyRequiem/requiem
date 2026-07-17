@@ -53,6 +53,7 @@ import asyncio
 import contextlib
 import json
 import os
+import shutil
 import time
 from dataclasses import dataclass, field
 from typing import Any, Final, Mapping
@@ -320,7 +321,7 @@ class CopilotProvider:
             # actually constructed. Keeps Anthropic-only / OpenAI-only
             # users from being forced to install the SDK.
             try:
-                from copilot import CopilotClient
+                from copilot import CopilotClient, RuntimeConnection
             except ImportError as e:
                 raise RuntimeError(
                     "CopilotProvider: the `github-copilot-sdk` package is "
@@ -337,7 +338,13 @@ class CopilotProvider:
                     "GitHub OAuth token (gho_* from `gh auth login` works), "
                     "OR run `copilot login` interactively on the host."
                 )
-            self.client = CopilotClient()
+            cli_path = shutil.which("copilot")
+            if cli_path:
+                self.client = CopilotClient(
+                    connection=RuntimeConnection.for_stdio(path=cli_path),
+                )
+            else:
+                self.client = CopilotClient()
 
     def _resolve_max_cumulative_input_tokens(
         self,
