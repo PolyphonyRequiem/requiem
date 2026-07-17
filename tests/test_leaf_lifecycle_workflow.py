@@ -236,6 +236,39 @@ async def test_review_prompt_binds_verdict_to_leaf_plan_contract(
     assert ".requiem/rationale.md" not in prompt.split("Merge-bound diff:", 1)[1]
 
 
+async def test_moderate_review_diff_is_supplied_completely(
+    log_dir: Path,
+    repo_path: Path,
+):
+    tk = _toolkit()
+    final_marker = "END-OF-MODERATE-DIFF"
+    tk.review_diff_text = (
+        "diff --git a/probe.cs b/probe.cs\n"
+        "--- a/probe.cs\n"
+        "+++ b/probe.cs\n"
+        "@@ -0,0 +1 @@\n"
+        f"+{'x' * 40_000}{final_marker}\n"
+    )
+    provider = _provider()
+    engine = _engine(
+        log_dir,
+        toolkit=tk,
+        provider=provider,
+        repo_path=repo_path,
+    )
+
+    await engine.run("moderate_complete_review")
+
+    completed = _completed_map(log_dir / "moderate_complete_review.events.jsonl")
+    review = completed["prepare_review"]["value"]
+    assert review["review_diff_chars"] > 30_000
+    assert review["diff_complete"] is True
+    assert review["diff"].endswith(final_marker)
+    prompt = provider.calls[0]["user_message"]
+    assert "Merge-bound diff (complete=True)" in prompt
+    assert final_marker in prompt
+
+
 async def test_token_exhaustion_gets_one_tool_free_compacted_review(
     log_dir: Path, repo_path: Path
 ):
