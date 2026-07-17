@@ -39,9 +39,11 @@ from dataclasses import dataclass, field, replace as _dc_replace
 from pathlib import Path
 from typing import Any, Callable, Literal
 
+from requiem.clients.twig import TwigClientError
 from requiem.dsl import AgentRegistry, VerbRegistry, Workflow, WorkflowBuilder
 from requiem.kernel import Completed, Engine, Failed, Suspended
 from requiem.outcomes import PermanentFailure, Success
+from requiem.plan_lineage import item_description
 from requiem.plan_tree import PlanArtifactError, load_committed_leaves
 from requiem.toolbelt import Toolbelt
 from requiem.workflows import implementation as impl_mod
@@ -397,6 +399,24 @@ def build_verb_registry(inputs: FanoutInputs) -> VerbRegistry:
                     )
             repo_path = worktree
 
+        context_leaf = leaf
+        if toolbelt.twig is not None:
+            try:
+                item = await toolbelt.twig.show_async(leaf.real_id)
+            except TwigClientError as error:
+                return LeafOutcome(
+                    real_id=leaf.real_id,
+                    disposition="needs_human",
+                    final_node=f"authoritative_plan_fetch_failed:{error}",
+                    child_run_id=run_id,
+                )
+            authoritative_body = item_description(item)
+            context_leaf = _dc_replace(
+                leaf,
+                title=item.title or leaf.title,
+                body=authoritative_body or leaf.body,
+            )
+
         child_inputs = impl_mod.ImplementationInputs(
             item_id=leaf.real_id,
             repo=inputs.repo,
@@ -404,7 +424,7 @@ def build_verb_registry(inputs: FanoutInputs) -> VerbRegistry:
             base_branch=inputs.base_branch,
             dry_run=inputs.dry_run,
             root=inputs.root_item_id,   # ADR-0006 (B3): impl/<root>-<leaf>
-            context_pack=_build_leaf_context_pack(leaf, inputs),
+            context_pack=_build_leaf_context_pack(context_leaf, inputs),
             # ADR-0030 §2: thread the operator's ProcessConfig into
             # every per-leaf implementation engine so the coder agent's
             # role="implementer" tag actually picks up the

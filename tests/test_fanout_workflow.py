@@ -238,6 +238,8 @@ async def test_live_twig_description_overrides_shortened_plan_body(
     repo: Path,
     tmp_path: Path,
 ):
+    _make_pushable(repo)
+
     class AuthoritativeTwig:
         async def show_async(self, item_id: int) -> TwigItem:
             return TwigItem(
@@ -273,6 +275,7 @@ async def test_live_twig_description_overrides_shortened_plan_body(
         ],
         provider=_happy_provider(),
         twig=AuthoritativeTwig(),
+        dry_run=False,
     )
 
     await engine.run("authoritative-description")
@@ -283,6 +286,10 @@ async def test_live_twig_description_overrides_shortened_plan_body(
     assert (
         child["fetch_plan"]["value"]["plan_text"]
         == "Implement the dedicated run-once ACI deployment surface."
+    )
+    assert (
+        "Implement the dedicated run-once ACI deployment surface."
+        in (repo / ".requiem" / "rationale.md").read_text(encoding="utf-8")
     )
 
 
