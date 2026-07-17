@@ -50,6 +50,82 @@ def test_lease_is_exclusive_and_tokens_increase(tmp_path: Path) -> None:
         assert third.identity.token == identity.token + 1
 
 
+def test_external_validation_retries_transient_permission_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease = _lease(tmp_path, holder="owner")
+    lease.acquire()
+    identity = lease.identity
+    original_read_text = Path.read_text
+    attempts = 0
+
+    def transient_permission_error(
+        path: Path,
+        encoding: str | None = None,
+        errors: str | None = None,
+    ) -> str:
+        nonlocal attempts
+        if path == identity.record_path:
+            attempts += 1
+            if attempts < 3:
+                raise PermissionError(13, "Permission denied", str(path))
+        return original_read_text(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", transient_permission_error)
+    try:
+        validate_lease_record(
+            identity.record_path,
+            token=identity.token,
+            holder=identity.holder,
+            repo=identity.repo,
+            root_item=identity.root_item,
+        )
+    finally:
+        monkeypatch.setattr(Path, "read_text", original_read_text)
+        lease.release()
+
+    assert attempts == 3
+
+
+def test_external_validation_fails_after_persistent_permission_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease = _lease(tmp_path, holder="owner")
+    lease.acquire()
+    identity = lease.identity
+    original_read_text = Path.read_text
+    attempts = 0
+
+    def persistent_permission_error(
+        path: Path,
+        encoding: str | None = None,
+        errors: str | None = None,
+    ) -> str:
+        nonlocal attempts
+        if path == identity.record_path:
+            attempts += 1
+            raise PermissionError(13, "Permission denied", str(path))
+        return original_read_text(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", persistent_permission_error)
+    try:
+        with pytest.raises(LeaseLostError, match="lease record is unreadable"):
+            validate_lease_record(
+                identity.record_path,
+                token=identity.token,
+                holder=identity.holder,
+                repo=identity.repo,
+                root_item=identity.root_item,
+            )
+    finally:
+        monkeypatch.setattr(Path, "read_text", original_read_text)
+        lease.release()
+
+    assert attempts == 3
+
+
 def test_lease_detects_fencing_record_tampering(tmp_path: Path) -> None:
     lease = _lease(tmp_path, holder="owner", heartbeat_seconds=0.05)
     lease.acquire()

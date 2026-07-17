@@ -25,6 +25,10 @@ class LeaseLostError(LeaseError):
     """The current holder can no longer prove ownership of its token."""
 
 
+_EXTERNAL_VALIDATION_READ_ATTEMPTS = 3
+_EXTERNAL_VALIDATION_RETRY_SECONDS = 0.01
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -51,6 +55,18 @@ def _read_record(path: Path) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise LeaseLostError(f"lease record must contain a JSON object: {path}")
     return payload
+
+
+def _read_record_for_external_validation(path: Path) -> dict[str, object]:
+    for attempt in range(_EXTERNAL_VALIDATION_READ_ATTEMPTS):
+        try:
+            return _read_record(path)
+        except LeaseLostError as error:
+            transient = isinstance(error.__cause__, PermissionError)
+            if not transient or attempt == _EXTERNAL_VALIDATION_READ_ATTEMPTS - 1:
+                raise
+            time.sleep(_EXTERNAL_VALIDATION_RETRY_SECONDS)
+    raise AssertionError("external lease validation retry loop did not terminate")
 
 
 def _write_record(
@@ -85,7 +101,7 @@ def validate_lease_record(
     root_item: int | None = None,
 ) -> None:
     """Fail unless ``path`` proves the supplied active fencing identity."""
-    payload = _read_record(Path(path))
+    payload = _read_record_for_external_validation(Path(path))
     _validate_record_payload(
         payload,
         token=token,
