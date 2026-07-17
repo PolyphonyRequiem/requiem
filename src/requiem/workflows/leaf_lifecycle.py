@@ -122,6 +122,7 @@ TEST_STATUS_RETRY_MAX = 2
 TEST_STATUS_RETRY_DELAY_S = 1.0
 MAX_REVIEW_DIFF_CHARS = 30_000
 MAX_COMPACTED_REVIEW_DIFF_CHARS = 20_000
+MAX_REVIEW_CONTRACT_CHARS = 12_000
 
 COMPACTED_LEAF_REVIEWER = AgentSpec(
     name="compacted_leaf_reviewer",
@@ -483,6 +484,24 @@ def _without_context_pack_diff(diff: str) -> tuple[str, list[str]]:
         kept.append(section)
 
     return "".join(kept).strip(), omitted
+
+
+def _review_contract_diff(diff: str) -> str:
+    """Retain the leaf plan contract while excluding other internal context."""
+    contract_paths = {
+        f"{CONTEXT_PACK_DIR}/acceptance.md",
+        f"{CONTEXT_PACK_DIR}/rationale.md",
+    }
+    sections = re.split(r"(?m)(?=^diff --git )", diff)
+    contract: list[str] = []
+    for section in sections:
+        if not section.startswith("diff --git "):
+            continue
+        header = section.partition("\n")[0]
+        path = header.partition(" b/")[2]
+        if path in contract_paths:
+            contract.append(section)
+    return "".join(contract).strip()
 
 
 def _merge_sha_from_pr(pr: RepoPullRequest) -> str | None:
@@ -1007,6 +1026,7 @@ def build_verb_registry(
                 operation="prepare_review",
             )
         review_diff, omitted_context_files = _without_context_pack_diff(raw_diff)
+        review_contract = _review_contract_diff(raw_diff)
         if not review_diff:
             review_diff = "(no merge-bound diff after excluding Requiem context pack)"
         return Success(
@@ -1019,6 +1039,10 @@ def build_verb_registry(
                 "review_diff_chars": len(review_diff),
                 "raw_diff_chars": len(raw_diff),
                 "omitted_context_pack_files": omitted_context_files,
+                "review_contract": review_contract[:MAX_REVIEW_CONTRACT_CHARS],
+                "review_contract_complete": (
+                    len(review_contract) <= MAX_REVIEW_CONTRACT_CHARS
+                ),
             }
         )
 
@@ -1031,12 +1055,18 @@ def build_verb_registry(
             f"Head: {prep['head']} @ {prep['head_sha']}\n"
             f"Base: {prep['base']}\n\n"
             "Return `approve` only when the diff is safe to squash-merge into the "
-            "feature trunk as-is. Return `request_changes` for concrete code fixes "
-            "Requiem can implement automatically. Return `needs_human` for any "
-            "ambiguous or unsafe case.\n\n"
+            "feature trunk as-is **and fully satisfies the leaf plan contract**. "
+            "Reject or escalate changes that omit required scope, contradict the "
+            "plan, or acknowledge that required work was left undone. Return "
+            "`request_changes` for concrete code fixes Requiem can implement "
+            "automatically. Return `needs_human` for any ambiguous or unsafe case, "
+            "including a missing or incomplete plan contract.\n\n"
+            "Leaf plan contract "
+            f"(complete={prep['review_contract_complete']}):\n"
+            f"{prep['review_contract'] or '(missing)'}\n\n"
             "Requiem-internal context files omitted: "
             f"{len(prep['omitted_context_pack_files'])}\n\n"
-            f"Diff:\n{prep['diff']}"
+            f"Merge-bound diff:\n{prep['diff']}"
         )
 
     @verbs.register("recover_review_token_exhaustion")
@@ -1077,6 +1107,10 @@ def build_verb_registry(
                 "omitted_context_pack_files": prep.get(
                     "omitted_context_pack_files", []
                 ),
+                "review_contract": prep.get("review_contract", ""),
+                "review_contract_complete": prep.get(
+                    "review_contract_complete", False
+                ),
                 "trigger": evidence,
             }
         )
@@ -1093,9 +1127,16 @@ def build_verb_registry(
             "the workflow removes it before merge. Do not call tools or seek "
             "additional repository context. If the supplied diff is genuinely "
             "insufficient to decide safely, return `needs_human`.\n\n"
+            "Approve only if the merge-bound diff fully satisfies the leaf plan "
+            "contract. Reject or escalate changes that omit required scope, "
+            "contradict the plan, or leave required work undone. A missing or "
+            "incomplete contract requires `needs_human`.\n\n"
+            "Leaf plan contract "
+            f"(complete={recovery['review_contract_complete']}):\n"
+            f"{recovery['review_contract'] or '(missing)'}\n\n"
             f"Previous failure evidence:\n"
             f"{json.dumps(recovery['trigger'], indent=2, sort_keys=True)}\n\n"
-            f"Diff:\n{recovery['diff']}"
+            f"Merge-bound diff:\n{recovery['diff']}"
         )
 
     @verbs.register("verify_compacted_review")

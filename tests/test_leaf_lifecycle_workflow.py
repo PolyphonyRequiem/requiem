@@ -196,6 +196,43 @@ async def test_happy_path_approves_and_merges(log_dir: Path, repo_path: Path):
     assert tk.complete_calls[0]["expected_head_sha"] == "push-sha-1"
 
 
+async def test_review_prompt_binds_verdict_to_leaf_plan_contract(
+    log_dir: Path,
+    repo_path: Path,
+):
+    tk = _toolkit()
+    tk.review_diff_text = (
+        "diff --git a/.requiem/rationale.md b/.requiem/rationale.md\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/.requiem/rationale.md\n"
+        "@@ -0,0 +1,3 @@\n"
+        "+# Rationale dump\n"
+        "+\n"
+        "+Implement the probe via the Accepted ACI mechanism.\n"
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+    provider = _provider()
+    engine = _engine(
+        log_dir,
+        toolkit=tk,
+        provider=provider,
+        repo_path=repo_path,
+    )
+
+    await engine.run("plan_contract_review")
+
+    prompt = provider.calls[0]["user_message"]
+    assert "Implement the probe via the Accepted ACI mechanism." in prompt
+    assert "Reject or escalate changes that omit required scope" in prompt
+    assert ".requiem/rationale.md" not in prompt.split("Merge-bound diff:", 1)[1]
+
+
 async def test_token_exhaustion_gets_one_tool_free_compacted_review(
     log_dir: Path, repo_path: Path
 ):
@@ -207,6 +244,12 @@ async def test_token_exhaustion_gets_one_tool_free_compacted_review(
         "+++ b/.requiem/AGENTS.md\n"
         "@@ -0,0 +1 @@\n"
         "+internal context\n"
+        "diff --git a/.requiem/rationale.md b/.requiem/rationale.md\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/.requiem/rationale.md\n"
+        "@@ -0,0 +1 @@\n"
+        "+Preserve the required deployment contract.\n"
         "diff --git a/app.py b/app.py\n"
         "--- a/app.py\n"
         "+++ b/app.py\n"
@@ -268,6 +311,8 @@ async def test_token_exhaustion_gets_one_tool_free_compacted_review(
         "disable_repo_tools": True
     }
     assert "Do not call tools" in compacted_prompt
+    assert "Preserve the required deployment contract." in compacted_prompt
+    assert "fully satisfies the leaf plan contract" in compacted_prompt
     assert "diff --git a/app.py b/app.py" in compacted_prompt
     assert ".requiem/AGENTS.md" not in compacted_prompt
 
