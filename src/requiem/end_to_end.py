@@ -141,7 +141,11 @@ def _gate_opened(log_dir: Path, run_id: str) -> str | None:
 
 def _plan_record(completed: dict[str, dict]) -> dict[str, Any] | None:
     """Pull the planning record value (approved or needs-human), if present."""
-    for node in ("record_plan", "record_needs_human"):
+    for node in (
+        "record_plan",
+        "record_needs_human",
+        "record_leaf_from_policy",
+    ):
         block = completed.get(node)
         if block and block.get("kind") == "success":
             return block.get("value")
@@ -758,7 +762,7 @@ async def run_pipeline(
     # feedback, but no generic escalation policy can authorize ADO seeding or
     # fanout. The plan must be regenerated with a final approved verdict.
     verdict = (plan_record or {}).get("final_verdict")
-    if plan_record is None or verdict != "approved":
+    if plan_record is None or verdict not in ("approved", "policy-forced-leaf"):
         verdict_repr = verdict or "unknown"
         return PipelineResult(
             item_id=item_id, stage="planning", status="paused",

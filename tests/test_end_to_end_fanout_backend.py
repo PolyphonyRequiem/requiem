@@ -54,6 +54,24 @@ def _stub_planning(item_id: int):
     return planning_factory
 
 
+def _stub_policy_forced_planning(item_id: int):
+    def planning_factory(log_dir, *, item_id=item_id, twig=None, provider=None,
+                         gate_handler=None, process_config=None):
+        class _E:
+            async def run(self, run_id):
+                outcome = _atomic_plan(item_id)
+                outcome["value"]["final_verdict"] = "policy-forced-leaf"
+                outcome["value"]["policy_tier"] = "implementable"
+                _write_log(
+                    log_dir,
+                    run_id,
+                    [("record_leaf_from_policy", outcome)],
+                )
+                return Completed(run_id, "completed", "end", {})
+        return _E()
+    return planning_factory
+
+
 def _repo(tmp_path: Path) -> Path:
     r = tmp_path / "repo"
     r.mkdir()
@@ -95,6 +113,22 @@ async def test_fanout_backend_dispatches_atomic_root_in_process(tmp_path: Path):
     assert result.leaf_ids == ("700",)
     # The in-process child wrote its own isolated log.
     assert (tmp_path / "fanout-700__leaf-700.events.jsonl").exists()
+
+
+async def test_fanout_backend_dispatches_policy_forced_root_in_process(
+    tmp_path: Path,
+):
+    repo = _repo(tmp_path)
+    result = await run_pipeline(
+        700, log_dir=tmp_path, board="requiem-test",
+        dispatch_backend="fanout", repo_path=repo,
+        provider=_happy_coder(), live=False,
+        planning_factory=_stub_policy_forced_planning(700),
+    )
+    assert result.stage == "fanout"
+    assert result.status == "delivered", result.detail
+    assert result.fanout_verdict == "previewed"
+    assert result.leaf_ids == ("700",)
 
 
 async def test_fanout_backend_requires_repo_path(tmp_path: Path):
