@@ -413,12 +413,13 @@ def build_verb_registry(inputs: FanoutInputs) -> VerbRegistry:
             # #28 gap that this commit closes).
             process_config=inputs.process_config,
         )
-        # Per-leaf toolbelt: serve THIS leaf's already-resolved plan via a
-        # _LeafTwig (no live ADO re-fetch) and bind fs to the leaf's working
-        # tree (the worktree in parallel mode, else the shared repo). We start
-        # from the orchestrator's toolbelt (so gh/git are the real,
-        # seam-propagated clients) and swap twig + fs for the leaf.
-        leaf_twig = _LeafTwig(real_id=leaf.real_id, title=leaf.title, body=leaf.body)
+        # Prefer the authoritative work-item description when the orchestrator
+        # has a Twig client. Offline callers still receive the resolved plan.
+        leaf_twig = toolbelt.twig or _LeafTwig(
+            real_id=leaf.real_id,
+            title=leaf.title,
+            body=leaf.body,
+        )
         leaf_toolbelt = _dc_replace(
             toolbelt,
             twig=leaf_twig,  # type: ignore[arg-type]

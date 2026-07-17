@@ -16,6 +16,7 @@ import pytest
 
 from requiem.agent import FakeProvider
 from requiem.clients.fs import FilesystemClient
+from requiem.clients.twig import TwigItem
 from requiem.kernel import Completed
 from requiem.toolbelt import FakeFileClient, RealGitClient, Toolbelt
 from requiem.workflows import fanout
@@ -65,13 +66,13 @@ def repo(tmp_path: Path) -> Path:
     return r
 
 
-def _toolbelt(repo: Path, *, gh=None) -> Toolbelt:
+def _toolbelt(repo: Path, *, gh=None, twig=None) -> Toolbelt:
     return Toolbelt(
         git=RealGitClient(),
         files=FakeFileClient({}),
         gh=gh or impl._DemoGhClient(),  # type: ignore[arg-type]
         fs=FilesystemClient(repo),
-        twig=None,  # per-leaf twig is swapped in by dispatch_leaves
+        twig=twig,
     )
 
 
@@ -108,14 +109,17 @@ def _passing_runner(_cmd, _cwd):
     return TestRunResult(passed=True, summary="green", full_output="OK")
 
 
-def _engine(repo: Path, log_dir: Path, *, leaves, provider, gh=None, dry_run=True,
-            leaf_merge=None):
+def _engine(repo: Path, log_dir: Path, *, leaves, provider, gh=None, twig=None,
+            dry_run=True, leaf_merge=None):
     inputs = fanout.FanoutInputs(
         root_item_id=ROOT, repo=REPO, repo_path=repo, log_dir=log_dir,
         dry_run=dry_run, leaves=tuple(leaves), leaf_merge=leaf_merge,
     )
     return fanout.build_engine(
-        log_dir, inputs=inputs, toolbelt=_toolbelt(repo, gh=gh), provider=provider,
+        log_dir,
+        inputs=inputs,
+        toolbelt=_toolbelt(repo, gh=gh, twig=twig),
+        provider=provider,
     )
 
 
@@ -228,6 +232,58 @@ async def test_all_leaves_land_in_process(repo: Path, tmp_path: Path):
     assert res.leaves_failed == 0
     # Every leaf reached the success-handoff terminal.
     assert all(o.disposition == "completed" for o in res.outcomes)
+
+
+async def test_live_twig_description_overrides_shortened_plan_body(
+    repo: Path,
+    tmp_path: Path,
+):
+    class AuthoritativeTwig:
+        async def show_async(self, item_id: int) -> TwigItem:
+            return TwigItem(
+                id=item_id,
+                title="leaf one",
+                state="Active",
+                area_path="Demo",
+                work_item_type="Task",
+                parent_id=ROOT,
+                raw={
+                    "id": item_id,
+                    "title": "leaf one",
+                    "fields": {
+                        "System.Description": (
+                            "Implement the dedicated run-once ACI deployment surface."
+                        )
+                    },
+                },
+            )
+
+        async def comment_async(self, item_id: int, message: str) -> None:
+            pass
+
+    engine = _engine(
+        repo,
+        tmp_path,
+        leaves=[
+            fanout.FanoutLeaf(
+                real_id=1,
+                title="leaf one",
+                body="Implement the probe mechanism.",
+            )
+        ],
+        provider=_happy_provider(),
+        twig=AuthoritativeTwig(),
+    )
+
+    await engine.run("authoritative-description")
+
+    child = completed_from_log(
+        tmp_path / f"fanout-{ROOT}__leaf-1.events.jsonl"
+    )
+    assert (
+        child["fetch_plan"]["value"]["plan_text"]
+        == "Implement the dedicated run-once ACI deployment surface."
+    )
 
 
 async def test_each_leaf_writes_isolated_log(repo: Path, tmp_path: Path):
