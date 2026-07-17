@@ -230,6 +230,9 @@ async def test_review_prompt_binds_verdict_to_leaf_plan_contract(
     prompt = provider.calls[0]["user_message"]
     assert "Implement the probe via the Accepted ACI mechanism." in prompt
     assert "Reject or escalate changes that omit required scope" in prompt
+    assert "Merge-bound diff (complete=True)" in prompt
+    assert "definitively missing from the PR" in prompt
+    assert "return `request_changes`" in prompt
     assert ".requiem/rationale.md" not in prompt.split("Merge-bound diff:", 1)[1]
 
 
@@ -313,6 +316,8 @@ async def test_token_exhaustion_gets_one_tool_free_compacted_review(
     assert "Do not call tools" in compacted_prompt
     assert "Preserve the required deployment contract." in compacted_prompt
     assert "fully satisfies the leaf plan contract" in compacted_prompt
+    assert "supplied merge-bound diff is complete" in compacted_prompt
+    assert "return `request_changes`" in compacted_prompt
     assert "diff --git a/app.py b/app.py" in compacted_prompt
     assert ".requiem/AGENTS.md" not in compacted_prompt
 
