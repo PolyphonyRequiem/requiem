@@ -36,6 +36,10 @@ ROOT = 700
 REPO = "Owner/Repo"
 
 
+def test_comment_addresser_uses_implementation_scale_budget() -> None:
+    assert leaf_lifecycle_module.COMMENT_ADDRESSER.role == "implementer"
+
+
 @pytest.fixture
 def log_dir(tmp_path: Path) -> Path:
     d = tmp_path / "runs"

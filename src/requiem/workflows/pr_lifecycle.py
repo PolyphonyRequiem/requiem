@@ -172,6 +172,7 @@ COMMENT_ADDRESSER = AgentSpec(
         "explain in summary; the workflow will surface it to a human."
     ),
     response_model=AddressResult,
+    role="implementer",
 )
 
 
