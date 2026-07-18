@@ -1335,6 +1335,84 @@ async def test_no_changes_retries_once_then_succeeds(
     assert (repo_path / "MARKER.md").exists()
 
 
+async def test_placeholder_content_retries_once_then_succeeds(
+    repo_path: Path, tmp_path: Path
+) -> None:
+    _make_pushable(repo_path)
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh(pr_number=99)
+    provider = FakeProvider(scripts={
+        "coder": [
+            {
+                "intent_summary": "placeholder",
+                "file_changes": [{
+                    "path": "MARKER.md",
+                    "operation": "create",
+                    "content": "SEE_NOTES_PATCH_INSTEAD",
+                }],
+                "notes": "",
+            },
+            _coder_creates("MARKER.md"),
+        ],
+        "coder_revision": [],
+    })
+    engine = _make_engine(
+        repo_path,
+        tmp_path / "logs",
+        provider=provider,
+        twig=twig,
+        gh=gh,
+        test_runner=_passing_runner,
+    )
+
+    result = await engine.run("placeholder_retry")
+
+    assert isinstance(result, Completed)
+    assert result.final_node == "end_handoff"
+    assert len(provider.calls) == 2
+    assert "placeholder-only file content" in provider.calls[1]["user_message"]
+    assert (repo_path / "MARKER.md").read_text(encoding="utf-8") != (
+        "SEE_NOTES_PATCH_INSTEAD"
+    )
+
+
+async def test_repeated_placeholder_content_fails_before_mutation(
+    repo_path: Path, tmp_path: Path
+) -> None:
+    _make_pushable(repo_path)
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh()
+    placeholder = {
+        "intent_summary": "placeholder",
+        "file_changes": [{
+            "path": "MARKER.md",
+            "operation": "create",
+            "content": "SEE_NOTES_PATCH_INSTEAD",
+        }],
+        "notes": "",
+    }
+    provider = FakeProvider(scripts={
+        "coder": [placeholder, placeholder],
+        "coder_revision": [],
+    })
+    engine = _make_engine(
+        repo_path,
+        tmp_path / "logs",
+        provider=provider,
+        twig=twig,
+        gh=gh,
+        test_runner=_passing_runner,
+    )
+
+    result = await engine.run("placeholder_repeated")
+
+    assert isinstance(result, Completed)
+    assert result.final_node == "end_needs_human"
+    assert len(provider.calls) == 2
+    assert not (repo_path / "MARKER.md").exists()
+    assert gh.created_calls == []
+
+
 # ---- bad output ----
 
 

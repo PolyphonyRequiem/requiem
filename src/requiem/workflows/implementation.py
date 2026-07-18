@@ -278,6 +278,9 @@ whether to delete-and-recreate or resume the prior attempt."""
 
 MAX_PR_BODY_CHARS = 4_000
 MAX_PR_PATH_LIST_CHARS = 800
+PLACEHOLDER_FILE_CONTENTS = frozenset({
+    "SEE_NOTES_PATCH_INSTEAD",
+})
 PR_PLAN_TRUNCATION_MARKER = "\n\n[plan truncated to fit PR description limit]"
 
 
@@ -916,7 +919,20 @@ def build_verb_registry(
             f"Local path: {plan['repo_path']}\n"
             f"GitHub: {plan['repo']}\n\n"
         )
-        if prior_kind == "success" and not prior_parsed.get("file_changes"):
+        placeholder_paths = _placeholder_change_paths(
+            prior_parsed.get("file_changes") or []
+        )
+        if prior_kind == "success" and placeholder_paths:
+            retry_note = (
+                "Your previous structured response used placeholder-only file "
+                f"content for: {', '.join(placeholder_paths)}. Literal sentinels "
+                "such as SEE_NOTES_PATCH_INSTEAD are not executable changes. "
+                "Inspect the repository and return concrete create, modify, or "
+                "exact replace operations now. For large existing files, prefer "
+                "localized replace operations instead of reproducing the full "
+                "file.\n\n"
+            )
+        elif prior_kind == "success" and not prior_parsed.get("file_changes"):
             retry_note = (
                 "Your previous structured response contained zero file_changes "
                 f"(intent_summary={prior_parsed.get('intent_summary')!r}). "
@@ -966,6 +982,17 @@ def build_verb_registry(
 
     # ---- apply_changes (both first and revision use this) ------------
 
+    def _placeholder_change_paths(changes: list[dict[str, Any]]) -> list[str]:
+        paths: list[str] = []
+        for change in changes:
+            content = change.get("content")
+            if (
+                isinstance(content, str)
+                and content.strip().upper() in PLACEHOLDER_FILE_CONTENTS
+            ):
+                paths.append(str(change.get("path") or "(unknown path)"))
+        return paths
+
     @verbs.register("validate_coder_changes")
     def _validate_coder_changes(ctx):
         if inputs.dry_run:
@@ -976,6 +1003,16 @@ def build_verb_registry(
             return PermanentFailure(
                 error_kind="coder.no_changes",
                 message="initial coder response contained 0 file_changes",
+            )
+        placeholder_paths = _placeholder_change_paths(changes)
+        if placeholder_paths:
+            return PermanentFailure(
+                error_kind="coder.no_effective_changes",
+                message=(
+                    "initial coder response contained placeholder-only file "
+                    f"content for: {', '.join(placeholder_paths)}"
+                ),
+                details={"placeholder_paths": placeholder_paths},
             )
         return Success(value={"change_count": len(changes)})
 
@@ -1079,6 +1116,16 @@ def build_verb_registry(
             return PermanentFailure(
                 error_kind="coder.no_changes",
                 message=f"coder agent returned 0 file_changes ({coder_nodes})",
+            )
+        placeholder_paths = _placeholder_change_paths(raw_changes)
+        if placeholder_paths:
+            return PermanentFailure(
+                error_kind="coder.no_effective_changes",
+                message=(
+                    "coder agent returned placeholder-only file content for: "
+                    f"{', '.join(placeholder_paths)}"
+                ),
+                details={"placeholder_paths": placeholder_paths},
             )
         applied: list[str] = []
         already_satisfied: list[str] = []
@@ -1987,6 +2034,11 @@ def build_workflow() -> Workflow:
                 .edge(
                     "validate_coder_changes",
                     on="permanent_failure:coder.no_changes",
+                    to="invoke_coder_retry",
+                )
+                .edge(
+                    "validate_coder_changes",
+                    on="permanent_failure:coder.no_effective_changes",
                     to="invoke_coder_retry",
                 )
                 .edge(
