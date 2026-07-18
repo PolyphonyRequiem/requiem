@@ -517,8 +517,12 @@ class CopilotProvider:
                 last_activity_event = evt
                 last_activity_at = time.monotonic()
             if evt == "assistant.message":
-                # The final assembled assistant message — this is what we keep.
+                # The SDK defines this as the final assembled response. Finish
+                # immediately instead of waiting for session.idle: some CLI
+                # sessions omit idle, and a recovery prompt would start a new
+                # turn that can overwrite an already-valid structured result.
                 response_text = getattr(event.data, "content", "") or ""
+                done.set()
             elif evt == "assistant.usage":
                 # Token accounting (floats sometimes; coerce). The
                 # Copilot SDK emits cumulative-per-turn input_tokens
