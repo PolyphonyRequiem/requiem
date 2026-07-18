@@ -1030,6 +1030,115 @@ async def test_transient_addressal_timeout_retries_once(
     )
 
 
+async def test_empty_addressal_retries_once(
+    log_dir: Path,
+    repo_path: Path,
+):
+    review = {
+        "verdict": "request_changes",
+        "summary": "fix it",
+        "comments": [{
+            "file": "README.md",
+            "line": 1,
+            "body": "fix the heading",
+            "severity": "major",
+        }],
+    }
+    synth = {
+        "actionable_items": [{
+            "file": "README.md",
+            "line_range": [1, 1],
+            "change_summary": "fix the heading",
+            "original_comment_ids": [1],
+        }],
+        "non_actionable": [],
+    }
+    fixed = {
+        "file_changes": [{
+            "path": "README.md",
+            "operation": "replace",
+            "old_content": "# repo\n",
+            "content": "# fixed\n",
+        }],
+        "summary": "fixed the heading",
+        "items_addressed": [1],
+    }
+    provider = _provider(
+        reviewer=[review, {"verdict": "approve", "comments": [], "summary": "ok"}],
+        synth=[synth],
+        addresser=[
+            {"file_changes": [], "summary": "placeholder", "items_addressed": []},
+            fixed,
+        ],
+    )
+    engine = _engine(
+        log_dir,
+        toolkit=_toolkit(),
+        provider=provider,
+        repo_path=repo_path,
+    )
+
+    result = await engine.run("empty_addressal_recovers")
+
+    assert result.final_node == "end_merged"
+    assert [
+        call["agent"] for call in provider.calls
+    ].count("comment_addresser") == 2
+    retry_prompt = [
+        call["user_message"]
+        for call in provider.calls
+        if call["agent"] == "comment_addresser"
+    ][1]
+    assert "zero file_changes" in retry_prompt
+    assert (repo_path / "README.md").read_text(encoding="utf-8") == "# fixed\n"
+
+
+async def test_repeated_empty_addressal_fails_closed(
+    log_dir: Path,
+    repo_path: Path,
+):
+    review = {
+        "verdict": "request_changes",
+        "summary": "fix it",
+        "comments": [{
+            "file": "README.md",
+            "line": 1,
+            "body": "fix the heading",
+            "severity": "major",
+        }],
+    }
+    synth = {
+        "actionable_items": [{
+            "file": "README.md",
+            "line_range": [1, 1],
+            "change_summary": "fix the heading",
+            "original_comment_ids": [1],
+        }],
+        "non_actionable": [],
+    }
+    empty = {"file_changes": [], "summary": "placeholder", "items_addressed": []}
+    provider = _provider(
+        reviewer=[review],
+        synth=[synth],
+        addresser=[empty, empty],
+    )
+    engine = _engine(
+        log_dir,
+        toolkit=_toolkit(),
+        provider=provider,
+        repo_path=repo_path,
+    )
+
+    result = await engine.run("empty_addressal_repeated")
+
+    assert result.final_node == "needs_human_end"
+    completed = _completed_map(log_dir / "empty_addressal_repeated.events.jsonl")
+    assert completed["validate_addressal_retry"]["error_kind"] == (
+        "addressal.no_changes"
+    )
+    assert (repo_path / "README.md").read_text(encoding="utf-8") == "# repo\n"
+
+
 async def test_review_fix_test_failure_blocks_before_push(
     log_dir: Path,
     repo_path: Path,

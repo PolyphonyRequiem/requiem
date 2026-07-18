@@ -186,6 +186,86 @@ async def test_comments_loop_synthesizes_addresses_pushes_then_merges(log_dir: P
     assert tk.merge_count == 1
 
 
+async def test_empty_addressal_retries_once(log_dir: Path):
+    comments = [
+        ReviewComment(id=1, path="a.py", line=10, body="rename", user="alice"),
+    ]
+    tk = _toolkit(
+        reviews=[[], [ReviewSummary(id=9, state="APPROVED", user="alice")]],
+        comments=[comments, []],
+        push_shas=["newsha111111111"],
+    )
+    provider = FakeProvider(scripts={
+        "comment_synthesizer": [{
+            "actionable_items": [{
+                "file": "a.py",
+                "line_range": [10, 10],
+                "change_summary": "rename",
+                "original_comment_ids": [1],
+            }],
+            "non_actionable": [],
+        }],
+        "comment_addresser": [
+            {"file_changes": [], "summary": "placeholder", "items_addressed": []},
+            {
+                "file_changes": [{
+                    "path": "a.py",
+                    "operation": "modify",
+                    "content": "# fixed\n",
+                }],
+                "summary": "renamed",
+                "items_addressed": [1],
+            },
+        ],
+    })
+    engine = _engine(log_dir, toolkit=tk, provider=provider, max_iterations=1)
+
+    result = await engine.run("empty_addressal_recovers")
+
+    assert isinstance(result, Completed), result
+    assert result.final_node == "end_merged"
+    assert [
+        call["agent"] for call in provider.calls
+    ].count("comment_addresser") == 2
+    retry_prompt = [
+        call["user_message"]
+        for call in provider.calls
+        if call["agent"] == "comment_addresser"
+    ][1]
+    assert "zero file_changes" in retry_prompt
+
+
+async def test_repeated_empty_addressal_fails_closed(log_dir: Path):
+    comments = [
+        ReviewComment(id=1, path="a.py", line=10, body="rename", user="alice"),
+    ]
+    tk = _toolkit(reviews=[[]], comments=[comments])
+    empty = {"file_changes": [], "summary": "placeholder", "items_addressed": []}
+    provider = FakeProvider(scripts={
+        "comment_synthesizer": [{
+            "actionable_items": [{
+                "file": "a.py",
+                "line_range": [10, 10],
+                "change_summary": "rename",
+                "original_comment_ids": [1],
+            }],
+            "non_actionable": [],
+        }],
+        "comment_addresser": [empty, empty],
+    })
+    engine = _engine(log_dir, toolkit=tk, provider=provider, max_iterations=1)
+
+    result = await engine.run("empty_addressal_repeated")
+
+    assert isinstance(result, Completed), result
+    assert result.final_node == "needs_human_end"
+    completed = _completed_map(log_dir / "empty_addressal_repeated.events.jsonl")
+    assert completed["validate_addressal_retry"]["error_kind"] == (
+        "addressal.no_changes"
+    )
+    assert tk.push_count == 0
+
+
 # ---- case 4: agent returns BadOutput → NeedsHuman -------------------
 
 

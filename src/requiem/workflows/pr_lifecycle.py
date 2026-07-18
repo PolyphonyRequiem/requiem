@@ -780,9 +780,46 @@ def build_verb_registry(
             f"{body}"
         )
 
+    @verbs.register("address_retry_prompt")
+    def _address_retry_prompt(ctx):
+        prior = ctx.completed["address_comments"]["value"]["parsed"]
+        return (
+            "Your previous structured response contained zero file_changes "
+            f"(summary={prior.get('summary')!r}). The review findings require "
+            "concrete repository changes. Inspect the checkout and return the "
+            "minimal file_changes that address them now.\n\n"
+            + _address_prompt(ctx)
+        )
+
+    def _addressal_parsed(ctx, node: str | None = None):
+        source = node or (
+            "address_comments_retry"
+            if "address_comments_retry" in ctx.completed
+            else "address_comments"
+        )
+        return ctx.completed[source]["value"]["parsed"]
+
+    def _validate_addressal(ctx, node: str):
+        parsed = _addressal_parsed(ctx, node)
+        changes = list(parsed.get("file_changes") or [])
+        if not changes:
+            return PermanentFailure(
+                error_kind="addressal.no_changes",
+                message=f"{node} response contained 0 file_changes",
+            )
+        return Success(value={"change_count": len(changes), "source_node": node})
+
+    @verbs.register("validate_addressal_changes")
+    def _validate_addressal_changes(ctx):
+        return _validate_addressal(ctx, "address_comments")
+
+    @verbs.register("validate_addressal_retry")
+    def _validate_addressal_retry(ctx):
+        return _validate_addressal(ctx, "address_comments_retry")
+
     @verbs.register("apply_addressal")
     def _apply_addressal(ctx):
-        parsed = ctx.completed["address_comments"]["value"]["parsed"]
+        parsed = _addressal_parsed(ctx)
         raw_changes = parsed.get("file_changes") or []
         if dry_run:
             return Success(value={
@@ -797,7 +834,12 @@ def build_verb_registry(
 
     @verbs.register("push_addressal")
     async def _push_addressal(ctx):
-        addr_outcome = ctx.completed["address_comments"]["value"]
+        addr_node = (
+            "address_comments_retry"
+            if "address_comments_retry" in ctx.completed
+            else "address_comments"
+        )
+        addr_outcome = ctx.completed[addr_node]["value"]
         parsed = addr_outcome.get("parsed") or {}
         if dry_run:
             applied = ctx.completed["apply_addressal"]["value"]
@@ -1009,9 +1051,28 @@ def build_workflow() -> Workflow:
             .edge("synthesize_comments", on="bad_output",         to="needs_human_end")
             .edge("synthesize_comments", on="permanent_failure",  to="needs_human_end")
         .agent("address_comments", agent="comment_addresser", prompt_verb="address_prompt")
-            .edge("address_comments", on="success",            to="apply_addressal")
+            .edge("address_comments", on="success",            to="validate_addressal_changes")
             .edge("address_comments", on="bad_output",         to="needs_human_end")
             .edge("address_comments", on="permanent_failure",  to="needs_human_end")
+        .script("validate_addressal_changes", verb="validate_addressal_changes")
+            .edge("validate_addressal_changes", on="success", to="apply_addressal")
+            .edge(
+                "validate_addressal_changes",
+                on="permanent_failure:addressal.no_changes",
+                to="address_comments_retry",
+            )
+            .edge("validate_addressal_changes", on="permanent_failure", to="needs_human_end")
+        .agent(
+            "address_comments_retry",
+            agent="comment_addresser",
+            prompt_verb="address_retry_prompt",
+        )
+            .edge("address_comments_retry", on="success", to="validate_addressal_retry")
+            .edge("address_comments_retry", on="bad_output", to="needs_human_end")
+            .edge("address_comments_retry", on="permanent_failure", to="needs_human_end")
+        .script("validate_addressal_retry", verb="validate_addressal_retry")
+            .edge("validate_addressal_retry", on="success", to="apply_addressal")
+            .edge("validate_addressal_retry", on="permanent_failure", to="needs_human_end")
         .script("apply_addressal", verb="apply_addressal")
             .edge("apply_addressal", on="success",            to="push_addressal")
             .edge("apply_addressal", on="permanent_failure",  to="needs_human_end")
