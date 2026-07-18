@@ -147,7 +147,7 @@ class LeafLifecycleInputs:
     root_item_id: int
     pr_number: int
     default_branch: str
-    max_iterations: int = 3
+    max_iterations: int = 5
     merge_strategy: RepoMergeStrategy = "squash"
     test_command: str | None = None
     dry_run: bool = False
@@ -1235,6 +1235,23 @@ def build_verb_registry(
                 message="reviewer requested changes but emitted no comments",
                 details={"report": parsed},
             )
+        completed_iterations = int(
+            ((ctx.completed.get("check_progress") or {}).get("value") or {}).get(
+                "iteration", 0
+            )
+        )
+        if completed_iterations >= inputs.max_iterations:
+            return PermanentFailure(
+                error_kind="needs_human.max_iterations",
+                message=(
+                    f"review loop hit max_iterations={inputs.max_iterations} "
+                    "without approval"
+                ),
+                details={
+                    "iterations": completed_iterations,
+                    "report": parsed,
+                },
+            )
         return Success(
             value={
                 "summary": summary,
@@ -1640,14 +1657,6 @@ def build_verb_registry(
             return PermanentFailure(
                 error_kind="needs_human.same_findings",
                 message="review loop reproduced the same findings on a new SHA",
-            )
-        if iteration > inputs.max_iterations:
-            return PermanentFailure(
-                error_kind="needs_human.max_iterations",
-                message=(
-                    f"review loop hit max_iterations={inputs.max_iterations} "
-                    "without approval"
-                ),
             )
         return Success(
             value={

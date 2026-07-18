@@ -935,6 +935,7 @@ async def test_review_fixes_rerun_tests_publish_status_and_recover_unknown(
         ),
         repo_path=repo_path,
         test_runner=runner,
+        max_iterations=1,
     )
 
     result = await engine.run("addressal_status_recovers")
@@ -1209,7 +1210,7 @@ async def test_reviewer_needs_human_routes_to_needs_human(log_dir: Path):
 
 
 async def test_max_iterations_escalates(log_dir: Path, repo_path: Path):
-    tk = _toolkit(push_shas=["sha-1", "sha-2"])
+    tk = _toolkit(push_shas=["sha-1"])
     review1 = {
         "verdict": "request_changes",
         "summary": "same fix",
@@ -1249,7 +1250,8 @@ async def test_max_iterations_escalates(log_dir: Path, repo_path: Path):
     result = await engine.run("max_iter")
     assert result.final_node == "needs_human_end"
     completed = _completed_map(log_dir / "max_iter.events.jsonl")
-    assert completed["check_progress"]["error_kind"] == "needs_human.max_iterations"
+    assert completed["dispatch_review"]["error_kind"] == "needs_human.max_iterations"
+    assert sum(name == "git_push" for name, _args in tk.calls) == 1
 
 
 async def test_same_sha_twice_trips_no_progress(log_dir: Path, repo_path: Path):

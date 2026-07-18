@@ -725,6 +725,20 @@ def build_verb_registry(
                 message="approvals present, no unresolved comments",
                 details={"approvals": pv.get("approvals", [])},
             )
+        completed_iterations = int(
+            ((ctx.completed.get("check_progress") or {}).get("value") or {}).get(
+                "iteration", 0
+            )
+        )
+        if completed_iterations >= max_iterations:
+            return PermanentFailure(
+                error_kind="needs_human.max_iterations",
+                message=(
+                    f"address-comments loop hit max_iterations={max_iterations} "
+                    "without merge"
+                ),
+                details={"iteration": completed_iterations},
+            )
         return Success(value={"branch": "comments"})
 
     @verbs.register("synth_prompt")
@@ -853,19 +867,6 @@ def build_verb_registry(
                     f"(sha={cur_sha[:8]} unchanged across iterations)"
                 ),
                 details={"iteration": iteration, "comments_addressed": addressed_so_far},
-            )
-        if iteration > max_iterations:
-            return PermanentFailure(
-                error_kind="needs_human.max_iterations",
-                message=(
-                    f"address-comments loop hit max_iterations={max_iterations} "
-                    f"without merge"
-                ),
-                details={
-                    "iteration": iteration,
-                    "comments_addressed": addressed_so_far,
-                    "commits": commits_so_far,
-                },
             )
         return Success(
             value={
@@ -1195,7 +1196,7 @@ def build_engine(
     repo: str = "PolyphonyRequiem/requiem",
     pr_number: int = 347,
     repo_path: Path | None = None,
-    max_iterations: int = 3,
+    max_iterations: int = 5,
     merge_strategy: Literal["merge", "squash", "rebase"] | None = "squash",
     dry_run: bool = False,
     toolkit: PrToolkit | None = None,

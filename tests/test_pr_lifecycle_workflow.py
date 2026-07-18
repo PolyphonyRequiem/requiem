@@ -172,7 +172,7 @@ async def test_comments_loop_synthesizes_addresses_pushes_then_merges(log_dir: P
              "items_addressed": [1, 2, 3]},
         ],
     })
-    engine = _engine(log_dir, toolkit=tk, provider=provider)
+    engine = _engine(log_dir, toolkit=tk, provider=provider, max_iterations=1)
     result = await engine.run("loop")
     assert isinstance(result, Completed), result
     assert result.final_node == "end_merged"
@@ -237,10 +237,10 @@ async def test_address_loop_max_iterations_yields_needs_human(log_dir: Path):
     assert isinstance(result, Completed), result
     assert result.final_node == "needs_human_end"; assert result.disposition == "failed"
     completed = _completed_map(log_dir / "max_iter.events.jsonl")
-    cp = completed["check_progress"]
+    cp = completed["dispatch_poll"]
     assert cp["kind"] == "permanent_failure"
     assert cp["error_kind"] == "needs_human.max_iterations"
-    assert tk.push_count == 3  # 2 successful iterations + the 3rd that trips the cap
+    assert tk.push_count == 2
     assert tk.merge_count == 0
 
 
