@@ -69,7 +69,7 @@ class ModelSpec:
     forces faster turnaround at the cost of less deliberate reasoning).
     ``max_cumulative_input_tokens`` is a Copilot-specific safeguard that
     can be pinned per-role from ``process.yaml``; when omitted, the
-    provider uses a model-based default for implementer roles.
+    provider uses model-based defaults for implementer and reviewer roles.
     The kernel threads non-None values through to the provider via
     ``AgentCall.model_options``; providers that don't understand a key
     silently ignore it. Operator yaml shape::

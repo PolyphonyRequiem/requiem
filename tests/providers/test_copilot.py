@@ -260,6 +260,18 @@ def test_implementer_budget_uses_model_window_floor():
     assert provider._resolve_max_cumulative_input_tokens(call, "claude-sonnet-5", {}) == 374_400
 
 
+def test_reviewer_budget_uses_model_window_floor():
+    provider = CopilotProvider(client=_FakeCopilotClient())
+    spec = _make_spec(role="reviewer", model="claude-sonnet-5")
+    call = _make_call(spec)
+
+    assert provider._resolve_max_cumulative_input_tokens(
+        call,
+        "claude-sonnet-5",
+        {},
+    ) == 187_200
+
+
 def test_call_level_budget_override_wins_over_role_default():
     provider = CopilotProvider(client=_FakeCopilotClient())
     spec = _make_spec(role="implementer", model="claude-sonnet-5")

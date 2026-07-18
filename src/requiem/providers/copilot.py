@@ -164,12 +164,15 @@ recovery (fail on first idle)."""
 
 _DEFAULT_MAX_CUMULATIVE_INPUT_TOKENS: Final[int] = 80_000
 """Default cap on peak ``assistant.usage.input_tokens`` for a single
-``invoke`` call. The provider uses this for non-implementer roles and
-for callers that do not provide a per-role override.
+``invoke`` call. The provider uses this for roles without a model-aware
+floor and for callers that do not provide a per-role override.
 
 For implementer-role calls, the provider now raises the lower-bound
 budget to 40% of the selected model's advertised max prompt window
-when that information is known; the fallback stays at this default.
+when that information is known. Reviewer-role calls use 20% so complete
+implementation-scale evidence and repository inspection can fit without
+granting the full implementer allowance. The fallback stays at this
+default.
 Set to ``None`` to disable the cap entirely (operator opt-out for
 runs that legitimately need large contexts)."""
 
@@ -180,9 +183,9 @@ _MODEL_MAX_PROMPT_TOKENS: Final[dict[str, int]] = {
     "claude-sonnet-4.5": 168_000,
 }
 """Known Copilot model max prompt windows. We use these only to derive
-an implementer-side lower bound: 40% of the model's advertised max
-prompt tokens, with a floor of 80K to preserve the current safety
-buffer for older models."""
+role-specific lower bounds from the model's advertised max prompt tokens,
+with a floor of 80K to preserve the current safety buffer for older
+models."""
 
 _DEFAULT_RECOVERY_PROMPT: Final[str] = (
     "It appears your previous response stalled or did not complete. "
@@ -354,21 +357,25 @@ class CopilotProvider:
     ) -> int | None:
         """Resolve the per-call input-token cap.
 
-        Call-scoped overrides win. Implementer-role calls get a model-
-        aware floor so the provider doesn't fail too aggressively on
-        larger work items.
+        Call-scoped overrides win. Implementer and reviewer calls get
+        model-aware floors so the provider doesn't fail too aggressively
+        on larger work items or implementation-scale review evidence.
         """
         options = dict(call_options or {})
         if "max_cumulative_input_tokens" in options:
             return options["max_cumulative_input_tokens"]
         if self.max_cumulative_input_tokens is None:
             return None
-        if getattr(call.spec, "role", None) == "implementer":
+        role_window_fraction = {
+            "implementer": 0.4,
+            "reviewer": 0.2,
+        }.get(getattr(call.spec, "role", None))
+        if role_window_fraction is not None:
             max_prompt_tokens = _MODEL_MAX_PROMPT_TOKENS.get(model)
             if max_prompt_tokens is not None:
                 return max(
                     int(self.max_cumulative_input_tokens),
-                    int(max_prompt_tokens * 0.4),
+                    int(max_prompt_tokens * role_window_fraction),
                 )
         return self.max_cumulative_input_tokens
 
