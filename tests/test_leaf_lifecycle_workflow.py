@@ -266,7 +266,7 @@ async def test_review_prompt_binds_verdict_to_leaf_plan_contract(
     assert ".requiem/rationale.md" not in prompt.split("Merge-bound diff:", 1)[1]
 
 
-async def test_moderate_review_diff_is_supplied_completely(
+async def test_implementation_scale_review_diff_is_supplied_completely(
     log_dir: Path,
     repo_path: Path,
 ):
@@ -277,7 +277,7 @@ async def test_moderate_review_diff_is_supplied_completely(
         "--- a/probe.cs\n"
         "+++ b/probe.cs\n"
         "@@ -0,0 +1 @@\n"
-        f"+{'x' * 40_000}{final_marker}\n"
+        f"+{'x' * 120_000}{final_marker}\n"
     )
     provider = _provider()
     engine = _engine(
@@ -287,15 +287,20 @@ async def test_moderate_review_diff_is_supplied_completely(
         repo_path=repo_path,
     )
 
-    await engine.run("moderate_complete_review")
+    await engine.run("implementation_scale_complete_review")
 
-    completed = _completed_map(log_dir / "moderate_complete_review.events.jsonl")
+    completed = _completed_map(
+        log_dir / "implementation_scale_complete_review.events.jsonl"
+    )
     review = completed["prepare_review"]["value"]
-    assert review["review_diff_chars"] > 30_000
+    assert review["review_diff_chars"] > 100_000
     assert review["diff_complete"] is True
     assert review["diff"].endswith(final_marker)
     prompt = provider.calls[0]["user_message"]
     assert "Merge-bound diff (complete=True)" in prompt
+    assert "ambient permission" in prompt
+    assert "undocumented external practice" in prompt
+    assert "Name a concrete contradiction or safety defect" in prompt
     assert final_marker in prompt
 
 

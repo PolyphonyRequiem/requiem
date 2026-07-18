@@ -120,7 +120,7 @@ MERGEABILITY_RETRY_MAX = 2
 MERGEABILITY_RETRY_DELAY_S = 1.0
 TEST_STATUS_RETRY_MAX = 2
 TEST_STATUS_RETRY_DELAY_S = 1.0
-MAX_REVIEW_DIFF_CHARS = 100_000
+MAX_REVIEW_DIFF_CHARS = 200_000
 MAX_COMPACTED_REVIEW_DIFF_CHARS = 20_000
 MAX_REVIEW_CONTRACT_CHARS = 12_000
 
@@ -1060,7 +1060,12 @@ def build_verb_registry(
             "plan, or acknowledge that required work was left undone. Return "
             "`request_changes` for concrete code fixes Requiem can implement "
             "automatically. Return `needs_human` for any ambiguous or unsafe case, "
-            "including a missing or incomplete plan contract.\n\n"
+            "including a missing or incomplete plan contract. Do not use "
+            "`needs_human` merely to ask whether an explicit implementation "
+            "rationale, ambient permission, or deployment convention matches "
+            "undocumented external practice. Name a concrete contradiction or "
+            "safety defect and return `request_changes`; otherwise judge the "
+            "implementation shown.\n\n"
             "Leaf plan contract "
             f"(complete={prep['review_contract_complete']}):\n"
             f"{prep['review_contract'] or '(missing)'}\n\n"
