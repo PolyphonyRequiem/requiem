@@ -1426,7 +1426,10 @@ def build_verb_registry(
             f"Repo checkout: {inputs.repo_path}\n"
             f"Branch: {inputs.expected_head}\n"
             "Apply the following actionable items. Return AddressResult "
-            "with file_changes (full content per changed file) — you "
+            "with file_changes. Prefer exact `replace` operations with "
+            "`old_content` and replacement `content` for localized edits "
+            "to large files; the old text must match exactly once. Use "
+            "full-file `modify` only for bounded whole-file changes. You "
             "cannot commit yourself.\n\n"
             f"{rendered}"
         )

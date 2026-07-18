@@ -166,8 +166,11 @@ COMMENT_ADDRESSER = AgentSpec(
         "You receive a list of actionable review items and the repo "
         "checkout path. You have read-only tools to inspect the repo — "
         "you cannot run git or write files yourself. Return an "
-        "AddressResult with the minimal set of file_changes (full file "
-        "content per changed file) that addresses every item. If you "
+        "AddressResult with the minimal set of file_changes that addresses "
+        "every item. Prefer exact `replace` operations with `old_content` "
+        "and replacement `content` for localized edits, especially in large "
+        "files; `old_content` must match exactly once. Use full-file `modify` "
+        "only when replacing the whole file is reasonably bounded. If you "
         "cannot address an item safely, leave file_changes empty and "
         "explain in summary; the workflow will surface it to a human."
     ),
@@ -755,7 +758,10 @@ def build_verb_registry(
         return (
             f"Repo checkout: {repo_path}\n"
             "Apply the following actionable items. Return AddressResult "
-            "with file_changes (full content per changed file) — you "
+            "with file_changes. Prefer exact `replace` operations with "
+            "`old_content` and replacement `content` for localized edits "
+            "to large files; the old text must match exactly once. Use "
+            "full-file `modify` only for bounded whole-file changes. You "
             "cannot commit yourself.\n\n"
             f"{body}"
         )

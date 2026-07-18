@@ -19,8 +19,9 @@ from requiem.clients.repo import (
     RepoMergeabilityReport,
     RepoPullRequest,
 )
+from requiem.coder_output import apply_file_changes
 from requiem.kernel import Completed, Suspended
-from requiem.outcomes import RetryableFailure
+from requiem.outcomes import PermanentFailure, RetryableFailure
 from requiem.persistence import replay
 from requiem.toolbelt import Toolbelt
 from requiem.workflows.implementation import TestRunResult
@@ -38,6 +39,28 @@ REPO = "Owner/Repo"
 
 def test_comment_addresser_uses_implementation_scale_budget() -> None:
     assert leaf_lifecycle_module.COMMENT_ADDRESSER.role == "implementer"
+
+
+def test_snippet_replacement_fails_closed_on_multiple_matches(
+    repo_path: Path,
+) -> None:
+    target = repo_path / "README.md"
+    target.write_text("repeat\nrepeat\n", encoding="utf-8")
+
+    outcome = apply_file_changes(
+        repo_path,
+        FilesystemClient(repo_path),
+        [{
+            "path": "README.md",
+            "operation": "replace",
+            "old_content": "repeat",
+            "content": "fixed",
+        }],
+    )
+
+    assert isinstance(outcome, PermanentFailure)
+    assert outcome.details["matches"] == 2
+    assert target.read_text(encoding="utf-8") == "repeat\nrepeat\n"
 
 
 @pytest.fixture
@@ -851,11 +874,16 @@ async def test_review_fixes_rerun_tests_publish_status_and_recover_unknown(
     review = {
         "verdict": "request_changes",
         "summary": "fix it",
-        "comments": [{"file": "a.py", "line": 1, "body": "fix", "severity": "major"}],
+        "comments": [{
+            "file": "README.md",
+            "line": 1,
+            "body": "fix",
+            "severity": "major",
+        }],
     }
     synth = {
         "actionable_items": [{
-            "file": "a.py",
+            "file": "README.md",
             "line_range": [1, 1],
             "change_summary": "fix",
             "original_comment_ids": [1],
@@ -863,7 +891,12 @@ async def test_review_fixes_rerun_tests_publish_status_and_recover_unknown(
         "non_actionable": [],
     }
     addr = {
-        "file_changes": [{"path": "a.py", "operation": "create", "content": "fixed\n"}],
+        "file_changes": [{
+            "path": "README.md",
+            "operation": "replace",
+            "old_content": "# repo\n",
+            "content": "# fixed\n",
+        }],
         "summary": "fixed",
         "items_addressed": [1],
     }
@@ -902,6 +935,14 @@ async def test_review_fixes_rerun_tests_publish_status_and_recover_unknown(
     result = await engine.run("addressal_status_recovers")
 
     assert result.final_node == "end_merged"
+    assert (repo_path / "README.md").read_text(encoding="utf-8") == "# fixed\n"
+    addresser_prompt = next(
+        call["user_message"]
+        for call in engine.provider.calls
+        if call["agent"] == "comment_addresser"
+    )
+    assert "Prefer exact `replace` operations" in addresser_prompt
+    assert "`old_content`" in addresser_prompt
     assert test_calls == [("pytest -q", repo_path)]
     completed = _completed_map(log_dir / "addressal_status_recovers.events.jsonl")
     assert completed["run_addressal_tests"]["value"]["passed"] is True

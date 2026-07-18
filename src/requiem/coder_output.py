@@ -30,10 +30,19 @@ class FileChange(BaseModel):
         ...,
         description="Path relative to the repo root; no '..', no absolute paths.",
     )
-    operation: Literal["create", "modify", "delete"]
+    operation: Literal["create", "modify", "replace", "delete"]
     content: str | None = Field(
         None,
-        description="Full file content for create/modify; None for delete.",
+        description=(
+            "Full file content for create/modify, replacement text for replace, "
+            "or None for delete."
+        ),
+    )
+    old_content: str | None = Field(
+        None,
+        description=(
+            "Exact text to replace; required for replace and must occur exactly once."
+        ),
     )
 
 
@@ -108,6 +117,28 @@ def apply_file_changes(
                         message=f"operation {op!r} on {rel} requires content",
                     )
                 fs.write_text(target, content)
+            elif op == "replace":
+                old_content = entry.get("old_content")
+                if not old_content or content is None:
+                    return PermanentFailure(
+                        error_kind=apply_failed_error_kind,
+                        message=(
+                            f"operation 'replace' on {rel} requires non-empty "
+                            "old_content and replacement content"
+                        ),
+                    )
+                current = fs.read_text(target)
+                matches = current.count(old_content)
+                if matches != 1:
+                    return PermanentFailure(
+                        error_kind=apply_failed_error_kind,
+                        message=(
+                            f"operation 'replace' on {rel} expected exactly one "
+                            f"old_content match; found {matches}"
+                        ),
+                        details={"path": str(rel), "matches": matches},
+                    )
+                fs.write_text(target, current.replace(old_content, content, 1))
             else:
                 return PermanentFailure(
                     error_kind=apply_failed_error_kind,
