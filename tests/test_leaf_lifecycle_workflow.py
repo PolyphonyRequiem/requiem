@@ -913,6 +913,69 @@ async def test_review_fixes_rerun_tests_publish_status_and_recover_unknown(
     }
 
 
+async def test_transient_addressal_timeout_retries_once(
+    log_dir: Path,
+    repo_path: Path,
+):
+    review = {
+        "verdict": "request_changes",
+        "summary": "add missing rollout wiring",
+        "comments": [{
+            "file": "rollout.json",
+            "line": 1,
+            "body": "add the rollout step",
+            "severity": "blocker",
+        }],
+    }
+    synth = {
+        "actionable_items": [{
+            "file": "rollout.json",
+            "line_range": [1, 1],
+            "change_summary": "add the rollout step",
+            "original_comment_ids": [1],
+        }],
+        "non_actionable": [],
+    }
+    timeout = RetryableFailure(
+        retry_key="addressal#1",
+        error_kind="network_timeout",
+        message="comment addresser became idle",
+        after=0.0,
+    )
+    addressal = {
+        "file_changes": [{
+            "path": "rollout.json",
+            "operation": "create",
+            "content": '{"step": "probe"}\n',
+        }],
+        "summary": "added rollout step",
+        "items_addressed": [1],
+    }
+    provider = _provider(
+        reviewer=[review, {"verdict": "approve", "comments": [], "summary": "ok"}],
+        synth=[synth],
+        addresser=[timeout, addressal],
+    )
+    engine = _engine(
+        log_dir,
+        toolkit=_toolkit(),
+        provider=provider,
+        repo_path=repo_path,
+    )
+
+    result = await engine.run("addressal_timeout_recovers")
+
+    assert result.final_node == "end_merged"
+    assert [
+        call["agent"] for call in provider.calls
+    ].count("comment_addresser") == 2
+    completed = _completed_map(log_dir / "addressal_timeout_recovers.events.jsonl")
+    assert completed["address_comments"]["kind"] == "success"
+    assert (repo_path / "rollout.json").read_text(encoding="utf-8") == (
+        '{"step": "probe"}\n'
+    )
+
+
 async def test_review_fix_test_failure_blocks_before_push(
     log_dir: Path,
     repo_path: Path,

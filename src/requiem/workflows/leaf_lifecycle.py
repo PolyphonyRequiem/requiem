@@ -2141,7 +2141,12 @@ def build_workflow() -> Workflow:
             .edge("synthesize_comments", on="success", to="address_comments")
             .edge("synthesize_comments", on="bad_output", to="needs_human_end")
             .edge("synthesize_comments", on="permanent_failure", to="needs_human_end")
-        .agent("address_comments", agent="comment_addresser", prompt_verb="address_prompt")
+        .agent(
+            "address_comments",
+            agent="comment_addresser",
+            prompt_verb="address_prompt",
+            retry_max=1,
+        )
             .edge("address_comments", on="success", to="apply_addressal")
             .edge("address_comments", on="bad_output", to="needs_human_end")
             .edge("address_comments", on="permanent_failure", to="needs_human_end")
