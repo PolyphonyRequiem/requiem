@@ -517,12 +517,13 @@ class CopilotProvider:
                 last_activity_event = evt
                 last_activity_at = time.monotonic()
             if evt == "assistant.message":
-                # The SDK defines this as the final assembled response. Finish
-                # immediately instead of waiting for session.idle: some CLI
-                # sessions omit idle, and a recovery prompt would start a new
-                # turn that can overwrite an already-valid structured result.
-                response_text = getattr(event.data, "content", "") or ""
-                done.set()
+                content = getattr(event.data, "content", "") or ""
+                if content:
+                    response_text = content
+                    if schema is not None:
+                        parsed, _ = _validate_response_text(content, schema)
+                        if parsed is not None:
+                            done.set()
             elif evt == "assistant.usage":
                 # Token accounting (floats sometimes; coerce). The
                 # Copilot SDK emits cumulative-per-turn input_tokens
@@ -688,30 +689,30 @@ class CopilotProvider:
         if schema is None:
             return success_with({"text": response_text}, receipt, agent=spec.name)
 
-        # Extract JSON from the response — Copilot models (especially
-        # claude-sonnet-5.5) routinely add prose preamble + wrap JSON in
-        # ```json ... ``` fences even when the prompt forbids it. They
-        # also sometimes emit prose AFTER the JSON. OpenAI's strict
-        # json_schema mode and Anthropic's tool-use API both sidestep
-        # this at the API layer; with Copilot we have to post-process
-        # defensively. The parser now tries multiple candidate slices so
-        # a prose preamble containing braces doesn't poison the parse.
-        candidates = _extract_json_candidates(response_text)
-        parsed = None
-        errors: tuple[str, ...] | None = None
-        for candidate in candidates:
-            repaired = _repair_json_literal_newlines(candidate)
-            parsed, errors = validate_schema(repaired, schema)
-            if parsed is not None:
-                return success_with(parsed, receipt, agent=spec.name)
-        if errors is None:
-            repaired = _repair_json_literal_newlines(response_text)
-            parsed, errors = validate_schema(repaired, schema)
+        parsed, errors = _validate_response_text(response_text, schema)
         if parsed is None:
             return bad_output_with(
                 raw=response_text, errors=errors or ("json decode: no viable JSON candidate",), receipt=receipt,
             )
         return success_with(parsed, receipt, agent=spec.name)
+
+
+def _validate_response_text(
+    response_text: str,
+    schema: type[BaseModel],
+) -> tuple[dict[str, Any] | None, tuple[str, ...] | None]:
+    """Extract and validate structured output from an assistant message."""
+    candidates = _extract_json_candidates(response_text)
+    errors: tuple[str, ...] | None = None
+    for candidate in candidates:
+        repaired = _repair_json_literal_newlines(candidate)
+        parsed, errors = validate_schema(repaired, schema)
+        if parsed is not None:
+            return parsed, errors
+    if errors is None:
+        repaired = _repair_json_literal_newlines(response_text)
+        return validate_schema(repaired, schema)
+    return None, errors
 
 
 def _repair_json_literal_newlines(text: str) -> str:

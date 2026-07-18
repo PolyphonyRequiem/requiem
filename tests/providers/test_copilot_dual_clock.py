@@ -219,6 +219,46 @@ def test_final_assistant_message_completes_without_idle_or_recovery():
     assert sends.count("please continue") == 0
 
 
+def test_empty_assistant_message_waits_for_valid_recovery_response():
+    """Empty intermediate messages must not end the call before the
+    structured response arrives on a recovery turn."""
+    from requiem.providers.copilot import CopilotProvider, DEFAULT_COPILOT_MODEL
+
+    sends: list[str] = []
+
+    async def _send_handler(session, prompt):
+        sends.append(prompt)
+
+        class _MsgEv:
+            type = "assistant.message"
+
+            class data:
+                content = "" if len(sends) == 1 else '{"x": 42}'
+
+        if session._cb:
+            session._cb(_MsgEv())
+
+    provider = CopilotProvider(
+        model=DEFAULT_COPILOT_MODEL,
+        client=_make_stub_client(_send_handler),
+        idle_timeout_s=0.01,
+        max_session_seconds=1.0,
+        max_recovery_attempts=1,
+        recovery_prompt="please continue",
+    )
+    spec = AgentSpec(
+        name="t",
+        charter="c",
+        response_model=_ToyResponse,
+        model=DEFAULT_COPILOT_MODEL,
+    )
+
+    outcome = asyncio.run(provider.invoke(AgentCall(spec=spec, user_message="hi")))
+
+    assert outcome.__class__.__name__ == "Success"
+    assert sends.count("please continue") == 1
+
+
 def test_max_session_seconds_caps_runaway_event_stream():
     """Wall-clock ceiling fires even when events keep arriving.
     A runaway session shouldn't run forever just because something
