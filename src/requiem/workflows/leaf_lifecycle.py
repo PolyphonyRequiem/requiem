@@ -114,7 +114,7 @@ from requiem.workflows.pr_lifecycle import (
 
 MODULE = "requiem.workflows.leaf_lifecycle"
 LeafLifecycleState = Literal["merged", "already_merged", "needs_human", "failed"]
-MERGE_CONFIRMATION_RETRY_MAX = 2
+MERGE_CONFIRMATION_RETRY_MAX = 30
 MERGE_CONFIRMATION_RETRY_DELAY_S = 1.0
 MERGEABILITY_RETRY_MAX = 2
 MERGEABILITY_RETRY_DELAY_S = 1.0

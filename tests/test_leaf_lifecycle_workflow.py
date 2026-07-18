@@ -439,7 +439,7 @@ async def test_oversized_diff_refuses_unsafe_compacted_review(log_dir: Path):
     assert build_result(completed).final_state == "failed"
 
 
-async def test_async_merge_completion_is_confirmed_by_authoritative_requery(
+async def test_delayed_async_merge_completion_is_confirmed_by_authoritative_requery(
     log_dir: Path, repo_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     monkeypatch.setattr(leaf_lifecycle_module, "MERGE_CONFIRMATION_RETRY_DELAY_S", 0.0)
@@ -450,7 +450,7 @@ async def test_async_merge_completion_is_confirmed_by_authoritative_requery(
             "lastMergeCommit": {"commitId": "merge-sha-41"},
         },
     )
-    tk = _toolkit(prs=[_pr(), _pr(), _pr(), _pr(), merged_pr])
+    tk = _toolkit(prs=[_pr(), _pr(), _pr(), _pr(), _pr(), _pr(), merged_pr])
     tk.complete_result = RepoCompleteResult(
         number=41,
         merged=False,
@@ -469,7 +469,7 @@ async def test_async_merge_completion_is_confirmed_by_authoritative_requery(
         "merge_sha": "merge-sha-41",
         "strategy": "squash",
         "confirmation_method": "authoritative_pr_requery",
-        "confirmation_attempt": 2,
+        "confirmation_attempt": 4,
     }
     assert len(tk.complete_calls) == 1
     lifecycle_result = build_result(completed)
@@ -501,7 +501,7 @@ async def test_unresolved_merge_confirmation_suspends_with_escalation_brief(
     assert brief["recovery_attempts"] == [
         {
             "kind": "authoritative_pr_requery",
-            "attempts": 3,
+            "attempts": 31,
             "result": "pr_open_not_merged",
         }
     ]
