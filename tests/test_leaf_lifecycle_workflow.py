@@ -237,6 +237,9 @@ async def test_review_prompt_binds_verdict_to_leaf_plan_contract(
     assert "Merge-bound diff (complete=True)" in prompt
     assert "definitively missing from the PR" in prompt
     assert "return `request_changes`" in prompt
+    assert "PR base is also authoritative" in prompt
+    assert "implementation claims a dependency has not landed" in prompt
+    assert "uses stand-ins or leaves them unwired" in prompt
     assert ".requiem/rationale.md" not in prompt.split("Merge-bound diff:", 1)[1]
 
 

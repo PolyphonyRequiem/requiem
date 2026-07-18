@@ -1072,7 +1072,12 @@ def build_verb_registry(
             "Any plan-required file or surface absent from that complete diff is "
             "definitively missing from the PR; return `request_changes` with "
             "concrete findings rather than `needs_human` merely to ask whether "
-            "other files exist.\n\n"
+            "other files exist. The named PR base is also authoritative for work "
+            "already merged from dependency leaves. Inspect the base when the "
+            "implementation claims a dependency has not landed. If required types "
+            "or contracts exist there but this PR uses stand-ins or leaves them "
+            "unwired, that is a concrete integration omission: return "
+            "`request_changes`, not `needs_human` to ask about dependency status.\n\n"
             f"Merge-bound diff:\n{prep['diff']}"
         )
 
