@@ -16,9 +16,12 @@ Pipeline
       → create_branch               (script · impl/<root>-<item> when a root is
                                        set, else legacy feature/<item_id>; idempotent)
       → invoke_coder                (agent  · CoderOutput)
-          ├─ success           → apply_changes
-      ├─ bad_output        → invoke_coder_retry
+          ├─ success           → validate_coder_changes
+          ├─ bad_output        → invoke_coder_retry
           └─ permanent_failure → end_failed
+      → validate_coder_changes     (script · bounded no-op recovery)
+          ├─ success                       → apply_changes
+          └─ permanent_failure:no_changes  → invoke_coder_retry
   → invoke_coder_retry          (agent  · CoderOutput, one retry after
                                    malformed prior output)
       ├─ success           → apply_changes
@@ -884,6 +887,7 @@ def build_verb_registry(
         prior_error = prior.get("error_kind", "")
         prior_errors = prior.get("validation_errors") or ()
         prior_output = prior.get("raw_output", "")
+        prior_parsed = (prior.get("value") or {}).get("parsed") or {}
         from requiem.context_pack import read_agents_md
         pack_text = read_agents_md(inputs.repo_path)
         header = (
@@ -893,13 +897,22 @@ def build_verb_registry(
             f"Local path: {plan['repo_path']}\n"
             f"GitHub: {plan['repo']}\n\n"
         )
-        retry_note = (
-            "Your previous response failed structured validation. "
-            f"Outcome: {prior_kind}. Error: {prior_error or '(none)'}\n"
-            f"Validation errors: {', '.join(prior_errors) if prior_errors else '(none)'}\n"
-            f"Raw output:\n{prior_output or '(empty)'}\n\n"
-            "Please return a corrected CoderOutput now."
-        )
+        if prior_kind == "success" and not prior_parsed.get("file_changes"):
+            retry_note = (
+                "Your previous structured response contained zero file_changes "
+                f"(intent_summary={prior_parsed.get('intent_summary')!r}). "
+                "The plan requires implementation work; inspect the repository "
+                "and return the concrete minimal changes now.\n\n"
+            )
+        else:
+            retry_note = (
+                "Your previous response failed structured validation. "
+                f"Outcome: {prior_kind}. Error: {prior_error or '(none)'}\n"
+                "Validation errors: "
+                f"{', '.join(prior_errors) if prior_errors else '(none)'}\n"
+                f"Raw output:\n{prior_output or '(empty)'}\n\n"
+                "Please return a corrected CoderOutput now."
+            )
         tail_instruction = (
             "Return a CoderOutput with the minimal set of file_changes "
             "that satisfies the plan."
@@ -933,6 +946,19 @@ def build_verb_registry(
         )
 
     # ---- apply_changes (both first and revision use this) ------------
+
+    @verbs.register("validate_coder_changes")
+    def _validate_coder_changes(ctx):
+        if inputs.dry_run:
+            return Success(value={"change_count": 0, "dry_run": True})
+        parsed = ctx.completed["invoke_coder"]["value"]["parsed"]
+        changes = list(parsed.get("file_changes") or [])
+        if not changes:
+            return PermanentFailure(
+                error_kind="coder.no_changes",
+                message="initial coder response contained 0 file_changes",
+            )
+        return Success(value={"change_count": len(changes)})
 
     def _safe_declared_target(rel: Path) -> tuple[Path | None, str | None]:
         repo_root = inputs.repo_path.resolve()
@@ -1916,11 +1942,23 @@ def build_workflow() -> Workflow:
                 .edge("commit_context_pack", on="success", to="invoke_coder")
                 .edge("commit_context_pack", on="permanent_failure", to="end_failed")
             .agent("invoke_coder", agent="coder", prompt_verb="coder_prompt")
-                .edge("invoke_coder", on="success", to="apply_changes")
+                .edge("invoke_coder", on="success", to="validate_coder_changes")
                 # A malformed first response is usually recoverable with one
                 # follow-up nudge; retry once before surrendering to human.
                 .edge("invoke_coder", on="bad_output", to="invoke_coder_retry")
                 .edge("invoke_coder", on="permanent_failure", to="cleanup_for_failed")
+            .script("validate_coder_changes", verb="validate_coder_changes")
+                .edge("validate_coder_changes", on="success", to="apply_changes")
+                .edge(
+                    "validate_coder_changes",
+                    on="permanent_failure:coder.no_changes",
+                    to="invoke_coder_retry",
+                )
+                .edge(
+                    "validate_coder_changes",
+                    on="permanent_failure",
+                    to="cleanup_for_needs_human",
+                )
             .agent("invoke_coder_retry", agent="coder", prompt_verb="coder_retry_prompt")
                 .edge("invoke_coder_retry", on="success", to="apply_changes")
                 .edge("invoke_coder_retry", on="bad_output", to="cleanup_for_needs_human")
@@ -1992,6 +2030,7 @@ def build_workflow() -> Workflow:
                 "create_branch":           "Created feature branch",
                 "commit_context_pack":     "Committed Requiem context pack",
                 "invoke_coder":            "Coder agent (first pass)",
+                "validate_coder_changes":  "Validated coder changes",
                 "invoke_coder_retry":      "Coder agent (retry)",
                 "apply_changes":           "Applied file changes",
                 "run_tests":               "Ran tests",

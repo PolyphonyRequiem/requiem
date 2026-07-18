@@ -1251,7 +1251,10 @@ async def test_no_changes_goes_to_end_needs_human(repo_path: Path, tmp_path: Pat
     twig = FakeTwig(item=_make_item())
     gh = FakeGh()
     provider = FakeProvider(scripts={
-        "coder": [{"intent_summary": "nothing to do", "file_changes": [], "notes": ""}],
+        "coder": [
+            {"intent_summary": "nothing to do", "file_changes": [], "notes": ""},
+            {"intent_summary": "still nothing", "file_changes": [], "notes": ""},
+        ],
         "coder_revision": [],
     })
     engine = _make_engine(
@@ -1268,6 +1271,39 @@ async def test_no_changes_goes_to_end_needs_human(repo_path: Path, tmp_path: Pat
     assert gh.created_calls == []
     # And no spurious twig comment.
     assert twig.comments == []
+    assert len(provider.calls) == 2
+
+
+async def test_no_changes_retries_once_then_succeeds(
+    repo_path: Path, tmp_path: Path
+) -> None:
+    _make_pushable(repo_path)
+    twig = FakeTwig(item=_make_item())
+    gh = FakeGh(pr_number=99)
+    provider = FakeProvider(scripts={
+        "coder": [
+            {"intent_summary": "placeholder", "file_changes": [], "notes": ""},
+            _coder_creates("MARKER.md"),
+        ],
+        "coder_revision": [],
+    })
+    engine = _make_engine(
+        repo_path,
+        tmp_path / "logs",
+        provider=provider,
+        twig=twig,
+        gh=gh,
+        test_runner=_passing_runner,
+    )
+
+    result = await engine.run("nochanges_retry")
+
+    assert isinstance(result, Completed)
+    assert result.final_node == "end_handoff"
+    assert result.disposition == "completed"
+    assert len(provider.calls) == 2
+    assert "contained zero file_changes" in provider.calls[1]["user_message"]
+    assert (repo_path / "MARKER.md").exists()
 
 
 # ---- bad output ----
@@ -1878,11 +1914,12 @@ async def test_all_emitted_error_kinds_are_in_closed_enum(
         coder = coder_scripts or [{
             "intent_summary": "nothing", "file_changes": [], "notes": "",
         }]
+        coder_attempts = [coder[0], coder[0]] if not coder_scripts else [coder[0]]
         revision = (
             [coder_scripts[1]] if coder_scripts and len(coder_scripts) > 1 else []
         )
         provider = FakeProvider(scripts={
-            "coder": [coder[0]],
+            "coder": coder_attempts,
             "coder_revision": revision,
         })
         engine = _make_engine(
