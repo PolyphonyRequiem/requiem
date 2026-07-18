@@ -80,6 +80,7 @@ def apply_file_changes(
             message="agent reported 0 file_changes — nothing to apply",
         )
     applied: list[str] = []
+    planned: dict[Path, str | None] = {}
     resolved_root = repo_path.resolve()
     for entry in raw_changes:
         rel = validate_relative_path(entry.get("path", ""))
@@ -108,15 +109,14 @@ def apply_file_changes(
         content = entry.get("content")
         try:
             if op == "delete":
-                if target.exists():
-                    target.unlink()
+                planned[target] = None
             elif op in ("create", "modify"):
                 if content is None:
                     return PermanentFailure(
                         error_kind=apply_failed_error_kind,
                         message=f"operation {op!r} on {rel} requires content",
                     )
-                fs.write_text(target, content)
+                planned[target] = content
             elif op == "replace":
                 old_content = entry.get("old_content")
                 if not old_content or content is None:
@@ -127,7 +127,15 @@ def apply_file_changes(
                             "old_content and replacement content"
                         ),
                     )
-                current = fs.read_text(target)
+                current = planned.get(target)
+                if target not in planned:
+                    current = fs.read_text(target)
+                if current is None:
+                    return PermanentFailure(
+                        error_kind=apply_failed_error_kind,
+                        message=f"operation 'replace' on deleted file {rel}",
+                        details={"path": str(rel)},
+                    )
                 matches = current.count(old_content)
                 if matches != 1:
                     return PermanentFailure(
@@ -138,7 +146,7 @@ def apply_file_changes(
                         ),
                         details={"path": str(rel), "matches": matches},
                     )
-                fs.write_text(target, current.replace(old_content, content, 1))
+                planned[target] = current.replace(old_content, content, 1)
             else:
                 return PermanentFailure(
                     error_kind=apply_failed_error_kind,
@@ -151,6 +159,20 @@ def apply_file_changes(
                 details={"path": str(rel)},
             )
         applied.append(str(rel))
+    try:
+        for target, content in planned.items():
+            if content is None:
+                if target.exists():
+                    target.unlink()
+            else:
+                fs.write_text(target, content)
+    except (FsClientError, OSError) as e:
+        rel = target.relative_to(resolved_root)
+        return PermanentFailure(
+            error_kind=apply_failed_error_kind,
+            message=f"writing {rel}: {e}",
+            details={"path": str(rel)},
+        )
     return Success(
         value={"applied_paths": applied, "change_count": len(applied)},
         inspected_artifacts=tuple(f"file:{p}" for p in applied),

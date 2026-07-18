@@ -1467,11 +1467,28 @@ def build_verb_registry(
             + _address_prompt(ctx)
         )
 
+    @verbs.register("address_apply_retry_prompt")
+    def _address_apply_retry_prompt(ctx):
+        failure = ctx.completed["apply_addressal"]
+        return (
+            "Your previous file_changes could not be applied safely. Re-read the "
+            "current checkout and return a corrected complete AddressResult. Keep "
+            "exact replace operations exact; do not use fuzzy matching or stale "
+            "old_content.\n\n"
+            f"Apply failure: {failure.get('message', '(unknown)')}\n"
+            f"Details: {failure.get('details') or {}}\n\n"
+            + _address_prompt(ctx)
+        )
+
     def _addressal_parsed(ctx, node: str | None = None):
         source = node or (
-            "address_comments_retry"
-            if "address_comments_retry" in ctx.completed
-            else "address_comments"
+            "address_comments_apply_retry"
+            if "address_comments_apply_retry" in ctx.completed
+            else (
+                "address_comments_retry"
+                if "address_comments_retry" in ctx.completed
+                else "address_comments"
+            )
         )
         return ctx.completed[source]["value"]["parsed"]
 
@@ -1493,8 +1510,11 @@ def build_verb_registry(
     def _validate_addressal_retry(ctx):
         return _validate_addressal(ctx, "address_comments_retry")
 
-    @verbs.register("apply_addressal")
-    def _apply_addressal(ctx):
+    @verbs.register("validate_addressal_apply_retry")
+    def _validate_addressal_apply_retry(ctx):
+        return _validate_addressal(ctx, "address_comments_apply_retry")
+
+    def _apply_addressal_impl(ctx):
         parsed = _addressal_parsed(ctx)
         raw_changes = parsed.get("file_changes") or []
         if inputs.dry_run:
@@ -1507,6 +1527,14 @@ def build_verb_registry(
         if isinstance(fs, PermanentFailure):
             return fs
         return apply_file_changes(inputs.repo_path, fs, raw_changes)
+
+    @verbs.register("apply_addressal")
+    def _apply_addressal(ctx):
+        return _apply_addressal_impl(ctx)
+
+    @verbs.register("apply_addressal_retry")
+    def _apply_addressal_retry(ctx):
+        return _apply_addressal_impl(ctx)
 
     @verbs.register("run_addressal_tests")
     async def _run_addressal_tests(ctx):
@@ -1581,10 +1609,14 @@ def build_verb_registry(
 
     @verbs.register("push_addressal")
     async def _push_addressal(ctx):
-        addr_node = (
-            "address_comments_retry"
-            if "address_comments_retry" in ctx.completed
-            else "address_comments"
+        addr_node = next(
+            node
+            for node in (
+                "address_comments_apply_retry",
+                "address_comments_retry",
+                "address_comments",
+            )
+            if node in ctx.completed
         )
         addr_outcome = ctx.completed[addr_node]["value"]
         parsed = addr_outcome.get("parsed") or {}
@@ -2235,7 +2267,45 @@ def build_workflow() -> Workflow:
             .edge("validate_addressal_retry", on="permanent_failure", to="needs_human_end")
         .script("apply_addressal", verb="apply_addressal")
             .edge("apply_addressal", on="success", to="run_addressal_tests")
+            .edge(
+                "apply_addressal",
+                on="permanent_failure:needs_human.apply_failed",
+                to="address_comments_apply_retry",
+            )
             .edge("apply_addressal", on="permanent_failure", to="needs_human_end")
+        .agent(
+            "address_comments_apply_retry",
+            agent="comment_addresser",
+            prompt_verb="address_apply_retry_prompt",
+        )
+            .edge(
+                "address_comments_apply_retry",
+                on="success",
+                to="validate_addressal_apply_retry",
+            )
+            .edge("address_comments_apply_retry", on="bad_output", to="needs_human_end")
+            .edge(
+                "address_comments_apply_retry",
+                on="permanent_failure",
+                to="needs_human_end",
+            )
+        .script(
+            "validate_addressal_apply_retry",
+            verb="validate_addressal_apply_retry",
+        )
+            .edge(
+                "validate_addressal_apply_retry",
+                on="success",
+                to="apply_addressal_retry",
+            )
+            .edge(
+                "validate_addressal_apply_retry",
+                on="permanent_failure",
+                to="needs_human_end",
+            )
+        .script("apply_addressal_retry", verb="apply_addressal_retry")
+            .edge("apply_addressal_retry", on="success", to="run_addressal_tests")
+            .edge("apply_addressal_retry", on="permanent_failure", to="needs_human_end")
         .script("run_addressal_tests", verb="run_addressal_tests")
             .edge("run_addressal_tests", on="success", to="push_addressal")
             .edge(

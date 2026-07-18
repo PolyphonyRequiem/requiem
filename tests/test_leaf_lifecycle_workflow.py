@@ -63,6 +63,32 @@ def test_snippet_replacement_fails_closed_on_multiple_matches(
     assert target.read_text(encoding="utf-8") == "repeat\nrepeat\n"
 
 
+def test_change_set_preflights_before_any_mutation(repo_path: Path) -> None:
+    target = repo_path / "README.md"
+
+    outcome = apply_file_changes(
+        repo_path,
+        FilesystemClient(repo_path),
+        [
+            {
+                "path": "FIRST.md",
+                "operation": "create",
+                "content": "must not be written\n",
+            },
+            {
+                "path": "README.md",
+                "operation": "replace",
+                "old_content": "not present",
+                "content": "fixed",
+            },
+        ],
+    )
+
+    assert isinstance(outcome, PermanentFailure)
+    assert not (repo_path / "FIRST.md").exists()
+    assert target.read_text(encoding="utf-8") == "# repo\n"
+
+
 @pytest.fixture
 def log_dir(tmp_path: Path) -> Path:
     d = tmp_path / "runs"
@@ -1136,6 +1162,146 @@ async def test_repeated_empty_addressal_fails_closed(
     assert completed["validate_addressal_retry"]["error_kind"] == (
         "addressal.no_changes"
     )
+    assert (repo_path / "README.md").read_text(encoding="utf-8") == "# repo\n"
+
+
+async def test_stale_addressal_replace_retries_once(
+    log_dir: Path,
+    repo_path: Path,
+):
+    review = {
+        "verdict": "request_changes",
+        "summary": "fix it",
+        "comments": [{
+            "file": "README.md",
+            "line": 1,
+            "body": "fix the heading",
+            "severity": "major",
+        }],
+    }
+    synth = {
+        "actionable_items": [{
+            "file": "README.md",
+            "line_range": [1, 1],
+            "change_summary": "fix the heading",
+            "original_comment_ids": [1],
+        }],
+        "non_actionable": [],
+    }
+    stale = {
+        "file_changes": [
+            {
+                "path": "FIRST.md",
+                "operation": "create",
+                "content": "must not survive failed preflight\n",
+            },
+            {
+                "path": "README.md",
+                "operation": "replace",
+                "old_content": "# stale\n",
+                "content": "# fixed\n",
+            },
+        ],
+        "summary": "fixed the heading",
+        "items_addressed": [1],
+    }
+    corrected = {
+        "file_changes": [{
+            "path": "README.md",
+            "operation": "replace",
+            "old_content": "# repo\n",
+            "content": "# fixed\n",
+        }],
+        "summary": "fixed the heading",
+        "items_addressed": [1],
+    }
+    provider = _provider(
+        reviewer=[review, {"verdict": "approve", "comments": [], "summary": "ok"}],
+        synth=[synth],
+        addresser=[stale, corrected],
+    )
+    engine = _engine(
+        log_dir,
+        toolkit=_toolkit(),
+        provider=provider,
+        repo_path=repo_path,
+    )
+
+    result = await engine.run("stale_addressal_recovers")
+
+    assert result.final_node == "end_merged"
+    assert [
+        call["agent"] for call in provider.calls
+    ].count("comment_addresser") == 2
+    retry_prompt = [
+        call["user_message"]
+        for call in provider.calls
+        if call["agent"] == "comment_addresser"
+    ][1]
+    assert "expected exactly one old_content match" in retry_prompt
+    assert not (repo_path / "FIRST.md").exists()
+    assert (repo_path / "README.md").read_text(encoding="utf-8") == "# fixed\n"
+
+
+async def test_repeated_stale_addressal_replace_fails_closed(
+    log_dir: Path,
+    repo_path: Path,
+):
+    review = {
+        "verdict": "request_changes",
+        "summary": "fix it",
+        "comments": [{
+            "file": "README.md",
+            "line": 1,
+            "body": "fix the heading",
+            "severity": "major",
+        }],
+    }
+    synth = {
+        "actionable_items": [{
+            "file": "README.md",
+            "line_range": [1, 1],
+            "change_summary": "fix the heading",
+            "original_comment_ids": [1],
+        }],
+        "non_actionable": [],
+    }
+    stale = {
+        "file_changes": [
+            {
+                "path": "FIRST.md",
+                "operation": "create",
+                "content": "must not survive failed preflight\n",
+            },
+            {
+                "path": "README.md",
+                "operation": "replace",
+                "old_content": "# stale\n",
+                "content": "# fixed\n",
+            },
+        ],
+        "summary": "fixed the heading",
+        "items_addressed": [1],
+    }
+    provider = _provider(
+        reviewer=[review],
+        synth=[synth],
+        addresser=[stale, stale],
+    )
+    engine = _engine(
+        log_dir,
+        toolkit=_toolkit(),
+        provider=provider,
+        repo_path=repo_path,
+    )
+
+    result = await engine.run("stale_addressal_repeated")
+
+    assert result.final_node == "needs_human_end"
+    assert [
+        call["agent"] for call in provider.calls
+    ].count("comment_addresser") == 2
+    assert not (repo_path / "FIRST.md").exists()
     assert (repo_path / "README.md").read_text(encoding="utf-8") == "# repo\n"
 
 
